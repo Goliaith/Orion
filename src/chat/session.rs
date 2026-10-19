@@ -11,19 +11,13 @@ use anyhow::{bail, Result};
 use super::classifier::LocalClassifier;
 use super::router::{self, Classifier, Route, RouteContext, Router, Strategy};
 use super::{connect, Backend, Event, Mode, Provider, Stop, ToolCall, ToolResult, Ui, UiApprover};
+use super::store::{self, Conversation, SavedBackend, Turn};
 use crate::{interrupt, Orion};
 
-/// A finished turn, as the other model will be told about it.
-struct TurnRecord {
-    user: String,
-    provider: Provider,
-    /// Kept away from Claude.
-    private: bool,
-    reply: String,
-    tools: Vec<String>,
-}
+/// A finished turn of the shared transcript.
+type TurnRecord = Turn;
 
-impl TurnRecord {
+impl Turn {
     /// The turn as plain text for a model that didn't handle it.
     fn render(&self) -> String {
         let mut s = format!("[{} handled this message", capitalized(router::name(self.provider)));
@@ -55,6 +49,26 @@ struct Slot {
     error: Option<String>,
     /// How many transcript turns this backend has been told about.
     synced: usize,
+    /// Saved history for a backend that was not connected when the
+    /// conversation was resumed; loaded when it connects, and kept in the
+    /// file until then.
+    stored: Option<SavedBackend>,
+}
+
+impl Slot {
+    fn attach(&mut self, mut backend: Box<dyn Backend>) {
+        if let Some(saved) = self.stored.take() {
+            match backend.import_history(saved.history.clone()) {
+                Ok(()) => self.synced = saved.synced,
+                Err(e) => {
+                    tracing::warn!("could not restore saved history: {e:#}");
+                    self.stored = Some(saved);
+                }
+            }
+        }
+        self.backend = Some(backend);
+        self.error = None;
+    }
 }
 
 pub struct Session<'a> {
@@ -68,6 +82,11 @@ pub struct Session<'a> {
     log: Vec<TurnRecord>,
     previous: Option<Provider>,
     max_tool_rounds: usize,
+    id: String,
+    /// Set by `/title` or a resumed conversation; otherwise derived from the
+    /// first message.
+    title: Option<String>,
+    created_ms: u64,
 }
 
 impl<'a> Session<'a> {
@@ -140,6 +159,9 @@ impl<'a> Session<'a> {
             log: Vec::new(),
             previous: None,
             max_tool_rounds: chat.max_tool_rounds,
+            id: store::new_id(),
+            title: None,
+            created_ms: store::now_ms(),
         }
     }
 
@@ -193,10 +215,7 @@ impl<'a> Session<'a> {
                 let connected = connect(self.orion, p, None);
                 let slot = self.slot_mut(p);
                 match connected {
-                    Ok(b) => {
-                        slot.backend = Some(b);
-                        slot.error = None;
-                    }
+                    Ok(b) => slot.attach(b),
                     Err(e) if mode != Mode::Auto => return Err(e),
                     Err(e) => slot.error = Some(format!("{e:#}")),
                 }
@@ -209,6 +228,7 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// Start a new conversation (the old one stays saved).
     pub fn clear(&mut self) {
         for p in [Provider::Claude, Provider::Local] {
             let slot = self.slot_mut(p);
@@ -216,9 +236,83 @@ impl<'a> Session<'a> {
                 b.clear();
             }
             slot.synced = 0;
+            slot.stored = None;
         }
         self.log.clear();
         self.previous = None;
+        self.id = store::new_id();
+        self.title = None;
+        self.created_ms = store::now_ms();
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn title(&self) -> String {
+        self.title.clone().or_else(|| self.log.first().map(store::title_from)).unwrap_or_default()
+    }
+
+    pub fn set_title(&mut self, title: &str) {
+        self.title = Some(title.trim().to_string());
+    }
+
+    pub fn turns(&self) -> &[Turn] {
+        &self.log
+    }
+
+    /// Everything needed to resume this conversation; `None` while it is
+    /// still empty.
+    pub fn snapshot(&self) -> Option<Conversation> {
+        if self.log.is_empty() {
+            return None;
+        }
+        let mut backends = std::collections::BTreeMap::new();
+        for (p, key) in [(Provider::Claude, "claude"), (Provider::Local, "local")] {
+            let slot = self.slot(p);
+            let saved = match &slot.backend {
+                Some(b) => Some(SavedBackend { model: b.model(), synced: slot.synced, history: b.export_history() }),
+                None => slot.stored.clone(),
+            };
+            if let Some(saved) = saved {
+                backends.insert(key.to_string(), saved);
+            }
+        }
+        Some(Conversation {
+            version: store::FORMAT_VERSION,
+            id: self.id.clone(),
+            title: self.title(),
+            created_ms: self.created_ms,
+            updated_ms: store::now_ms(),
+            mode: self.mode,
+            previous: self.previous,
+            turns: self.log.clone(),
+            backends,
+        })
+    }
+
+    /// Continue a saved conversation. Each connected model gets its own
+    /// history back exactly as saved (and its model); a model that is not
+    /// connected gets it when it connects. The mode is left to the caller.
+    pub fn restore(&mut self, conv: Conversation) {
+        self.clear();
+        self.id = conv.id;
+        self.title = Some(conv.title);
+        self.created_ms = conv.created_ms;
+        self.previous = conv.previous;
+        self.log = conv.turns;
+        for (p, key) in [(Provider::Claude, "claude"), (Provider::Local, "local")] {
+            let Some(saved) = conv.backends.get(key).cloned() else { continue };
+            let slot = self.slot_mut(p);
+            slot.stored = Some(saved.clone());
+            if let Some(b) = slot.backend.take() {
+                let mut b = b;
+                if !saved.model.is_empty() {
+                    b.set_model(&saved.model);
+                }
+                slot.attach(b);
+            }
+        }
     }
 
     /// What the router would do with `text`, without sending it.
@@ -465,11 +559,19 @@ mod tests {
         name: &'static str,
         script: VecDeque<Result<(String, Vec<ToolCall>)>>,
         log: Log,
+        /// What it has been told, as its "history".
+        history: Vec<String>,
+        model: String,
     }
 
     impl Scripted {
         fn new(name: &'static str, log: &Log, script: Vec<Result<(String, Vec<ToolCall>)>>) -> Box<Self> {
-            Box::new(Self { name, script: script.into(), log: log.clone() })
+            Box::new(Self { name, script: script.into(), log: log.clone(), history: Vec::new(), model: name.into() })
+        }
+
+        fn note(&mut self, entry: String) {
+            self.history.push(entry.clone());
+            self.log.borrow_mut().push(entry);
         }
     }
 
@@ -478,18 +580,21 @@ mod tests {
             self.name.to_string()
         }
         fn model(&self) -> String {
-            self.name.to_string()
+            self.model.clone()
         }
-        fn set_model(&mut self, _model: &str) {}
+        fn set_model(&mut self, model: &str) {
+            self.model = model.into();
+        }
         fn push_user(&mut self, text: &str) {
-            self.log.borrow_mut().push(format!("{} user: {text}", self.name));
+            self.note(format!("{} user: {text}", self.name));
         }
         fn push_assistant_text(&mut self, text: &str) {
-            self.log.borrow_mut().push(format!("{} assistant: {text}", self.name));
+            self.note(format!("{} assistant: {text}", self.name));
         }
         fn respond(&mut self, on: &mut dyn FnMut(Event)) -> Result<Reply> {
             let (text, calls) = self.script.pop_front().unwrap_or_else(|| Err(anyhow::anyhow!("script ran out")))?;
             on(Event::Text(&text));
+            self.history.push(format!("{} said: {text}", self.name));
             let stop = if calls.is_empty() { Stop::Done } else { Stop::ToolUse };
             Ok(Reply { calls, stop })
         }
@@ -498,7 +603,16 @@ mod tests {
                 self.log.borrow_mut().push(format!("{} result: {}", self.name, if r.is_error { &r.content } else { "ok" }));
             }
         }
-        fn clear(&mut self) {}
+        fn clear(&mut self) {
+            self.history.clear();
+        }
+        fn export_history(&self) -> Value {
+            json!(self.history)
+        }
+        fn import_history(&mut self, history: Value) -> Result<()> {
+            self.history = serde_json::from_value(history)?;
+            Ok(())
+        }
         fn usage(&self) -> Usage {
             Usage::default()
         }
@@ -665,6 +779,46 @@ mod tests {
         assert!(ui.out.ends_with("!Interrupted."), "{}", ui.out);
         assert!(!ui.out.contains("trying"), "an interrupt is not a failure: {}", ui.out);
         assert!(entries(&log, "local").is_empty());
+    }
+
+    #[test]
+    fn snapshot_and_restore_continue_the_conversation() {
+        let log = Log::default();
+        let orion = orion();
+        let claude = Scripted::new("claude", &log, vec![say("Here's the plan.")]);
+        let local = Scripted::new("local", &log, vec![say("28% full.")]);
+        let mut s = Session::with_backends(&orion, Mode::Auto, Some(claude), Some(local));
+        assert!(s.snapshot().is_none(), "nothing to save yet");
+        let mut ui = Recorder::default();
+        s.turn("how full is my disk?", &mut ui).unwrap();
+        s.turn("plan a cleanup of my home", &mut ui).unwrap();
+        s.backend_mut(Provider::Claude).unwrap().set_model("claude-sonnet-5-5");
+        let saved = s.snapshot().unwrap();
+        assert_eq!(saved.title, "how full is my disk?");
+        assert_eq!(saved.turns.len(), 2);
+        assert_eq!(saved.backends["claude"].synced, 2);
+        assert_eq!(saved.backends["claude"].model, "claude-sonnet-5-5");
+        let json = serde_json::to_string(&saved).unwrap();
+
+        // A fresh session (say, after a restart) with only Claude connected.
+        let log2 = Log::default();
+        let claude = Scripted::new("claude", &log2, vec![say("Starting with ~/.cache.")]);
+        let mut resumed = Session::with_backends(&orion, Mode::Auto, Some(claude), None);
+        resumed.restore(serde_json::from_str(&json).unwrap());
+        assert_eq!(resumed.id(), saved.id);
+        assert_eq!(resumed.backend(Provider::Claude).unwrap().model(), "claude-sonnet-5-5");
+        let history = resumed.backend(Provider::Claude).unwrap().export_history();
+        assert_eq!(history, saved.backends["claude"].history, "Claude's own history comes back verbatim");
+
+        // The follow-up goes to Claude, which answered last, without a re-sync.
+        resumed.turn("ok, go ahead", &mut Recorder::default()).unwrap();
+        assert_eq!(entries(&log2, "claude"), ["claude user: ok, go ahead"]);
+
+        // The local model wasn't connected; its saved history is kept, not lost.
+        let again = resumed.snapshot().unwrap();
+        assert_eq!(again.backends["local"], saved.backends["local"]);
+        assert_eq!(again.turns.len(), 3);
+        assert_eq!(again.created_ms, saved.created_ms);
     }
 
     #[test]

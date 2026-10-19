@@ -14,6 +14,7 @@ mod http;
 pub mod local;
 pub mod router;
 mod session;
+pub mod store;
 pub mod terminal;
 
 pub use session::Session;
@@ -22,7 +23,7 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{Approver, Decision, Orion, Policy, Tool};
@@ -38,6 +39,8 @@ pub struct ChatConfig {
     pub max_tool_rounds: usize,
     /// Show reasoning and progress notes (Ctrl-O toggles it in the chat).
     pub show_reasoning: bool,
+    /// Save conversations after every message so they can be resumed.
+    pub save_conversations: bool,
     pub claude: claude::ClaudeConfig,
     pub local: local::LocalConfig,
     pub router: router::RouterConfig,
@@ -49,6 +52,7 @@ impl Default for ChatConfig {
             mode: Mode::Auto,
             max_tool_rounds: 50,
             show_reasoning: true,
+            save_conversations: true,
             claude: Default::default(),
             local: Default::default(),
             router: Default::default(),
@@ -57,14 +61,14 @@ impl Default for ChatConfig {
 }
 
 /// Where the model behind a message comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Claude,
     Local,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Route each message to Claude or the local model.
@@ -159,6 +163,10 @@ pub trait Backend {
     /// Answers to every call of the last reply, in order.
     fn push_tool_results(&mut self, results: Vec<ToolResult>);
     fn clear(&mut self);
+    /// The conversation history in this backend's wire format, for saving.
+    fn export_history(&self) -> Value;
+    /// Replace the history with one from `export_history`.
+    fn import_history(&mut self, history: Value) -> Result<()>;
     fn usage(&self) -> Usage;
 }
 

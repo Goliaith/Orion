@@ -22,6 +22,16 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ConversationCmd {
+    /// Saved conversations, most recent first (the default).
+    List,
+    /// Print a conversation's transcript.
+    Show { id: String },
+    /// Delete a conversation.
+    Delete { id: String },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Talk to an AI in the terminal; it works on the machine through Orion's tools.
     Chat {
@@ -37,6 +47,14 @@ enum Cmd {
         /// Use this model instead of the configured one (with --claude or --local).
         #[arg(long)]
         model: Option<String>,
+        /// Continue a saved conversation: the latest, or the one with this id (or id prefix).
+        #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
+        resume: Option<String>,
+    },
+    /// List, show or delete saved chat conversations.
+    Conversations {
+        #[command(subcommand)]
+        action: Option<ConversationCmd>,
     },
     /// Serve the tools over MCP on stdin/stdout (this is what AI clients launch).
     Serve,
@@ -71,15 +89,20 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Cmd::Chat { local, claude, auto, model } => {
+        Cmd::Chat { local, claude, auto, model, resume } => {
             let mode = match (local, claude, auto) {
                 (true, _, _) => Some(Mode::Local),
                 (_, true, _) => Some(Mode::Claude),
                 (_, _, true) => Some(Mode::Auto),
                 _ => None,
             };
-            terminal::run(&Orion::new(policy), mode, model.as_deref())
+            terminal::run(&Orion::new(policy), mode, model.as_deref(), resume.as_deref())
         }
+        Cmd::Conversations { action } => terminal::conversations(match &action {
+            None | Some(ConversationCmd::List) => None,
+            Some(ConversationCmd::Show { id }) => Some(("show", id.as_str())),
+            Some(ConversationCmd::Delete { id }) => Some(("delete", id.as_str())),
+        }),
         Cmd::Serve => {
             let orion = Orion::new(policy);
             tracing::info!(

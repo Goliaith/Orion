@@ -6,7 +6,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rustyline::error::ReadlineError;
 use rustyline::{
     Cmd, ConditionalEventHandler, DefaultEditor, Event, EventContext, EventHandler, KeyCode, KeyEvent, Modifiers,
@@ -14,6 +14,7 @@ use rustyline::{
 };
 use serde_json::Value;
 
+use super::store::{self, Store, Turn};
 use super::{router, Mode, Provider, Session, Ui};
 use crate::{interrupt, Approver, Decision, Orion, Tool};
 
@@ -284,9 +285,37 @@ fn prompt(style: &Style, mode: Mode) -> String {
 }
 
 /// Run the interactive chat until the user leaves. `mode` and `model`
-/// override the `[chat]` settings.
-pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>) -> Result<()> {
-    let mut session = Session::start(orion, mode.unwrap_or(orion.policy().chat.mode), model)?;
+/// override the `[chat]` settings; `resume` continues a saved conversation
+/// (by id or id prefix; empty for the latest).
+pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Option<&str>) -> Result<()> {
+    let store = Store::default_location();
+    let saved = match (resume, &store) {
+        (Some(q), Some(store)) => Some(store.load(q)?),
+        (Some(_), None) => anyhow::bail!("no state directory for saved conversations (is HOME set?)"),
+        (None, _) => None,
+    };
+    // A resumed conversation goes back to its own mode unless one is given.
+    let start_mode = mode.or(saved.as_ref().map(|c| c.mode)).unwrap_or(orion.policy().chat.mode);
+    let resumed = saved.is_some();
+    let mut session = match Session::start(orion, start_mode, model) {
+        // The saved mode's model may be gone; the conversation can still go on in auto.
+        Err(e) if resumed && mode.is_none() && start_mode != Mode::Auto => {
+            let why = format!("{e:#}");
+            println!("(can't use the saved mode: {}; using auto)", why.lines().next().unwrap_or_default());
+            Session::start(orion, Mode::Auto, None)?
+        }
+        other => other?,
+    };
+    if let Some(conv) = saved {
+        session.restore(conv);
+        if let Some(m) = model {
+            // --model wins over the model the conversation was saved with.
+            if let Some(b) = session.backend_mut(session.current()) {
+                b.set_model(m);
+            }
+        }
+    }
+    let saver = Saver { store: store.filter(|_| orion.policy().chat.save_conversations) };
     let mut term = Terminal::new();
     term.show_reasoning = orion.policy().chat.show_reasoning;
     let mut editor = DefaultEditor::new()?;
@@ -299,6 +328,9 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>) -> Result<()>
     interrupt::install();
 
     banner(&term.style, orion, &session);
+    if resumed {
+        recap(&term.style, &session);
+    }
     let mut restore: Option<(String, usize)> = None;
     let mut last_ctrl_c: Option<Instant> = None;
     loop {
@@ -332,7 +364,7 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>) -> Result<()>
         }
         let _ = editor.add_history_entry(input);
         if let Some(cmd) = input.strip_prefix('/') {
-            if !command(cmd, orion, &mut session, &mut term) {
+            if !command(cmd, orion, &mut session, &mut term, &saver) {
                 break;
             }
             continue;
@@ -344,6 +376,7 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>) -> Result<()>
             println!("{}", term.style.red(&format!("error: {e:#}")));
         }
         interrupt::clear();
+        saver.save(&session, &term.style);
         term.line_break();
         println!();
     }
@@ -352,6 +385,90 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>) -> Result<()>
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = editor.save_history(h);
+    }
+    Ok(())
+}
+
+/// Saves the conversation after each change, if saving is on.
+struct Saver {
+    store: Option<Store>,
+}
+
+impl Saver {
+    fn save(&self, session: &Session, s: &Style) {
+        let (Some(store), Some(conv)) = (&self.store, session.snapshot()) else { return };
+        if let Err(e) = store.save(&conv) {
+            println!("{}", s.red(&format!("  could not save the conversation: {e:#}")));
+        }
+    }
+}
+
+fn provider_label(p: Provider) -> &'static str {
+    match p {
+        Provider::Claude => "claude",
+        Provider::Local => "local",
+    }
+}
+
+fn clip(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(max - 1).collect::<String>())
+    }
+}
+
+/// What a resumed conversation was about: its title and the last exchange.
+fn recap(s: &Style, session: &Session) {
+    let turns = session.turns();
+    println!(
+        "{}",
+        s.bold(&format!("Resumed “{}” · {} message{}", session.title(), turns.len(), if turns.len() == 1 { "" } else { "s" }))
+    );
+    for t in turns.iter().rev().take(2).rev() {
+        print_turn(s, t, 160);
+    }
+    println!();
+}
+
+fn print_turn(s: &Style, t: &Turn, max: usize) {
+    println!("  {} {}", s.dim("you:"), clip(&t.user, max));
+    for tool in &t.tools {
+        println!("    {} {}", s.cyan("⚙"), s.dim(&clip(tool, max)));
+    }
+    let reply = if t.reply.trim().is_empty() { "(no reply)" } else { &t.reply };
+    println!("  {} {}", s.dim(&format!("{}:", provider_label(t.provider))), clip(reply, max * 2));
+}
+
+/// `orion conversations`: list, show or delete saved conversations.
+pub fn conversations(action: Option<(&str, &str)>) -> Result<()> {
+    let store = Store::default_location().context("no state directory (is HOME set?)")?;
+    let s = Style { on: io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() };
+    match action {
+        None | Some(("list", _)) => {
+            let all = store.list()?;
+            if all.is_empty() {
+                println!("no saved conversations ({})", store.dir().display());
+            }
+            for c in all {
+                println!("{}  {:<14} {:>3} msg  {}", c.id, s.dim(&store::ago(c.updated_ms)), c.turns, c.title);
+            }
+        }
+        Some(("show", id)) => {
+            let c = store.load(id)?;
+            println!("{}", s.bold(&c.title));
+            println!(
+                "{}",
+                s.dim(&format!("{} · started {} · {} messages", c.id, store::local_time(c.created_ms, "%Y-%m-%d %H:%M"), c.turns.len()))
+            );
+            for t in &c.turns {
+                println!();
+                print_turn(&s, t, 10_000);
+            }
+        }
+        Some(("delete", id)) => println!("deleted {}", store.delete(id)?),
+        Some((other, _)) => anyhow::bail!("unknown action {other}"),
     }
     Ok(())
 }
@@ -426,7 +543,7 @@ fn banner(s: &Style, orion: &Orion, session: &Session) {
 }
 
 /// Handle a slash command; `false` means quit.
-fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal) -> bool {
+fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal, saver: &Saver) -> bool {
     let s = &term.style;
     let (name, arg) = cmd.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((cmd, ""));
     // `/model local qwen3:8b` names the provider; `/model qwen3:8b` means the current one.
@@ -450,7 +567,10 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal)
             println!("  /effort <level>         set Claude's effort: low, medium, high, xhigh, max");
             println!("  /tools                  what the AI can do, and what needs your approval");
             println!("  /usage                  tokens used this session");
-            println!("  /clear                  start a new conversation");
+            println!("  /new                    start a new conversation (this one stays saved)");
+            println!("  /history                saved conversations, most recent first");
+            println!("  /resume <n|id>          continue a saved conversation");
+            println!("  /title <text>           rename this conversation");
             println!("  /exit                   leave (Ctrl-D works too)");
             println!();
             for (key, what) in HOTKEYS {
@@ -529,9 +649,48 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal)
                 println!("{line}");
             }
         }
-        "clear" => {
+        "clear" | "new" => {
             session.clear();
             println!("  {}", s.dim("new conversation"));
+        }
+        "title" if arg.is_empty() => println!("  {}", session.title()),
+        "title" => {
+            session.set_title(arg);
+            saver.save(session, s);
+            println!("  {}", s.dim(&format!("title → {}", session.title())));
+        }
+        "history" => match &saver.store {
+            None => println!("  {}", s.dim("saving is off (chat.save_conversations)")),
+            Some(store) => match store.list() {
+                Ok(all) if all.is_empty() => println!("  {}", s.dim("no saved conversations yet")),
+                Ok(all) => {
+                    for (i, c) in all.iter().take(20).enumerate() {
+                        let here = if c.id == session.id() { s.green(" ← this one") } else { String::new() };
+                        println!("  {:>2}. {:<44} {}{here}", i + 1, clip(&c.title, 44), s.dim(&format!("{} · {} msg", store::ago(c.updated_ms), c.turns)));
+                    }
+                    println!("  {}", s.dim("/resume <number> continues one"));
+                }
+                Err(e) => println!("  {}", s.red(&format!("{e:#}"))),
+            },
+        },
+        "resume" => {
+            let Some(store) = &saver.store else {
+                println!("  {}", s.dim("saving is off (chat.save_conversations)"));
+                return true;
+            };
+            // A number picks from /history; anything else is an id (prefix).
+            let query = match arg.parse::<usize>() {
+                Ok(n) if n >= 1 => store.list().ok().and_then(|all| all.get(n - 1).map(|c| c.id.clone())),
+                _ => Some(arg.to_string()),
+            };
+            match query.map(|q| store.load(&q)) {
+                Some(Ok(conv)) => {
+                    session.restore(conv);
+                    recap(s, session);
+                }
+                Some(Err(e)) => println!("  {}", s.red(&format!("{e:#}"))),
+                None => println!("  {}", s.red("no conversation with that number; see /history")),
+            }
         }
         _ => println!("  {}", s.red(&format!("unknown command /{cmd}; try /help"))),
     }

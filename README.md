@@ -75,10 +75,43 @@ Firefox is using 3.1 GB of your 16 GB. I wrote the details to ~/orion-workspace/
 - **Streaming.** Replies stream as they are written. The model's progress notes and reasoning show dimmed, so long tasks don't sit silent.
 - **Every tool call is visible**, with its arguments and whether it worked.
 - **Approval prompts** show the full arguments of anything that changes the machine. `a` approves that tool for the rest of the session.
-- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/keys`, `/clear`, `/exit`, plus `@claude` / `@local` prefixes and the [hotkeys](#hotkeys). Line history is kept in `~/.local/state/orion/chat_history`.
+- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/keys`, `/new`, `/history`, `/resume`, `/title`, `/exit`, plus `@claude` / `@local` prefixes and the [hotkeys](#hotkeys). Line history is kept in `~/.local/state/orion/chat_history`.
 - Settings live under `[chat]` in the policy file: the mode (`provider = "auto"`, `"claude"` or `"local"`) and the sections `[chat.claude]` (model, default `claude-opus-5-5`; effort; progress notes; fallbacks), `[chat.local]` and `[chat.router]`.
 
 `ANTHROPIC_AUTH_TOKEN` (an OAuth access token) also works in place of an API key.
+
+### Saved conversations
+
+Every conversation is saved after each message, so closing the terminal (or a crash) loses nothing:
+
+```sh
+orion chat --resume               # continue the most recent conversation
+orion chat --resume 20261020-15   # or a specific one, by id or id prefix
+orion conversations               # list them: id, last active, length, title
+orion conversations show <id>     # print a transcript
+orion conversations delete <id>
+```
+
+```
+Resumed “Cleanup plan” · 3 messages
+  you: second message
+  claude: Reply 1.
+  you: third message
+  claude: Reply 2.
+```
+
+Inside a chat:
+
+- `/history` lists saved conversations, most recent first.
+- `/resume <n|id>` switches to one; the current conversation is already saved.
+- `/new` starts a fresh conversation.
+- `/title <text>` renames the current one. Titles otherwise come from the first message, and a conversation that starts with a private message is titled "(private conversation)".
+
+How it works:
+
+- **Each model's own history is saved exactly as it was produced,** alongside the shared transcript. Claude's thinking blocks and their signatures are included, so a resumed conversation continues with full context (and prompt caching), not from a summary. Each model's id is saved too, and comes back on resume unless you pass `--model`.
+- **The routing mode comes back as well.** If that mode's model is gone (say the local server is off), the conversation continues in `auto`. A model that isn't connected when you resume keeps its saved history in the file, and gets it back as soon as it connects (with `/use` or Shift-Tab).
+- **Files live in `~/.local/state/orion/conversations/`** (`$XDG_STATE_HOME`), one JSON file per conversation. They are readable only by you (the folder is `0700`, the files `0600`) and written atomically. They hold private turns too, which never leave the machine. Set `save_conversations = false` under `[chat]` to stop saving.
 
 ### Hotkeys
 
@@ -175,6 +208,7 @@ orion tools                                   # every tool, its risk, and the po
 orion call system_info                        # call a tool yourself, exactly as the AI would (prompts for "ask" tools)
 orion call fs_list '{"path": "~"}'
 orion audit -n 20                             # recent calls, as JSON lines
+orion conversations                           # saved chats (see "Saved conversations")
 orion serve                                   # MCP server on stdin/stdout
 ```
 
@@ -223,7 +257,8 @@ src/
     claude.rs   Claude backend: streaming Messages API client (SSE)
     local.rs    local backend: OpenAI-compatible chat completions (Ollama, llama.cpp, vLLM, LM Studio)
     http.rs     shared HTTP: retries, proxy rules, error bodies, SSE lines
-    terminal.rs the interactive terminal UI and hotkeys
+    store.rs    saved conversations: atomic, private JSON files
+    terminal.rs the interactive terminal UI, hotkeys, `orion conversations`
   interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
 tests/stdio.rs  end-to-end MCP session against the real binary
 ```
@@ -236,4 +271,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. **System daemon.** Run `oriond` as a systemd service on a Unix socket, with `orion serve` as a thin stdio bridge, so many agents share one policy and one log.
 3. **Isolation.** Run `proc_run` inside namespaces, cgroups and seccomp (or Landlock), with CPU, memory and GPU limits per call.
 4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O) are done too. Still to come: saving and resuming conversations, a full-screen TUI, voice, and a graphical shell.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O) and ~~saved conversations~~ are done too. Still to come: a full-screen TUI, voice, and a graphical shell.

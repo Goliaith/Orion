@@ -237,6 +237,17 @@ impl Backend for ClaudeBackend {
         self.messages.clear();
     }
 
+    fn export_history(&self) -> Value {
+        Value::Array(self.messages.clone())
+    }
+
+    fn import_history(&mut self, history: Value) -> Result<()> {
+        let Value::Array(messages) = history else { bail!("saved Claude history is not a list") };
+        // Verbatim, thinking blocks and all, so they stay valid.
+        self.messages = messages;
+        Ok(())
+    }
+
     fn usage(&self) -> Usage {
         self.usage
     }
@@ -474,6 +485,18 @@ mod tests {
         assert_eq!(results[0]["is_error"], false);
         assert_eq!(results[1]["is_error"], true);
         assert!(results[1]["content"].as_str().unwrap().contains("declined"));
+    }
+
+    #[test]
+    fn history_round_trips_verbatim() {
+        let mut b = ClaudeBackend::new(Client::with_api_key("http://127.0.0.1:9", "k"), ClaudeConfig::default(), "s".into(), &[]);
+        let history = json!([
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"EqQBCkgIARABGAIi"},{"type":"text","text":"Hello."}]},
+        ]);
+        b.import_history(history.clone()).unwrap();
+        assert_eq!(b.export_history(), history);
+        assert!(b.import_history(json!({"not": "a list"})).is_err());
     }
 
     #[test]

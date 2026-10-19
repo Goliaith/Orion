@@ -158,6 +158,11 @@ impl Policy {
         }
     }
 
+    /// Orion's own state: `$XDG_STATE_HOME/orion`.
+    pub fn state_dir() -> Option<PathBuf> {
+        xdg_dir("XDG_STATE_HOME", ".local/state").map(|d| d.join("orion"))
+    }
+
     pub fn audit_path(&self) -> Option<PathBuf> {
         if !self.audit.enabled {
             return None;

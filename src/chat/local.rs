@@ -204,6 +204,19 @@ impl Backend for LocalBackend {
         self.messages.truncate(1);
     }
 
+    fn export_history(&self) -> Value {
+        // The system prompt is rebuilt on resume, so only the rest is saved.
+        Value::Array(self.messages[1..].to_vec())
+    }
+
+    fn import_history(&mut self, history: Value) -> Result<()> {
+        let Value::Array(messages) = history else { bail!("saved local history is not a list") };
+        self.messages.truncate(1);
+        self.next_call_id = messages.len() as u64;
+        self.messages.extend(messages);
+        Ok(())
+    }
+
     fn usage(&self) -> Usage {
         self.usage
     }
