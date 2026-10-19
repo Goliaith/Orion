@@ -10,11 +10,8 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::Value;
 
-use super::claude::Client;
-use super::{Session, Ui};
+use super::{connect, Provider, Session, Ui};
 use crate::{Approver, Decision, Orion, Tool};
-
-const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 struct Style {
     on: bool,
@@ -81,12 +78,12 @@ impl Terminal {
         }
         self.line_break();
         let s = &self.style;
-        println!("  {} {} wants to run {}:", s.yellow("?"), s.bold("Claude"), s.bold(tool.name()));
+        println!("  {} Approve {}?", s.yellow("?"), s.bold(tool.name()));
         for line in preview(args).lines() {
             println!("    {}", s.dim(line));
         }
         loop {
-            print!("  {} ", s.yellow("Allow? [y]es / [n]o / [a]lways for this session ›"));
+            print!("  {} ", s.yellow("[y]es / [n]o / [a]lways for this session ›"));
             let _ = io::stdout().flush();
             let mut answer = String::new();
             let read = io::stdin().read_line(&mut answer).unwrap_or(0);
@@ -177,10 +174,11 @@ impl Approver for PromptApprover {
     }
 }
 
-/// Run the interactive chat until the user leaves.
-pub fn run(orion: &Orion) -> Result<()> {
-    let client = Client::from_env(&orion.policy().chat.base_url)?;
-    let mut session = Session::new(orion, client);
+/// Run the interactive chat until the user leaves. `provider` and `model`
+/// override the `[chat]` settings.
+pub fn run(orion: &Orion, provider: Option<Provider>, model: Option<&str>) -> Result<()> {
+    let provider = provider.unwrap_or(orion.policy().chat.provider);
+    let mut session = Session::new(orion, connect(orion, provider, model)?);
     let mut term = Terminal::new();
     let mut editor = DefaultEditor::new()?;
     let history = orion.policy().audit_path().and_then(|p| Some(p.parent()?.join("chat_history")));
@@ -231,10 +229,9 @@ fn banner(s: &Style, orion: &Orion, session: &Session) {
     println!(
         "{}",
         s.dim(&format!(
-            "{} · effort {} · {} tools ({} automatic, {} ask first) · /help for commands",
-            session.config.model,
-            session.config.effort,
-            session.tool_count(),
+            "{} · {} tools ({} automatic, {} ask first) · /help for commands",
+            session.backend.describe(),
+            count(Decision::Allow) + count(Decision::Ask),
             count(Decision::Allow),
             count(Decision::Ask),
         ))
@@ -248,12 +245,14 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style) -> bool {
     match name {
         "exit" | "quit" | "q" => return false,
         "help" | "?" => {
-            println!("  /tools           what Claude can do, and what needs your approval");
-            println!("  /model [id]      show or switch the model");
-            println!("  /effort [level]  show or set effort: {}", EFFORTS.join(", "));
-            println!("  /usage           tokens used this session");
-            println!("  /clear           start a new conversation");
-            println!("  /exit            leave (Ctrl-D works too)");
+            println!("  /tools             what the AI can do, and what needs your approval");
+            println!("  /model [id]        show or switch the model");
+            println!("  /models            list the models a local server has");
+            println!("  /use claude|local  switch provider (starts a new conversation)");
+            println!("  /effort [level]    set Claude's effort: low, medium, high, xhigh, max");
+            println!("  /usage             tokens used this session");
+            println!("  /clear             start a new conversation");
+            println!("  /exit              leave (Ctrl-D works too)");
         }
         "tools" => {
             for (tool, decision) in orion.tools() {
@@ -265,25 +264,47 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style) -> bool {
                 println!("  {d}  {:<12} {}", tool.name(), s.dim(tool.risk().as_str()));
             }
         }
-        "model" if arg.is_empty() => println!("  {}", session.config.model),
+        "model" | "effort" if arg.is_empty() => println!("  {}", session.backend.describe()),
         "model" => {
-            session.config.model = arg.to_string();
-            println!("  model → {arg}");
+            session.backend.set_model(arg);
+            println!("  {}", session.backend.describe());
         }
-        "effort" if arg.is_empty() => println!("  {}", session.config.effort),
-        "effort" if EFFORTS.contains(&arg) => {
-            session.config.effort = arg.to_string();
-            println!("  effort → {arg}");
+        "effort" => match session.backend.set_effort(arg) {
+            Ok(()) => println!("  {}", session.backend.describe()),
+            Err(e) => println!("  {}", s.red(&e)),
+        },
+        "models" => match session.backend.list_models() {
+            Ok(models) if models.is_empty() => println!("  {}", s.dim("no models installed")),
+            Ok(models) => models.iter().for_each(|m| println!("  {m}")),
+            Err(e) => println!("  {}", s.red(&format!("{e:#}"))),
+        },
+        "use" => {
+            let provider = match arg {
+                "claude" => Provider::Claude,
+                "local" => Provider::Local,
+                _ => {
+                    println!("  {}", s.red("usage: /use claude | /use local"));
+                    return true;
+                }
+            };
+            match connect(orion, provider, None) {
+                Ok(backend) => {
+                    session.backend = backend;
+                    println!("  {}", s.dim(&format!("new conversation with {}", session.backend.describe())));
+                }
+                Err(e) => println!("  {}", s.red(&format!("{e:#}"))),
+            }
         }
         "usage" => {
-            let u = session.usage;
-            println!(
-                "  input {} · output {} · cache read {} · cache write {}",
-                u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens
-            );
+            let u = session.backend.usage();
+            let mut line = format!("  input {} · output {}", u.input_tokens, u.output_tokens);
+            if u.cache_read_input_tokens + u.cache_creation_input_tokens > 0 {
+                line += &format!(" · cache read {} · cache write {}", u.cache_read_input_tokens, u.cache_creation_input_tokens);
+            }
+            println!("{line}");
         }
         "clear" => {
-            session.clear();
+            session.backend.clear();
             println!("  {}", s.dim("new conversation"));
         }
         _ => println!("  {}", s.red(&format!("unknown command /{cmd}; try /help"))),

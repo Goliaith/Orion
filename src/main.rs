@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use orion::chat::terminal::{self, PromptApprover};
+use orion::chat::Provider;
 use orion::mcp::Server;
 use orion::{audit, Approver, Orion, Policy};
 
@@ -22,8 +23,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Talk to Claude in the terminal; it works on the machine through Orion's tools.
-    Chat,
+    /// Talk to an AI in the terminal; it works on the machine through Orion's tools.
+    Chat {
+        /// Use a model served on this machine instead of Claude.
+        #[arg(long)]
+        local: bool,
+        /// Use this model instead of the configured one.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Serve the tools over MCP on stdin/stdout (this is what AI clients launch).
     Serve,
     /// Show every tool, its risk level, and what the policy decides for it.
@@ -57,7 +65,10 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Cmd::Chat => terminal::run(&Orion::new(policy)),
+        Cmd::Chat { local, model } => {
+            let provider = local.then_some(Provider::Local);
+            terminal::run(&Orion::new(policy), provider, model.as_deref())
+        }
         Cmd::Serve => {
             let orion = Orion::new(policy);
             tracing::info!(

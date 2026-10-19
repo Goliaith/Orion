@@ -1,56 +1,45 @@
-//! Minimal streaming client for the Claude Messages API (raw HTTP + SSE;
-//! there is no official Rust SDK).
+//! The Claude backend: a minimal streaming client for the Messages API (raw
+//! HTTP + SSE; there is no official Rust SDK).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::thread;
-use std::time::Duration;
+use std::io::BufRead;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::http::{non_empty_env, sse_data, Http};
+use super::{Backend, Event, Reply, Stop, ToolCall, ToolResult, ToolSpec, Usage};
+
 const API_VERSION: &str = "2023-06-01";
-const MAX_RETRIES: u32 = 3;
 
-/// What the UI hears while a response streams in.
-pub enum Event<'a> {
-    Text(&'a str),
-    /// Text of a thinking block. With `display: "updates"` these are the
-    /// model's progress notes between tool calls.
-    Thinking(&'a str),
-    ToolUse(&'a str),
+/// `[chat.claude]` in orion.toml.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaudeConfig {
+    pub model: String,
+    /// `low`, `medium`, `high`, `xhigh` or `max`.
+    pub effort: String,
+    pub max_tokens: u32,
+    /// `updates` shows the model's progress notes between tool calls,
+    /// `summarized` shows a summary of its reasoning, `omitted` shows nothing.
+    pub thinking_display: String,
+    /// Let the API retry a declined request on another model.
+    pub fallbacks: bool,
+    /// `ANTHROPIC_BASE_URL` overrides this.
+    pub base_url: String,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Usage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_input_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-}
-
-impl Usage {
-    fn merge(&mut self, v: &Value) {
-        let get = |k: &str| v.get(k).and_then(Value::as_u64);
-        if let Some(n) = get("input_tokens") {
-            self.input_tokens = n;
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self {
+            model: "claude-opus-5-5".into(),
+            effort: "high".into(),
+            max_tokens: 64000,
+            thinking_display: "updates".into(),
+            fallbacks: true,
+            base_url: "https://api.anthropic.com".into(),
         }
-        if let Some(n) = get("output_tokens") {
-            self.output_tokens = n;
-        }
-        if let Some(n) = get("cache_read_input_tokens") {
-            self.cache_read_input_tokens = n;
-        }
-        if let Some(n) = get("cache_creation_input_tokens") {
-            self.cache_creation_input_tokens = n;
-        }
-    }
-
-    pub fn add(&mut self, other: &Usage) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_read_input_tokens += other.cache_read_input_tokens;
-        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
     }
 }
 
@@ -68,126 +57,211 @@ pub struct Message {
     pub invalid_tool_inputs: HashMap<String, String>,
 }
 
-enum Auth {
-    ApiKey(String),
-    Bearer(String),
-}
-
 pub struct Client {
-    agent: ureq::Agent,
-    url: String,
-    auth: Auth,
+    http: Http,
+    /// Betas every request needs because of how it authenticates.
+    auth_betas: Vec<&'static str>,
 }
 
 impl Client {
     /// Credentials come from `ANTHROPIC_API_KEY`, else `ANTHROPIC_AUTH_TOKEN`
     /// (an OAuth access token). `ANTHROPIC_BASE_URL` overrides `base_url`.
     pub fn from_env(base_url: &str) -> Result<Self> {
-        let auth = if let Some(key) = non_empty_env("ANTHROPIC_API_KEY") {
-            Auth::ApiKey(key)
+        let base = non_empty_env("ANTHROPIC_BASE_URL").unwrap_or_else(|| base_url.to_string());
+        if let Some(key) = non_empty_env("ANTHROPIC_API_KEY") {
+            Ok(Self::with_api_key(&base, &key))
         } else if let Some(token) = non_empty_env("ANTHROPIC_AUTH_TOKEN") {
-            Auth::Bearer(token)
+            let headers = vec![("authorization".into(), format!("Bearer {token}"))];
+            Ok(Self { http: Http::new(&base, headers), auth_betas: vec!["oauth-2025-04-20"] })
         } else {
             bail!(
                 "no Claude credentials: set ANTHROPIC_API_KEY (from console.anthropic.com), or set \
-                 ANTHROPIC_AUTH_TOKEN, for example to `ant auth print-credentials --access-token`"
+                 ANTHROPIC_AUTH_TOKEN, for example to `ant auth print-credentials --access-token`. \
+                 Or run a local model with `orion chat --local`"
             );
-        };
-        let base = non_empty_env("ANTHROPIC_BASE_URL").unwrap_or_else(|| base_url.to_string());
-        Ok(Self::new(&base, auth))
+        }
     }
 
     pub fn with_api_key(base_url: &str, key: &str) -> Self {
-        Self::new(base_url, Auth::ApiKey(key.to_string()))
-    }
-
-    fn new(base_url: &str, auth: Auth) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .try_proxy_from_env(!bypass_proxy(base_url))
-            .timeout_connect(Duration::from_secs(30))
-            // Long thinking can leave a stream quiet for a while; the API
-            // sends pings, so this only trips on a dead connection.
-            .timeout_read(Duration::from_secs(600))
-            .build();
-        Self { agent, url: format!("{}/v1/messages", base_url.trim_end_matches('/')), auth }
+        Self { http: Http::new(base_url, vec![("x-api-key".into(), key.to_string())]), auth_betas: Vec::new() }
     }
 
     /// POST a streaming request and assemble the response, reporting progress
-    /// through `on`. Retries rate limits, overload and connection failures
-    /// that happen before the stream starts.
+    /// through `on`.
     pub fn stream(&self, body: &Value, betas: &[&str], on: &mut dyn FnMut(Event)) -> Result<Message> {
-        let body = serde_json::to_string(body)?;
-        let mut attempt = 0;
-        loop {
-            let mut req = self
-                .agent
-                .post(&self.url)
-                .set("content-type", "application/json")
-                .set("anthropic-version", API_VERSION);
-            let mut betas: Vec<&str> = betas.to_vec();
-            match &self.auth {
-                Auth::ApiKey(key) => req = req.set("x-api-key", key),
-                Auth::Bearer(token) => {
-                    req = req.set("authorization", &format!("Bearer {token}"));
-                    betas.push("oauth-2025-04-20");
-                }
-            }
-            if !betas.is_empty() {
-                req = req.set("anthropic-beta", &betas.join(","));
-            }
-            let wait = match req.send_string(&body) {
-                Ok(resp) => return parse_sse(BufReader::new(resp.into_reader()), on),
-                Err(ureq::Error::Status(code, resp)) if retryable(code) && attempt < MAX_RETRIES => {
-                    resp.header("retry-after").and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs)
-                }
-                Err(ureq::Error::Status(code, resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    bail!("Claude API error {code}: {}", api_error_message(&text));
-                }
-                Err(ureq::Error::Transport(t)) if attempt < MAX_RETRIES => {
-                    tracing::debug!("transport error, retrying: {t}");
-                    None
-                }
-                Err(e) => return Err(anyhow!(e).context("calling the Claude API")),
-            };
-            attempt += 1;
-            thread::sleep(wait.unwrap_or(Duration::from_secs(1 << attempt)).min(Duration::from_secs(60)));
+        let mut headers = vec![("anthropic-version", API_VERSION.to_string())];
+        let betas: Vec<&str> = betas.iter().chain(&self.auth_betas).copied().collect();
+        if !betas.is_empty() {
+            headers.push(("anthropic-beta", betas.join(",")));
         }
+        let reader = self.http.post_stream("/v1/messages", body, &headers).context("calling the Claude API")?;
+        parse_sse(reader, on)
     }
 }
 
-/// Loopback hosts and hosts matched by `NO_PROXY` (which ureq ignores) are
-/// reached directly.
-fn bypass_proxy(base_url: &str) -> bool {
-    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
-    let authority = rest.split('/').next().unwrap_or_default();
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
+pub struct ClaudeBackend {
+    client: Client,
+    config: ClaudeConfig,
+    system: String,
+    tools: Vec<Value>,
+    /// Append-only, so thinking blocks and the prompt cache stay valid.
+    messages: Vec<Value>,
+    usage: Usage,
+}
+
+impl ClaudeBackend {
+    pub fn from_env(config: ClaudeConfig, system: String, tools: &[ToolSpec]) -> Result<Self> {
+        let client = Client::from_env(&config.base_url)?;
+        Ok(Self::new(client, config, system, tools))
     }
-    .to_ascii_lowercase();
-    if host == "localhost" || host == "::1" || host.starts_with("127.") {
-        return true;
+
+    pub fn new(client: Client, config: ClaudeConfig, system: String, tools: &[ToolSpec]) -> Self {
+        let tools = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.schema,
+                    "eager_input_streaming": true,
+                })
+            })
+            .collect();
+        Self { client, config, system, tools, messages: Vec::new(), usage: Usage::default() }
     }
-    let no_proxy = non_empty_env("NO_PROXY").or_else(|| non_empty_env("no_proxy")).unwrap_or_default();
-    no_proxy.split(',').map(|p| p.trim().trim_start_matches('.').to_ascii_lowercase()).any(|p| {
-        p == "*" || (!p.is_empty() && (host == p || host.ends_with(&format!(".{p}"))))
-    })
+
+    fn request_body(&self) -> Value {
+        let mut body = json!({
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "stream": true,
+            "system": self.system,
+            "tools": self.tools,
+            "messages": self.messages,
+            "thinking": { "type": "adaptive", "display": self.config.thinking_display },
+            "output_config": { "effort": self.config.effort },
+            // Caches the growing conversation prefix between requests.
+            "cache_control": { "type": "ephemeral" },
+        });
+        if self.config.fallbacks {
+            body["fallbacks"] = json!("default");
+        }
+        body
+    }
+
+    fn betas(&self) -> Vec<&'static str> {
+        let mut betas = Vec::new();
+        if self.config.fallbacks {
+            betas.push("server-side-fallback-2026-07-01");
+        }
+        if self.config.thinking_display == "updates" {
+            betas.push("thinking-display-updates-2026-08-18");
+        }
+        betas
+    }
 }
 
-fn non_empty_env(var: &str) -> Option<String> {
-    std::env::var(var).ok().filter(|v| !v.trim().is_empty())
+impl Backend for ClaudeBackend {
+    fn describe(&self) -> String {
+        format!("{} · effort {}", self.config.model, self.config.effort)
+    }
+
+    fn set_model(&mut self, model: &str) {
+        self.config.model = model.to_string();
+    }
+
+    fn set_effort(&mut self, effort: &str) -> Result<(), String> {
+        const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+        if !EFFORTS.contains(&effort) {
+            return Err(format!("effort must be one of {}", EFFORTS.join(", ")));
+        }
+        self.config.effort = effort.to_string();
+        Ok(())
+    }
+
+    fn push_user(&mut self, text: &str) {
+        self.messages.push(json!({ "role": "user", "content": text }));
+    }
+
+    fn respond(&mut self, on: &mut dyn FnMut(Event)) -> Result<Reply> {
+        let msg = self.client.stream(&self.request_body(), &self.betas(), on)?;
+        self.usage.add(&msg.usage);
+        let stop = msg.stop_reason.as_deref().unwrap_or_default();
+        if stop == "refusal" {
+            // A partial reply is discarded, not kept in the history.
+            return Ok(Reply { calls: Vec::new(), stop: Stop::Refused });
+        }
+        let content = echo_content(msg.content);
+        let calls: Vec<ToolCall> = content
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|b| {
+                let id = b["id"].as_str().unwrap_or_default().to_string();
+                ToolCall {
+                    invalid_input: msg.invalid_tool_inputs.get(&id).cloned(),
+                    name: b["name"].as_str().unwrap_or_default().to_string(),
+                    input: b["input"].clone(),
+                    id,
+                }
+            })
+            .collect();
+        if !content.is_empty() {
+            self.messages.push(json!({ "role": "assistant", "content": content }));
+        }
+        let stop = match stop {
+            "max_tokens" => Stop::Truncated,
+            _ if !calls.is_empty() => Stop::ToolUse,
+            _ => Stop::Done,
+        };
+        Ok(Reply { calls, stop })
+    }
+
+    fn push_tool_results(&mut self, results: Vec<ToolResult>) {
+        // Every tool_use gets a result, all in a single user message.
+        let blocks: Vec<Value> = results
+            .into_iter()
+            .map(|r| json!({ "type": "tool_result", "tool_use_id": r.id, "content": r.content, "is_error": r.is_error }))
+            .collect();
+        self.messages.push(json!({ "role": "user", "content": blocks }));
+    }
+
+    fn clear(&mut self) {
+        self.messages.clear();
+    }
+
+    fn usage(&self) -> Usage {
+        self.usage
+    }
 }
 
-fn retryable(code: u16) -> bool {
-    matches!(code, 408 | 409 | 429 | 500..=599)
+/// The blocks of a response that go back into the history. After a
+/// mid-response server-side fallback, only text survives from before the last
+/// `fallback` marker; the declined model's tool calls and thinking are dropped
+/// (and so are never run).
+fn echo_content(content: Vec<Value>) -> Vec<Value> {
+    let Some(boundary) = content.iter().rposition(|b| b["type"] == "fallback") else { return content };
+    content
+        .into_iter()
+        .enumerate()
+        .filter(|(i, b)| *i >= boundary || b["type"] == "text")
+        .map(|(_, b)| b)
+        .collect()
 }
 
-fn api_error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| body.trim().to_string())
+fn merge_usage(usage: &mut Usage, v: &Value) {
+    let get = |k: &str| v.get(k).and_then(Value::as_u64);
+    if let Some(n) = get("input_tokens") {
+        usage.input_tokens = n;
+    }
+    if let Some(n) = get("output_tokens") {
+        usage.output_tokens = n;
+    }
+    if let Some(n) = get("cache_read_input_tokens") {
+        usage.cache_read_input_tokens = n;
+    }
+    if let Some(n) = get("cache_creation_input_tokens") {
+        usage.cache_creation_input_tokens = n;
+    }
 }
 
 /// Assemble a message from a Server-Sent Events stream.
@@ -195,24 +269,19 @@ pub fn parse_sse(reader: impl BufRead, on: &mut dyn FnMut(Event)) -> Result<Mess
     let mut msg = Message::default();
     // Per block index: the block so far and any streamed tool-input JSON.
     let mut blocks: Vec<(Value, String)> = Vec::new();
-    for line in reader.lines() {
-        let line = line.context("reading the response stream")?;
-        let Some(data) = line.strip_prefix("data:") else { continue };
-        let ev: Value = serde_json::from_str(data.trim()).context("malformed stream event")?;
+    for data in sse_data(reader) {
+        let ev: Value = serde_json::from_str(&data?).context("malformed stream event")?;
         let index = ev.get("index").and_then(Value::as_u64).map(|i| i as usize);
         match ev.get("type").and_then(Value::as_str).unwrap_or_default() {
             "message_start" => {
                 let m = &ev["message"];
                 msg.model = m.get("model").and_then(Value::as_str).map(str::to_string);
-                msg.usage.merge(&m["usage"]);
+                merge_usage(&mut msg.usage, &m["usage"]);
             }
             "content_block_start" => {
                 let (Some(i), Some(block)) = (index, ev.get("content_block")) else { continue };
                 if blocks.len() <= i {
                     blocks.resize(i + 1, (Value::Null, String::new()));
-                }
-                if block["type"] == "tool_use" {
-                    on(Event::ToolUse(block["name"].as_str().unwrap_or_default()));
                 }
                 blocks[i] = (block.clone(), String::new());
             }
@@ -265,10 +334,13 @@ pub fn parse_sse(reader: impl BufRead, on: &mut dyn FnMut(Event)) -> Result<Mess
                 if let Some(r) = ev.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     msg.stop_reason = Some(r.to_string());
                 }
-                msg.usage.merge(&ev["usage"]);
+                merge_usage(&mut msg.usage, &ev["usage"]);
             }
             "message_stop" => break,
-            "error" => bail!("Claude API stream error: {}", ev.pointer("/error/message").and_then(Value::as_str).unwrap_or("unknown")),
+            "error" => bail!(
+                "Claude API stream error: {}",
+                ev.pointer("/error/message").and_then(Value::as_str).unwrap_or("unknown")
+            ),
             _ => {} // ping and future event types
         }
     }
@@ -278,6 +350,8 @@ pub fn parse_sse(reader: impl BufRead, on: &mut dyn FnMut(Event)) -> Result<Mess
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{fake_server, orion, Recorder};
+    use super::super::{offered_tools, Session};
     use super::*;
 
     fn sse(events: &[Value]) -> String {
@@ -312,11 +386,10 @@ mod tests {
             seen.push(match e {
                 Event::Text(t) => format!("text:{t}"),
                 Event::Thinking(t) => format!("thinking:{t}"),
-                Event::ToolUse(n) => format!("tool:{n}"),
             })
         })
         .unwrap();
-        assert_eq!(seen, ["thinking:Checking memory.", "text:Let me ", "text:look.", "tool:proc_list", "tool:fs_read"]);
+        assert_eq!(seen, ["thinking:Checking memory.", "text:Let me ", "text:look."]);
         assert_eq!(msg.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(msg.usage.input_tokens, 10);
         assert_eq!(msg.usage.output_tokens, 42);
@@ -328,16 +401,86 @@ mod tests {
     }
 
     #[test]
-    fn loopback_skips_the_proxy() {
-        assert!(bypass_proxy("http://127.0.0.1:8080"));
-        assert!(bypass_proxy("http://localhost/v1"));
-        assert!(bypass_proxy("http://[::1]:9"));
-    }
-
-    #[test]
     fn surfaces_stream_errors() {
         let stream = sse(&[json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})]);
         let err = parse_sse(stream.as_bytes(), &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("Overloaded"));
+    }
+
+    #[test]
+    fn tool_loop_round_trip() {
+        let first = sse(&[
+            json!({"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":100}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Checking the host."}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"system_info","input":{}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t2","name":"fs_write","input":{}}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/orion-test-root/x\",\"content\":\"hi\"}"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let second = sse(&[
+            json!({"type":"message_start","message":{"usage":{"input_tokens":300}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+            json!({"type":"message_stop"}),
+        ]);
+        let (url, requests) = fake_server(vec![first, second]);
+        let orion = orion();
+        let backend = ClaudeBackend::new(
+            Client::with_api_key(&url, "test"),
+            ClaudeConfig::default(),
+            "system".into(),
+            &offered_tools(&orion),
+        );
+        let mut session = Session::new(&orion, Box::new(backend));
+        let mut ui = Recorder::default();
+        session.turn("what machine is this?", &mut ui).unwrap();
+
+        assert_eq!(ui.out, "[Checking the host.]<system_info><ok><fs_write><err>Done.");
+        assert_eq!(ui.approvals, 1, "fs_write is `ask` by default");
+        let usage = session.backend.usage();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (400, 25));
+
+        let (path, req1) = requests.recv().unwrap();
+        assert_eq!(path, "/v1/messages");
+        assert_eq!(req1["model"], "claude-opus-5-5");
+        assert_eq!(req1["fallbacks"], "default");
+        let offered: Vec<&str> = req1["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(offered.contains(&"proc_run") && offered.contains(&"fs_write"));
+
+        let (_, req2) = requests.recv().unwrap();
+        let msgs = req2["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        // The thinking block goes back unchanged, signature included.
+        assert_eq!(msgs[1]["content"][0], json!({"type":"thinking","thinking":"Checking the host.","signature":"abc"}));
+        let results = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(results[0]["tool_use_id"], "t1");
+        assert_eq!(results[0]["is_error"], false);
+        assert_eq!(results[1]["is_error"], true);
+        assert!(results[1]["content"].as_str().unwrap().contains("declined"));
+    }
+
+    #[test]
+    fn fallback_echo_drops_declined_partial() {
+        let content = vec![
+            json!({"type":"thinking","thinking":"","signature":"a"}),
+            json!({"type":"text","text":"Partial"}),
+            json!({"type":"tool_use","id":"t1","name":"fs_read","input":{}}),
+            json!({"type":"fallback","from":{"model":"x"},"to":{"model":"y"}}),
+            json!({"type":"thinking","thinking":"","signature":"b"}),
+            json!({"type":"text","text":" continued"}),
+        ];
+        let kept: Vec<Value> = echo_content(content);
+        let types: Vec<&str> = kept.iter().map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["text", "fallback", "thinking", "text"]);
+        assert_eq!(kept[2]["signature"], "b");
     }
 }

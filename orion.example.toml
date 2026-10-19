@@ -39,12 +39,26 @@ max_output_bytes = 65536   # per stream
 enabled = true
 # path = "~/.local/state/orion/audit.jsonl"
 
-# The `orion chat` front-end. Needs ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN).
+# The `orion chat` front-end.
 [chat]
+provider = "claude"             # claude, or local (`orion chat --local` overrides)
+max_tool_rounds = 50            # model calls per message before stopping
+
+# Claude. Needs ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN).
+[chat.claude]
 model = "claude-opus-5-5"
 effort = "high"                 # low, medium, high, xhigh, max
 max_tokens = 64000
 thinking_display = "updates"    # updates (progress notes), summarized, omitted
 fallbacks = true                # retry declined requests on another model
-max_tool_rounds = 50            # model calls per message before stopping
 base_url = "https://api.anthropic.com"   # ANTHROPIC_BASE_URL overrides
+
+# A model served on this machine, through the OpenAI-compatible API that
+# Ollama, llama.cpp (llama-server), vLLM and LM Studio all provide.
+[chat.local]
+base_url = "http://127.0.0.1:11434/v1"   # Ollama. llama-server: :8080/v1,
+                                         # vLLM: :8000/v1, LM Studio: :1234/v1
+model = ""                      # empty: the first model the server lists
+# max_tokens = 8192             # unset: the server decides
+# temperature = 0.6
+# api_key_env = "LOCAL_LLM_KEY" # for servers that want a bearer token

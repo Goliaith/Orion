@@ -5,10 +5,10 @@ Orion is an operating system built around AI: Linux underneath, with a model as 
 This repository holds the first two pieces:
 
 - **The interface between the AI and the system.** A model never touches the machine directly. It talks to `orion`, which offers the machine as a small set of typed tools. A local policy decides what is allowed, and every call is written to an audit log.
-- **The front-end**, `orion chat`. You talk to Claude in your terminal, and Claude works on the machine through those same tools. Anything risky stops and asks you first.
+- **The front-end**, `orion chat`. You talk to an AI in your terminal, either Claude or a model running on this machine's own hardware, and it works on the machine through those same tools. Anything risky stops and asks you first.
 
 ```
-   you ──▶ orion chat ──(Claude API)──▶ Claude
+   you ──▶ orion chat ──▶ Claude (API)  or  a local model (Ollama, llama.cpp, vLLM, …)
               │  ▲ approval prompts
               ▼  │
    ┌────────────────────────────┐   MCP (stdio)   ┌──────────────────────┐
@@ -63,20 +63,45 @@ I'll check the hardware and the biggest processes.
   ⚙ proc_list {"limit":5,"sort":"memory"}
     ✓ 3ms
   ⚙ fs_write {"content":"…","path":"~/orion-workspace/memory.txt"}
-  ? Claude wants to run fs_write:
+  ? Approve fs_write?
     { "content": "…", "path": "~/orion-workspace/memory.txt" }
-  Allow? [y]es / [n]o / [a]lways for this session › y
+  [y]es / [n]o / [a]lways for this session › y
     ✓ 1ms
 Firefox is using 3.1 GB of your 16 GB. I wrote the details to ~/orion-workspace/memory.txt.
 ```
 
-- **Streaming.** Replies stream as they are written. Claude's short progress notes between tool calls show dimmed, so long tasks don't sit silent.
+- **Streaming.** Replies stream as they are written. The model's progress notes and reasoning show dimmed, so long tasks don't sit silent.
 - **Every tool call is visible**, with its arguments and whether it worked.
 - **Approval prompts** show the full arguments of anything that changes the machine. `a` approves that tool for the rest of the session.
-- **Commands:** `/tools`, `/model`, `/effort`, `/usage`, `/clear`, `/exit`. Line history is kept in `~/.local/state/orion/chat_history`.
-- Settings live under `[chat]` in the policy file: model (default `claude-opus-5-5`), effort, display of progress notes, and server-side fallbacks.
+- **Commands:** `/tools`, `/model`, `/models`, `/use claude|local`, `/effort`, `/usage`, `/clear`, `/exit`. Line history is kept in `~/.local/state/orion/chat_history`.
+- Settings live under `[chat]` in the policy file: the default provider, and per-provider sections `[chat.claude]` (model, default `claude-opus-5-5`; effort; progress notes; fallbacks) and `[chat.local]`.
 
 `ANTHROPIC_AUTH_TOKEN` (an OAuth access token) also works in place of an API key.
+
+### Local models
+
+Orion can use a model running on your own GPU instead of Claude. Nothing leaves the machine, and no API key is needed. It speaks the OpenAI-compatible chat API (`/v1/chat/completions`, with streaming and tool calls), which every major local runtime serves:
+
+| Runtime | Start it | `[chat.local] base_url` |
+|---|---|---|
+| [Ollama](https://ollama.com) | `ollama pull qwen3:8b` (the server runs as a service) | `http://127.0.0.1:11434/v1` (default) |
+| llama.cpp | `llama-server -m model.gguf --jinja` | `http://127.0.0.1:8080/v1` |
+| vLLM | `vllm serve Qwen/Qwen3-8B --enable-auto-tool-choice --tool-call-parser hermes` | `http://127.0.0.1:8000/v1` |
+| LM Studio | start the local server in the app | `http://127.0.0.1:1234/v1` |
+
+```sh
+orion chat --local                    # first model the server lists
+orion chat --local --model qwen3:8b   # a specific one
+```
+
+Or set `provider = "local"` under `[chat]` to make it the default. Inside a chat, `/models` lists what the server has, `/model <id>` switches, and `/use claude` or `/use local` swaps provider, which starts a new conversation.
+
+Things to know:
+
+- **Pick a model trained for tool calling.** Qwen3, Llama 3.1+, Mistral Small 3 and gpt-oss work well. Smaller models (under ~7B) often call tools badly or not at all.
+- **Context length matters.** Orion's tool definitions plus the results of a few calls fill a small window fast. Ollama's default context is short; raise it with `OLLAMA_CONTEXT_LENGTH=32768`, or with `-c` on llama-server.
+- **Reasoning display.** Models that reason (Qwen3, DeepSeek-R1, gpt-oss) show their reasoning dimmed, whether the server sends it separately (`reasoning_content` / `reasoning`) or inline in `<think>` tags. It is not sent back to the model in the history.
+- **The same policy applies.** A local model gets exactly the tools, approvals and audit log that Claude does.
 
 ## Other commands
 
@@ -126,8 +151,10 @@ src/
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
   tools/        built-in tools: system, fs, process
   chat/
-    claude.rs   streaming Claude Messages API client (SSE, retries)
-    mod.rs      the agent loop: append-only history, tool rounds, approvals
+    mod.rs      the Backend trait and the tool loop: rounds, approvals, results
+    claude.rs   Claude backend: streaming Messages API client (SSE)
+    local.rs    local backend: OpenAI-compatible chat completions (Ollama, llama.cpp, vLLM, LM Studio)
+    http.rs     shared HTTP: retries, proxy rules, error bodies, SSE lines
     terminal.rs the interactive terminal UI
 tests/stdio.rs  end-to-end MCP session against the real binary
 ```
@@ -140,4 +167,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. **System daemon.** Run `oriond` as a systemd service on a Unix socket, with `orion serve` as a thin stdio bridge, so many agents share one policy and one log.
 3. **Isolation.** Run `proc_run` inside namespaces, cgroups and seccomp (or Landlock), with CPU, memory and GPU limits per call.
 4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
-5. **Front-end, next steps.** ~~A terminal chat~~ is done. Still to come: interrupting a reply with Ctrl-C, saving and resuming conversations, a full-screen TUI, voice, local models (running on the GPU) alongside Claude, and a graphical shell.
+5. **Front-end, next steps.** ~~A terminal chat~~ and ~~local models~~ are done. Still to come: interrupting a reply with Ctrl-C, saving and resuming conversations, a full-screen TUI, voice, a graphical shell, and routing between local and hosted models automatically (for example, local for private or simple tasks).

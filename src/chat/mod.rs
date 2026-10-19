@@ -1,9 +1,14 @@
-//! `orion chat`: the human-facing front-end. You talk to Claude in the
-//! terminal; Claude works on the machine through the same policy-checked
-//! tools that `orion serve` exposes, and `ask` decisions come to you as
-//! approval prompts.
+//! `orion chat`: the human-facing front-end. You talk to a model in the
+//! terminal; it works on the machine through the same policy-checked tools
+//! that `orion serve` exposes, and `ask` decisions come to you as approval
+//! prompts.
+//!
+//! The model is behind [`Backend`]: [`claude`] for the Claude API, [`local`]
+//! for models served on this machine (Ollama, llama.cpp, vLLM, LM Studio).
 
 pub mod claude;
+mod http;
+pub mod local;
 pub mod terminal;
 
 use std::cell::RefCell;
@@ -11,41 +16,121 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{Approver, Decision, Orion, Policy, Tool};
-use claude::{Client, Event, Usage};
 
 /// `[chat]` in orion.toml.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatConfig {
-    pub model: String,
-    /// `low`, `medium`, `high`, `xhigh` or `max`.
-    pub effort: String,
-    pub max_tokens: u32,
-    /// `updates` shows the model's progress notes between tool calls,
-    /// `summarized` shows a summary of its reasoning, `omitted` shows nothing.
-    pub thinking_display: String,
-    /// Let the API retry a declined request on another model.
-    pub fallbacks: bool,
+    pub provider: Provider,
     /// Model calls per user message before the turn is stopped.
     pub max_tool_rounds: usize,
-    pub base_url: String,
+    pub claude: claude::ClaudeConfig,
+    pub local: local::LocalConfig,
 }
 
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
-            model: "claude-opus-5-5".into(),
-            effort: "high".into(),
-            max_tokens: 64000,
-            thinking_display: "updates".into(),
-            fallbacks: true,
+            provider: Provider::Claude,
             max_tool_rounds: 50,
-            base_url: "https://api.anthropic.com".into(),
+            claude: Default::default(),
+            local: Default::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Claude,
+    Local,
+}
+
+/// What the UI hears while a reply streams in.
+pub enum Event<'a> {
+    Text(&'a str),
+    /// Reasoning or progress notes, shown apart from the answer.
+    Thinking(&'a str),
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+}
+
+impl Usage {
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+    }
+}
+
+/// A tool as offered to the model.
+pub struct ToolSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub schema: Value,
+}
+
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
+    /// The raw arguments, when they were not a valid JSON object. Such a
+    /// call is answered with an error and never run.
+    pub invalid_input: Option<String>,
+}
+
+pub struct ToolResult {
+    pub id: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// The model finished its reply.
+    Done,
+    /// The model wants the tool calls run.
+    ToolUse,
+    /// The reply hit the output limit; any tool calls in it may be cut off.
+    Truncated,
+    /// The model declined. Nothing from this reply was kept in the history.
+    Refused,
+}
+
+pub struct Reply {
+    pub calls: Vec<ToolCall>,
+    pub stop: Stop,
+}
+
+/// A model and the conversation history in that model's own format. A
+/// backend appends its replies to the history itself, so the session never
+/// rewrites what the model said.
+pub trait Backend {
+    /// One line for the banner, such as the model and its settings.
+    fn describe(&self) -> String;
+    fn set_model(&mut self, model: &str);
+    fn set_effort(&mut self, _effort: &str) -> Result<(), String> {
+        Err("this backend has no effort setting".into())
+    }
+    fn list_models(&self) -> Result<Vec<String>> {
+        anyhow::bail!("this backend cannot list models")
+    }
+    fn push_user(&mut self, text: &str);
+    fn respond(&mut self, on: &mut dyn FnMut(Event)) -> Result<Reply>;
+    /// Answers to every call of the last reply, in order.
+    fn push_tool_results(&mut self, results: Vec<ToolResult>);
+    fn clear(&mut self);
+    fn usage(&self) -> Usage;
 }
 
 /// What the session needs from whoever is showing it.
@@ -67,154 +152,105 @@ impl Approver for UiApprover<'_> {
     }
 }
 
-/// One conversation. The history is append-only, so thinking blocks and the
-/// prompt cache stay valid from turn to turn.
+/// The tools a model in chat is offered. Denied tools never are. `ask`
+/// tools are, because a human is here to answer.
+pub fn offered_tools(orion: &Orion) -> Vec<ToolSpec> {
+    orion
+        .tools()
+        .filter(|(_, d)| *d != Decision::Deny)
+        .map(|(t, _)| ToolSpec { name: t.name(), description: t.description(), schema: t.input_schema() })
+        .collect()
+}
+
+/// Build the backend for `provider`, optionally overriding its model.
+pub fn connect(orion: &Orion, provider: Provider, model: Option<&str>) -> Result<Box<dyn Backend>> {
+    let config = &orion.policy().chat;
+    let system = system_prompt(orion.policy());
+    let tools = offered_tools(orion);
+    Ok(match provider {
+        Provider::Claude => {
+            let mut b = claude::ClaudeBackend::from_env(config.claude.clone(), system, &tools)?;
+            if let Some(m) = model {
+                b.set_model(m);
+            }
+            Box::new(b)
+        }
+        Provider::Local => {
+            let mut c = config.local.clone();
+            if let Some(m) = model {
+                c.model = m.to_string();
+            }
+            Box::new(local::LocalBackend::connect(c, system, &tools)?)
+        }
+    })
+}
+
+/// One conversation: the tool loop around a backend.
 pub struct Session<'a> {
     orion: &'a Orion,
-    client: Client,
-    pub config: ChatConfig,
-    system: String,
-    tools: Vec<Value>,
-    messages: Vec<Value>,
-    pub usage: Usage,
+    pub backend: Box<dyn Backend>,
+    max_tool_rounds: usize,
 }
 
 impl<'a> Session<'a> {
-    pub fn new(orion: &'a Orion, client: Client) -> Self {
-        let config = orion.policy().chat.clone();
-        // Denied tools are never offered. `ask` tools are, because a human is here.
-        let tools = orion
-            .tools()
-            .filter(|(_, d)| *d != Decision::Deny)
-            .map(|(t, _)| {
-                json!({
-                    "name": t.name(),
-                    "description": t.description(),
-                    "input_schema": t.input_schema(),
-                    "eager_input_streaming": true,
-                })
-            })
-            .collect();
-        Self { orion, client, config, system: system_prompt(orion.policy()), tools, messages: Vec::new(), usage: Usage::default() }
+    pub fn new(orion: &'a Orion, backend: Box<dyn Backend>) -> Self {
+        Self { orion, backend, max_tool_rounds: orion.policy().chat.max_tool_rounds }
     }
 
-    pub fn tool_count(&self) -> usize {
-        self.tools.len()
-    }
-
-    pub fn clear(&mut self) {
-        self.messages.clear();
-    }
-
-    fn request_body(&self) -> Value {
-        let mut body = json!({
-            "model": self.config.model,
-            "max_tokens": self.config.max_tokens,
-            "stream": true,
-            "system": self.system,
-            "tools": self.tools,
-            "messages": self.messages,
-            "thinking": { "type": "adaptive", "display": self.config.thinking_display },
-            "output_config": { "effort": self.config.effort },
-            // Caches the growing conversation prefix between requests.
-            "cache_control": { "type": "ephemeral" },
-        });
-        if self.config.fallbacks {
-            body["fallbacks"] = json!("default");
-        }
-        body
-    }
-
-    fn betas(&self) -> Vec<&'static str> {
-        let mut betas = Vec::new();
-        if self.config.fallbacks {
-            betas.push("server-side-fallback-2026-07-01");
-        }
-        if self.config.thinking_display == "updates" {
-            betas.push("thinking-display-updates-2026-08-18");
-        }
-        betas
-    }
-
-    /// Send one user message and run the tool loop until the model is done.
+    /// Send one user message and run tools until the model is done.
     pub fn turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
-        self.messages.push(json!({ "role": "user", "content": input }));
-        for _ in 0..self.config.max_tool_rounds {
-            let msg = self.client.stream(&self.request_body(), &self.betas(), &mut |ev| match ev {
+        self.backend.push_user(input);
+        for _ in 0..self.max_tool_rounds {
+            let reply = self.backend.respond(&mut |ev| match ev {
                 Event::Text(t) => ui.text(t),
                 Event::Thinking(t) => ui.thinking(t),
-                Event::ToolUse(_) => {}
             })?;
-            self.usage.add(&msg.usage);
-            let stop = msg.stop_reason.as_deref().unwrap_or_default();
-            if stop == "refusal" {
-                // A partial reply is discarded, not kept in the history.
-                ui.notice("The model declined this request.");
-                return Ok(());
-            }
-
-            let content = echo_content(msg.content);
-            let calls: Vec<Value> = content.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
-            if !content.is_empty() {
-                self.messages.push(json!({ "role": "assistant", "content": content }));
-            }
-            if calls.is_empty() {
-                if stop == "max_tokens" {
-                    ui.notice("The reply hit max_tokens and was cut off.");
+            match reply.stop {
+                Stop::Refused => {
+                    ui.notice("The model declined this request.");
+                    return Ok(());
                 }
-                return Ok(());
+                _ if reply.calls.is_empty() => {
+                    if reply.stop == Stop::Truncated {
+                        ui.notice("The reply hit the output limit and was cut off.");
+                    }
+                    return Ok(());
+                }
+                _ => {}
             }
-
-            // Every tool_use gets a result, all in a single user message.
-            let results: Vec<Value> = calls
+            let results = reply
+                .calls
                 .iter()
                 .map(|call| {
-                    let id = call["id"].as_str().unwrap_or_default();
-                    let (text, is_error) = if let Some(raw) = msg.invalid_tool_inputs.get(id) {
-                        (json!({ "INVALID_JSON": raw }).to_string(), true)
-                    } else if stop == "max_tokens" {
-                        ("Not run: the tool input was cut off by max_tokens.".to_string(), true)
+                    let (content, is_error) = if let Some(raw) = &call.invalid_input {
+                        (serde_json::json!({ "INVALID_JSON": raw }).to_string(), true)
+                    } else if reply.stop == Stop::Truncated {
+                        ("Not run: the tool input was cut off by the output limit.".to_string(), true)
                     } else {
                         self.run_tool(call, ui)
                     };
-                    json!({ "type": "tool_result", "tool_use_id": id, "content": text, "is_error": is_error })
+                    ToolResult { id: call.id.clone(), content, is_error }
                 })
                 .collect();
-            self.messages.push(json!({ "role": "user", "content": results }));
+            self.backend.push_tool_results(results);
         }
-        ui.notice(&format!("Stopped after {} model calls in one turn.", self.config.max_tool_rounds));
+        ui.notice(&format!("Stopped after {} model calls in one turn.", self.max_tool_rounds));
         Ok(())
     }
 
-    fn run_tool(&self, call: &Value, ui: &mut dyn Ui) -> (String, bool) {
-        let name = call["name"].as_str().unwrap_or_default();
-        let input = call["input"].clone();
-        ui.tool_start(name, &input);
+    fn run_tool(&self, call: &ToolCall, ui: &mut dyn Ui) -> (String, bool) {
+        ui.tool_start(&call.name, &call.input);
         let start = Instant::now();
         let result = {
             let approver = UiApprover(RefCell::new(&mut *ui));
-            self.orion.call(name, input, Some(&approver)).map_err(|e| e.to_string())
+            self.orion.call(&call.name, call.input.clone(), Some(&approver)).map_err(|e| e.to_string())
         };
-        ui.tool_end(name, &result, start.elapsed());
+        ui.tool_end(&call.name, &result, start.elapsed());
         match result {
             Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_default(), false),
             Err(e) => (e, true),
         }
     }
-}
-
-/// The blocks of a response that go back into the history. After a
-/// mid-response server-side fallback, only text survives from before the last
-/// `fallback` marker; the declined model's tool calls and thinking are dropped
-/// (and so are never run).
-fn echo_content(content: Vec<Value>) -> Vec<Value> {
-    let Some(boundary) = content.iter().rposition(|b| b["type"] == "fallback") else { return content };
-    content
-        .into_iter()
-        .enumerate()
-        .filter(|(i, b)| *i >= boundary || b["type"] == "text")
-        .map(|(_, b)| b)
-        .collect()
 }
 
 fn system_prompt(policy: &Policy) -> String {
@@ -249,19 +285,19 @@ no approval can override that. Programs that run without asking: {commands}.",
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
 
     use super::*;
-    use crate::Policy;
 
+    /// Records what a session shows, and declines every approval.
     #[derive(Default)]
-    struct Recorder {
-        out: String,
-        approvals: u32,
+    pub struct Recorder {
+        pub out: String,
+        pub approvals: u32,
     }
 
     impl Ui for Recorder {
@@ -286,12 +322,15 @@ mod tests {
         }
     }
 
-    fn sse(events: &[Value]) -> String {
-        events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect()
+    pub fn orion() -> Orion {
+        Orion::new(
+            Policy::from_toml("[fs]\nwrite_roots = [\"/tmp/orion-test-root\"]\n[audit]\nenabled = false\n").unwrap(),
+        )
     }
 
-    /// Serve each canned SSE body in turn; send each request body back.
-    fn fake_api(responses: Vec<String>) -> (String, mpsc::Receiver<Value>) {
+    /// A server that answers each request with the next canned body (SSE or
+    /// JSON), and sends each request's path and JSON body back.
+    pub fn fake_server(responses: Vec<String>) -> (String, mpsc::Receiver<(String, Value)>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = mpsc::channel();
@@ -299,6 +338,9 @@ mod tests {
             for body in responses {
                 let (stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
                 let mut len = 0;
                 loop {
                     let mut line = String::new();
@@ -312,88 +354,17 @@ mod tests {
                 }
                 let mut req = vec![0; len];
                 reader.read_exact(&mut req).unwrap();
-                tx.send(serde_json::from_slice(&req).unwrap()).unwrap();
+                tx.send((path, serde_json::from_slice(&req).unwrap_or(Value::Null))).unwrap();
+                let kind = if body.starts_with('{') { "application/json" } else { "text/event-stream" };
                 let mut stream = stream;
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .unwrap();
             }
         });
         (url, rx)
-    }
-
-    #[test]
-    fn tool_loop_round_trip() {
-        let first = sse(&[
-            json!({"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":100}}}),
-            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
-            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Checking the host."}}),
-            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}),
-            json!({"type":"content_block_stop","index":0}),
-            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"system_info","input":{}}}),
-            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
-            json!({"type":"content_block_stop","index":1}),
-            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t2","name":"fs_write","input":{}}}),
-            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/orion-test-root/x\",\"content\":\"hi\"}"}}),
-            json!({"type":"content_block_stop","index":2}),
-            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}),
-            json!({"type":"message_stop"}),
-        ]);
-        let second = sse(&[
-            json!({"type":"message_start","message":{"usage":{"input_tokens":300}}}),
-            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
-            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}),
-            json!({"type":"content_block_stop","index":0}),
-            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
-            json!({"type":"message_stop"}),
-        ]);
-        let (url, requests) = fake_api(vec![first, second]);
-        let orion =
-            Orion::new(Policy::from_toml("[fs]\nwrite_roots = [\"/tmp/orion-test-root\"]\n[audit]\nenabled = false\n").unwrap());
-        let mut session = Session::new(&orion, Client::with_api_key(&url, "test"));
-        let mut ui = Recorder::default();
-        session.turn("what machine is this?", &mut ui).unwrap();
-
-        assert_eq!(ui.out, "[Checking the host.]<system_info><ok><fs_write><err>Done.");
-        assert_eq!(ui.approvals, 1, "fs_write is `ask` by default");
-        assert_eq!(session.usage.input_tokens, 400);
-        assert_eq!(session.usage.output_tokens, 25);
-
-        let req1 = requests.recv().unwrap();
-        assert_eq!(req1["model"], "claude-opus-5-5");
-        assert_eq!(req1["fallbacks"], "default");
-        let offered: Vec<&str> = req1["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(offered.contains(&"proc_run") && offered.contains(&"fs_write"));
-
-        let req2 = requests.recv().unwrap();
-        let msgs = req2["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
-        // The thinking block goes back unchanged, signature included.
-        assert_eq!(msgs[1]["content"][0], json!({"type":"thinking","thinking":"Checking the host.","signature":"abc"}));
-        let results = msgs[2]["content"].as_array().unwrap();
-        assert_eq!(results[0]["tool_use_id"], "t1");
-        assert_eq!(results[0]["is_error"], false);
-        assert_eq!(results[1]["is_error"], true);
-        assert!(results[1]["content"].as_str().unwrap().contains("declined"));
-        assert_eq!(session.messages.len(), 4);
-    }
-
-    #[test]
-    fn fallback_echo_drops_declined_partial() {
-        let content = vec![
-            json!({"type":"thinking","thinking":"","signature":"a"}),
-            json!({"type":"text","text":"Partial"}),
-            json!({"type":"tool_use","id":"t1","name":"fs_read","input":{}}),
-            json!({"type":"fallback","from":{"model":"x"},"to":{"model":"y"}}),
-            json!({"type":"thinking","thinking":"","signature":"b"}),
-            json!({"type":"text","text":" continued"}),
-        ];
-        let kept: Vec<Value> = echo_content(content);
-        let types: Vec<&str> = kept.iter().map(|b| b["type"].as_str().unwrap()).collect();
-        assert_eq!(types, ["text", "fallback", "thinking", "text"]);
-        assert_eq!(kept[2]["signature"], "b");
     }
 }
