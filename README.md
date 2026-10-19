@@ -75,7 +75,7 @@ Firefox is using 3.1 GB of your 16 GB. I wrote the details to ~/orion-workspace/
 - **Streaming.** Replies stream as they are written. The model's progress notes and reasoning show dimmed, so long tasks don't sit silent.
 - **Every tool call is visible**, with its arguments and whether it worked.
 - **Approval prompts** show the full arguments of anything that changes the machine. `a` approves that tool for the rest of the session.
-- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/keys`, `/new`, `/history`, `/resume`, `/title`, `/exit`, plus `@claude` / `@local` prefixes and the [hotkeys](#hotkeys). Line history is kept in `~/.local/state/orion/chat_history`.
+- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/voice`, `/keys`, `/new`, `/history`, `/resume`, `/title`, `/exit`, plus `@claude` / `@local` prefixes and the [hotkeys](#hotkeys). Line history is kept in `~/.local/state/orion/chat_history`.
 - Settings live under `[chat]` in the policy file: the mode (`provider = "auto"`, `"claude"` or `"local"`) and the sections `[chat.claude]` (model, default `claude-opus-5-5`; effort; progress notes; fallbacks), `[chat.local]` and `[chat.router]`.
 
 `ANTHROPIC_AUTH_TOKEN` (an OAuth access token) also works in place of an API key.
@@ -117,6 +117,35 @@ On a terminal, `orion chat` opens full screen:
 
 `orion chat --plain`, or `interface = "plain"` under `[chat]`, keeps the line-by-line chat, and it's used automatically when input or output isn't a terminal. Both interfaces share the same session, commands and keys.
 
+### Voice
+
+Press **Ctrl-T** and talk. A live level meter shows Orion is listening. When you pause, the recording ends (or press Ctrl-T again full screen, Enter in the line chat; Esc or Ctrl-C cancels). Your words land in the message box to check and edit before you press Enter.
+
+```
+┌ ● listening ▁▁▁▆▆▆▆▆▆▅▅▅ 1s · pause or Ctrl-T to finish · Esc cancels ───────────┐
+│›                                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────┘
+┌ message · Enter sends · Alt-Enter new line ──────────────────────────────────────┐
+│› how full is my disk?                                                            │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+`/voice speak on` makes Orion **speak its replies**, sentence by sentence as they stream in. Code blocks are left on screen ("code shown on screen"), and Markdown symbols are not read out. Ctrl-C, or starting your next message, stops it mid-sentence. `/voice` shows what is set up, and `/voice test` says a test sentence.
+
+It is local-first and uses what the machine already has:
+
+| Part | Default | Alternatives |
+|---|---|---|
+| Microphone | the first of `parecord` (PulseAudio/PipeWire), `arecord` (ALSA), `sox`, `ffmpeg` | any command writing 16 kHz mono 16-bit PCM to stdout (`record_command`) |
+| Speech to text | an OpenAI-compatible server at `http://127.0.0.1:8000/v1`, such as [speaches](https://github.com/speaches-ai/speaches) (faster-whisper), LocalAI, or whisper.cpp's server | a command that prints the transcript, for example `whisper-cli … -f {wav}` (`transcribe_command`) |
+| Text to speech | `espeak-ng`, `espeak` or `spd-say` | [piper](https://github.com/rhasspy/piper) as a command, or an OpenAI-compatible `/audio/speech` server such as Kokoro-FastAPI (`speak_url`) |
+
+- **Listening ends on a pause.** Orion measures the room's noise floor at the start and waits for at least 0.3 s of speech before a pause can end the recording, so a click doesn't cut you off.
+- **Transcripts are cleaned up.** Whisper's `[BLANK_AUDIO]`-style markers are removed.
+- **A spoken message is routed like a typed one,** so private speech stays on the local model.
+- **Nothing is sent off the machine** unless you point `transcribe_url` or `speak_url` at a remote server.
+- **Settings are under `[voice]`.** Set `send_after_transcribe = true` to send without the editing step.
+
 ### Saved conversations
 
 Every conversation is saved after each message, so closing the terminal (or a crash) loses nothing:
@@ -156,6 +185,7 @@ How it works:
 |---|---|
 | **Ctrl-C** | Stops the AI mid-turn: a streaming reply, a long think, a running program or an approval prompt. Any partial reply is kept and marked as interrupted, so the model knows where it stopped. At the prompt, press it twice to quit. |
 | **Shift-Tab** | Cycles routing between auto, claude and local, keeping what you've typed. Models that can't be reached are skipped. |
+| **Ctrl-T** | Talks: listens until you pause, then puts what you said in the message box. See [Voice](#voice). |
 | **Ctrl-O** | Shows or hides reasoning and progress notes (default: `show_reasoning` under `[chat]`). |
 | **Alt-Enter** | Starts a new line, for multi-line messages. Pasting multi-line text also works. |
 | **Ctrl-R**, **↑ ↓** | Search and browse your earlier messages. |
@@ -299,6 +329,8 @@ src/
     tui/        the full-screen chat: screen and keys (mod.rs), the conversation's
                 thread (agent.rs), the message editor (input.rs)
   interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
+  voice/        listening and the pause detector (record.rs), speech to text
+                (transcribe.rs), text to speech and sentence splitting (speak.rs)
 tests/stdio.rs  end-to-end MCP session against the real binary
 ```
 
@@ -310,4 +342,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. **System daemon.** Run `oriond` as a systemd service on a Unix socket, with `orion serve` as a thin stdio bridge, so many agents share one policy and one log.
 3. **Isolation.** Run `proc_run` inside namespaces, cgroups and seccomp (or Landlock), with CPU, memory and GPU limits per call.
 4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~ and ~~a full-screen TUI~~ are done too. Still to come: voice and a graphical shell.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~ and ~~voice~~ are done too. Still to come: a graphical shell, and wake-word listening.

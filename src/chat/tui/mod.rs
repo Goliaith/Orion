@@ -28,6 +28,7 @@ use self::input::Input;
 use super::store::Turn;
 use super::terminal::{clip, provider_label, Saver};
 use super::{Mode, Session};
+use crate::voice::{Recording, VoiceConfig, VoiceIo};
 use crate::{interrupt, Orion};
 
 const LABEL: usize = 8;
@@ -40,6 +41,7 @@ const KEYS: &[(&str, &str)] = &[
     ("Alt-Enter / Ctrl-J", "new line"),
     ("Ctrl-C", "stop the AI · clear the line · twice to quit"),
     ("Shift-Tab", "cycle routing: auto → claude → local"),
+    ("Ctrl-T", "talk: listen until you pause (Ctrl-T again finishes, Esc cancels)"),
     ("Ctrl-O", "show or hide reasoning"),
     ("Ctrl-B", "show or hide the machine panel"),
     ("PgUp / PgDn, wheel", "scroll (End follows the conversation again)"),
@@ -114,6 +116,12 @@ struct App {
     who: &'static str,
     show_reasoning: bool,
     show_panel: bool,
+    voice: VoiceIo,
+    listening: Option<Recording>,
+    /// Recent input levels, for the meter.
+    levels: Vec<f32>,
+    /// A transcript being produced off-thread.
+    transcribing: Option<Receiver<Result<String>>>,
     /// First visible line while scrolled up; `None` follows the bottom.
     top: Option<usize>,
     /// Lines of the conversation and its visible height at the last draw.
@@ -126,7 +134,7 @@ struct App {
 }
 
 impl App {
-    fn new(to_agent: Sender<ToAgent>, show_reasoning: bool) -> Self {
+    fn new(to_agent: Sender<ToAgent>, show_reasoning: bool, voice: &VoiceConfig) -> Self {
         Self {
             to_agent,
             entries: Vec::new(),
@@ -140,6 +148,10 @@ impl App {
             who: "claude",
             show_reasoning,
             show_panel: true,
+            voice: VoiceIo::new(voice),
+            listening: None,
+            levels: Vec::new(),
+            transcribing: None,
             top: None,
             last_total: 0,
             last_height: 0,
@@ -182,15 +194,18 @@ impl App {
 
     fn apply(&mut self, ev: FromAgent) {
         match ev {
-            FromAgent::Text(t) => match self.entries.last_mut() {
-                Some(Entry::Reply { text, .. }) => text.push_str(&t),
-                _ => {
-                    let t = t.trim_start().to_string();
-                    if !t.is_empty() {
-                        self.entries.push(Entry::Reply { who: self.who, text: t });
+            FromAgent::Text(t) => {
+                self.voice.reply_text(&t);
+                match self.entries.last_mut() {
+                    Some(Entry::Reply { text, .. }) => text.push_str(&t),
+                    _ => {
+                        let t = t.trim_start().to_string();
+                        if !t.is_empty() {
+                            self.entries.push(Entry::Reply { who: self.who, text: t });
+                        }
                     }
                 }
-            },
+            }
             FromAgent::Thinking(t) => match self.entries.last_mut() {
                 Some(Entry::Thinking(text)) => text.push_str(&t),
                 _ => self.entries.push(Entry::Thinking(t)),
@@ -236,6 +251,7 @@ impl App {
                 self.status = s;
             }
             FromAgent::Done => {
+                self.voice.reply_done();
                 self.busy = false;
                 self.stopping = false;
                 if let Some(text) = self.queued.take() {
@@ -258,6 +274,13 @@ impl App {
                     self.quit = true;
                     return;
                 }
+                "voice" => {
+                    let arg = cmd.split_once(' ').map(|(_, a)| a.trim()).unwrap_or("");
+                    let out = self.voice.command(arg);
+                    self.entries.push(Entry::Output(format!("/{cmd}\n{out}")));
+                    self.top = None;
+                    return;
+                }
                 "keys" => {
                     let keys = KEYS.iter().map(|(k, v)| format!("  {k:<20} {v}")).collect::<Vec<_>>().join("\n");
                     self.entries.push(Entry::Output(keys));
@@ -270,6 +293,7 @@ impl App {
             self.send(ToAgent::Command(cmd.to_string()));
         } else {
             self.entries.push(Entry::User(trimmed.to_string()));
+            self.voice.hush();
             self.busy = true;
             self.send(ToAgent::Turn(trimmed.to_string()));
         }
@@ -313,8 +337,27 @@ impl App {
             None => {}
         }
 
+        // While listening, keys either finish or cancel.
+        if self.listening.is_some() {
+            match key.code {
+                KeyCode::Char('t') if ctrl => self.finish_listening(),
+                KeyCode::Enter => self.finish_listening(),
+                KeyCode::Esc => self.cancel_listening("cancelled"),
+                KeyCode::Char('c') if ctrl => self.cancel_listening("cancelled"),
+                _ => self.flash("listening: pause or Ctrl-T to finish, Esc to cancel"),
+            }
+            return;
+        }
+
         match key.code {
+            KeyCode::Char('t') if ctrl => self.start_listening(),
             KeyCode::Char('c') if ctrl => {
+                if self.voice.hush() {
+                    self.flash("stopped speaking");
+                    if !self.busy {
+                        return;
+                    }
+                }
                 if self.busy {
                     self.stop();
                 } else if !self.input.is_empty() {
@@ -372,6 +415,86 @@ impl App {
             KeyCode::PageDown => self.scroll_down(self.last_height.saturating_sub(2).max(1)),
             _ => {}
         }
+    }
+
+    fn start_listening(&mut self) {
+        if self.transcribing.is_some() {
+            return self.flash("still transcribing the last recording");
+        }
+        self.voice.hush();
+        let recorder = match &self.voice.recorder {
+            Ok(r) => r,
+            Err(e) => {
+                let e = e.clone();
+                self.entries.push(Entry::Notice(format!("voice: {e}")));
+                return;
+            }
+        };
+        if let Err(e) = &self.voice.transcriber {
+            let e = e.clone();
+            self.entries.push(Entry::Notice(format!("voice: can't transcribe: {e}")));
+            return;
+        }
+        match recorder.start() {
+            Ok(rec) => {
+                self.levels.clear();
+                self.listening = Some(rec);
+            }
+            Err(e) => self.entries.push(Entry::Notice(format!("voice: {e:#}"))),
+        }
+    }
+
+    /// Stop recording and transcribe on another thread.
+    fn finish_listening(&mut self) {
+        let Some(rec) = self.listening.take() else { return };
+        let Ok(transcriber) = self.voice.transcriber.clone() else { return };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(rec.finish().and_then(|wav| transcriber.transcribe(&wav)));
+        });
+        self.transcribing = Some(rx);
+    }
+
+    fn cancel_listening(&mut self, why: &str) {
+        if let Some(rec) = self.listening.take() {
+            rec.cancel();
+            self.flash(&format!("listening {why}"));
+        }
+    }
+
+    /// Called every frame: the meter, the pause detector, the transcript.
+    fn tick_voice(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(rec) = &self.listening {
+            self.levels.push(rec.level());
+            if self.levels.len() > 24 {
+                self.levels.remove(0);
+            }
+            changed = true;
+            if rec.should_stop() {
+                self.finish_listening();
+            }
+        }
+        if let Some(rx) = &self.transcribing {
+            if let Ok(result) = rx.try_recv() {
+                self.transcribing = None;
+                changed = true;
+                match result {
+                    Ok(text) => {
+                        if !self.input.is_empty() {
+                            self.input.insert(' ');
+                        }
+                        self.input.insert_str(&text);
+                        if self.voice.config.send_after_transcribe && !self.busy {
+                            let text = self.input.submit();
+                            self.submit(text);
+                        }
+                    }
+                    Err(e) => self.entries.push(Entry::Notice(format!("voice: {e:#}"))),
+                }
+            }
+        }
+        changed
     }
 
     fn stop(&mut self) {
@@ -452,7 +575,17 @@ impl App {
     }
 
     fn render_input(&self, f: &mut Frame, area: Rect, rows: &[String], cursor: (usize, usize)) {
+        let meter: String = self
+            .levels
+            .iter()
+            .map(|l| ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'][((l * 7.0).round() as usize).min(7)])
+            .collect();
         let (title, color) = match &self.prompt {
+            None if self.listening.is_some() => {
+                let secs = self.listening.as_ref().map_or(0, |r| r.elapsed().as_secs());
+                (format!(" ● listening {meter} {secs}s · pause or Ctrl-T to finish · Esc cancels "), Color::Red)
+            }
+            None if self.transcribing.is_some() => (" transcribing… ".to_string(), Color::Red),
             Some(Prompt::Approve(_)) => (" Approve?  y yes · n no · a always this session ".to_string(), Color::Yellow),
             Some(Prompt::Confirm(_)) => (" y yes · n no ".to_string(), Color::Yellow),
             None if self.stopping => (" stopping… ".to_string(), Color::Yellow),
@@ -487,6 +620,9 @@ impl App {
             Mode::Local => (" LOCAL ", Color::Green),
         };
         let mut spans = vec![Span::styled(label, Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD))];
+        if self.voice.speaker.as_ref().is_ok_and(|s| s.is_speaking()) {
+            spans.push(Span::styled(" ♪ speaking · Ctrl-C hushes ", Style::new().fg(Color::Cyan)));
+        }
         if self.busy {
             let frame = SPINNER[(self.started.elapsed().as_millis() / 100) as usize % SPINNER.len()];
             spans.push(Span::styled(format!(" {frame} working "), Style::new().fg(Color::Magenta)));
@@ -497,7 +633,7 @@ impl App {
             }
         }
         spans.push(Span::styled(
-            "  Shift-Tab routing · Ctrl-O reasoning · Ctrl-B panel · PgUp/PgDn scroll · /keys · Ctrl-D quit",
+            "  Ctrl-T talk · Shift-Tab routing · Ctrl-O reasoning · Ctrl-B panel · PgUp/PgDn · /keys",
             Style::new().fg(Color::DarkGray),
         ));
         Line::from(spans)
@@ -873,7 +1009,8 @@ pub fn run(orion: &Orion, session: Session, saver: Saver) -> Result<()> {
     std::thread::scope(|scope| {
         scope.spawn(move || agent::run(orion, session, saver, agent_rx, agent_tx));
         scope.spawn(|| watch_machine(machine_tx, &stop));
-        let result = screen(App::new(to_agent, show_reasoning), from_agent, machine_rx);
+        let app = App::new(to_agent, show_reasoning, &orion.policy().voice);
+        let result = screen(app, from_agent, machine_rx);
         stop.store(true, Ordering::Relaxed);
         // A turn still running stops promptly; dropping the App hung up on the agent.
         interrupt::request();
@@ -916,10 +1053,13 @@ fn screen(mut app: App, from_agent: Receiver<FromAgent>, machine: Receiver<Machi
                 app.machine = m;
                 dirty = true;
             }
-            // Animate the spinner and expire flashes.
-            if last_tick.elapsed() >= Duration::from_millis(100) && (app.busy || app.flash.is_some()) {
+            // Every 100 ms: the meter and pause detector, the spinner, flashes.
+            if last_tick.elapsed() >= Duration::from_millis(100) {
                 last_tick = Instant::now();
-                dirty = true;
+                let speaking = app.voice.speaker.as_ref().is_ok_and(|s| s.is_speaking());
+                if app.tick_voice() || app.busy || app.flash.is_some() || speaking {
+                    dirty = true;
+                }
             }
         }
         Ok(())
@@ -940,7 +1080,7 @@ mod tests {
 
     fn app() -> (App, Receiver<ToAgent>) {
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(tx, true);
+        let mut app = App::new(tx, true, &VoiceConfig::default());
         app.apply(FromAgent::Done);
         (app, rx)
     }

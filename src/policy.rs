@@ -111,6 +111,8 @@ pub struct Policy {
     pub audit: AuditPolicy,
     /// Settings for the `orion chat` front-end.
     pub chat: crate::chat::ChatConfig,
+    /// Voice input and output for the chat.
+    pub voice: crate::voice::VoiceConfig,
 }
 
 impl Policy {

@@ -90,6 +90,22 @@ impl Http {
         })
     }
 
+    /// One POST of raw bytes (audio, multipart forms); returns the raw reply.
+    pub fn post_bytes(&self, path: &str, content_type: &str, body: Vec<u8>, timeout: Duration) -> Result<Vec<u8>> {
+        let (http, path, content_type) = (self.clone(), path.to_string(), content_type.to_string());
+        interrupt::wait(move || {
+            let resp = http
+                .request("POST", &path, &[])
+                .timeout(timeout)
+                .set("content-type", &content_type)
+                .send_bytes(&body)
+                .map_err(|e| http.describe(e))?;
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut resp.into_reader(), &mut out).context("reading the response")?;
+            Ok(out)
+        })
+    }
+
     pub fn get_json(&self, path: &str) -> Result<Value> {
         let (http, path) = (self.clone(), path.to_string());
         interrupt::wait(move || {

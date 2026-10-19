@@ -93,3 +93,32 @@ complex_words = ["code", "script", "program", "debug", "refactor", "implement", 
                  "optimize", "optimise", "write", "draft", "review", "why", "strategy",
                  "algorithm", "step by step"]
 long_request_words = 60         # longer messages go to Claude
+
+# Voice in the chat: Ctrl-T to talk, `/voice speak on` to hear replies.
+# Everything here runs on this machine unless a URL points elsewhere.
+[voice]
+enabled = true
+# Raw 16-bit mono PCM at sample_rate on stdout. Empty: the first of parecord,
+# arecord, sox, ffmpeg that is installed.
+record_command = ""
+sample_rate = 16000
+silence_ms = 1200               # a pause this long after speech ends listening (0: never)
+max_seconds = 60
+# Speech to text: an OpenAI-compatible server (speaches/faster-whisper-server
+# on :8000, LocalAI, or whisper.cpp's server with
+# --inference-path /v1/audio/transcriptions) ...
+transcribe_url = "http://127.0.0.1:8000/v1"
+transcribe_model = "Systran/faster-whisper-small"
+# ... or a command that prints the transcript ({wav} is the recording):
+# transcribe_command = "whisper-cli -m ~/models/ggml-base.en.bin -nt -np -f {wav}"
+language = ""                   # e.g. "en"; empty detects it
+send_after_transcribe = false   # true: send at once instead of leaving it to edit
+# Text to speech, for spoken replies.
+speak_replies = false
+speak_command = ""              # text on stdin; empty: espeak-ng, espeak or spd-say
+# speak_command = "piper --model ~/voices/en_US-amy-medium.onnx --output-raw | aplay -q -r 22050 -f S16_LE -t raw -"
+speak_url = ""                  # or an OpenAI-compatible /audio/speech server (Kokoro-FastAPI, speaches)
+speak_model = "kokoro"
+speak_voice = "af_heart"
+play_command = ""               # plays {wav} from speak_url; empty: pw-play, paplay, aplay or ffplay
+# api_key_env = "VOICE_API_KEY" # bearer token for servers that want one

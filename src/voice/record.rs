@@ -1,0 +1,282 @@
+//! Listening: run a recorder that writes raw PCM to stdout, measure the
+//! level as it arrives, and stop on a pause after speech.
+
+use std::io::Read;
+use std::process::{Child, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+
+use super::{kill_group, shell, which, VoiceConfig};
+
+/// 100 ms of audio per measurement.
+const CHUNK_MS: u64 = 100;
+/// Speech must last this long before a pause can end the recording, so a
+/// click or a cough does not.
+const MIN_SPEECH_MS: u64 = 300;
+
+pub struct Recorder {
+    command: String,
+    rate: u32,
+    silence_ms: u64,
+    max: Duration,
+}
+
+impl Recorder {
+    pub fn detect(config: &VoiceConfig) -> Result<Self> {
+        let rate = config.sample_rate;
+        let command = if !config.record_command.is_empty() {
+            config.record_command.clone()
+        } else {
+            let candidates = [
+                ("parecord", format!("parecord --raw --rate={rate} --channels=1 --format=s16le")),
+                ("arecord", format!("arecord -q -t raw -f S16_LE -r {rate} -c 1")),
+                ("sox", format!("sox -q -d -t raw -r {rate} -c 1 -b 16 -e signed-integer -L -")),
+                ("ffmpeg", format!("ffmpeg -loglevel quiet -f pulse -i default -ac 1 -ar {rate} -f s16le -")),
+            ];
+            candidates
+                .into_iter()
+                .find(|(bin, _)| which(bin).is_some())
+                .map(|(_, cmd)| cmd)
+                .context("no recorder found: install pulseaudio-utils (parecord), alsa-utils (arecord), sox or ffmpeg, or set voice.record_command")?
+        };
+        Ok(Self { command, rate, silence_ms: config.silence_ms, max: Duration::from_secs(config.max_seconds.max(1)) })
+    }
+
+    pub fn describe(&self) -> String {
+        self.command.split_whitespace().next().unwrap_or_default().to_string()
+    }
+
+    pub fn start(&self) -> Result<Recording> {
+        let mut cmd = shell(&self.command);
+        cmd.stdout(Stdio::piped());
+        let mut child = cmd.spawn().with_context(|| format!("starting {}", self.describe()))?;
+        let mut stdout = child.stdout.take().context("recorder has no stdout")?;
+        let shared = Arc::new(Mutex::new(Capture::default()));
+        let chunk_bytes = (self.rate as u64 * 2 * CHUNK_MS / 1000) as usize;
+        let reader = {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                let mut buf = vec![0u8; chunk_bytes];
+                let mut carry: Option<u8> = None;
+                loop {
+                    let n = match stdout.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let mut bytes: Vec<u8> = carry.take().into_iter().collect();
+                    bytes.extend_from_slice(&buf[..n]);
+                    if bytes.len() % 2 == 1 {
+                        carry = bytes.pop();
+                    }
+                    let samples: Vec<i16> = bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+                    shared.lock().unwrap_or_else(|e| e.into_inner()).add(&samples, chunk_bytes / 2);
+                }
+                shared.lock().unwrap_or_else(|e| e.into_inner()).ended = true;
+            })
+        };
+        Ok(Recording {
+            child: Some(child),
+            reader: Some(reader),
+            shared,
+            started: Instant::now(),
+            rate: self.rate,
+            silence_ms: self.silence_ms,
+            max: self.max,
+        })
+    }
+}
+
+#[derive(Default)]
+struct Capture {
+    samples: Vec<i16>,
+    /// Samples not yet measured.
+    pending: Vec<i16>,
+    level: f32,
+    noise_floor: Option<f32>,
+    chunks: u32,
+    speech_ms: u64,
+    silent_ms: u64,
+    ended: bool,
+}
+
+impl Capture {
+    fn add(&mut self, samples: &[i16], chunk: usize) {
+        self.samples.extend_from_slice(samples);
+        self.pending.extend_from_slice(samples);
+        while self.pending.len() >= chunk {
+            let part: Vec<i16> = self.pending.drain(..chunk).collect();
+            self.measure(&part);
+        }
+    }
+
+    fn measure(&mut self, chunk: &[i16]) {
+        let rms = (chunk.iter().map(|&s| (s as f32).powi(2)).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
+        // A meter in dBFS from -60 (empty) to 0 (full).
+        let db = 20.0 * (rms.max(1.0) / 32768.0).log10();
+        self.level = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+        // The quietest of the first few chunks is the room's noise floor.
+        self.chunks += 1;
+        if self.chunks <= 3 {
+            self.noise_floor = Some(self.noise_floor.map_or(rms, |f| f.min(rms)));
+        }
+        let threshold = (self.noise_floor.unwrap_or(0.0) * 3.0).max(300.0);
+        if rms > threshold {
+            self.speech_ms += CHUNK_MS;
+            self.silent_ms = 0;
+        } else {
+            self.silent_ms += CHUNK_MS;
+        }
+    }
+}
+
+/// A recording in progress.
+pub struct Recording {
+    child: Option<Child>,
+    reader: Option<JoinHandle<()>>,
+    shared: Arc<Mutex<Capture>>,
+    started: Instant,
+    rate: u32,
+    silence_ms: u64,
+    max: Duration,
+}
+
+impl Recording {
+    fn with<T>(&self, f: impl FnOnce(&Capture) -> T) -> T {
+        f(&self.shared.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Input level from 0 to 1, for a meter.
+    pub fn level(&self) -> f32 {
+        self.with(|c| c.level)
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    pub fn heard_speech(&self) -> bool {
+        self.with(|c| c.speech_ms >= MIN_SPEECH_MS)
+    }
+
+    /// True once the speaker paused after talking, the time limit passed,
+    /// or the recorder stopped.
+    pub fn should_stop(&self) -> bool {
+        let paused = |c: &Capture| self.silence_ms > 0 && c.speech_ms >= MIN_SPEECH_MS && c.silent_ms >= self.silence_ms;
+        self.elapsed() >= self.max || self.with(|c| c.ended || paused(c))
+    }
+
+    fn stop_recorder(&mut self) -> Option<String> {
+        let mut child = self.child.take()?;
+        kill_group(child.id(), libc::SIGINT);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        kill_group(child.id(), libc::SIGKILL);
+        let status = child.wait().ok();
+        if let Some(r) = self.reader.take() {
+            let _ = r.join();
+        }
+        // A recorder that failed outright (no device, say) exits non-zero
+        // before producing anything.
+        let empty = self.with(|c| c.samples.is_empty());
+        match status {
+            Some(s) if empty && !s.success() && s.code().is_some() => Some(format!("the recorder exited with {s}")),
+            _ => None,
+        }
+    }
+
+    /// Stop and return the audio as WAV.
+    pub fn finish(mut self) -> Result<Vec<u8>> {
+        if let Some(why) = self.stop_recorder() {
+            bail!("{why}: is a microphone connected?");
+        }
+        let (samples, heard) = self.with(|c| (c.samples.clone(), c.speech_ms >= MIN_SPEECH_MS));
+        if samples.len() < (self.rate / 4) as usize {
+            bail!("the recording is empty: is a microphone connected?");
+        }
+        if !heard {
+            bail!("heard nothing that sounded like speech");
+        }
+        Ok(super::wav(&samples, self.rate))
+    }
+
+    pub fn cancel(mut self) {
+        self.stop_recorder();
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        self.stop_recorder();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    /// Raw PCM: `ms` of a loud tone or of near-silence.
+    pub fn pcm(parts: &[(bool, u64)], rate: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &(loud, ms) in parts {
+            for i in 0..(rate as u64 * ms / 1000) {
+                let s: i16 = if loud { ((i as f32 * 0.07).sin() * 8000.0) as i16 } else { ((i % 7) as i16) - 3 };
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    pub fn recorder_for(pcm: &[u8], silence_ms: u64) -> (Recorder, tempfile::NamedTempFile) {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(pcm).unwrap();
+        // Then held open, like a microphone.
+        let cmd = format!("cat {}; sleep 30", f.path().display());
+        let config = VoiceConfig { record_command: cmd, silence_ms, max_seconds: 10, ..Default::default() };
+        (Recorder::detect(&config).unwrap(), f)
+    }
+
+    #[test]
+    fn stops_on_a_pause_after_speech() {
+        let rate = 16_000;
+        let audio = pcm(&[(false, 300), (true, 800), (false, 1500)], rate);
+        let (rec, _f) = recorder_for(&audio, 600);
+        let r = rec.start().unwrap();
+        let start = Instant::now();
+        while !r.should_stop() {
+            assert!(start.elapsed() < Duration::from_secs(8), "never stopped");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(r.heard_speech());
+        let wav = r.finish().unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert!(wav.len() > 44 + rate as usize, "kept the audio");
+    }
+
+    #[test]
+    fn silence_is_not_speech() {
+        let (rec, _f) = recorder_for(&pcm(&[(false, 1000)], 16_000), 600);
+        let r = rec.start().unwrap();
+        thread::sleep(Duration::from_millis(400));
+        assert!(!r.should_stop(), "no speech yet, so no pause to stop on");
+        assert!(r.finish().unwrap_err().to_string().contains("heard nothing"));
+    }
+
+    #[test]
+    fn a_missing_device_is_explained() {
+        let config = VoiceConfig { record_command: "echo 'no such device' >&2; exit 1".into(), ..Default::default() };
+        let r = Recorder::detect(&config).unwrap().start().unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(r.should_stop());
+        assert!(r.finish().unwrap_err().to_string().contains("microphone"));
+    }
+}

@@ -10,7 +10,7 @@
 
 mod classifier;
 pub mod claude;
-mod http;
+pub(crate) mod http;
 pub mod local;
 pub mod router;
 mod session;

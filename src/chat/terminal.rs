@@ -16,11 +16,13 @@ use serde_json::Value;
 
 use super::store::{self, Store, Turn};
 use super::{router, Mode, Provider, Session, Ui};
+use crate::voice::VoiceIo;
 use crate::{interrupt, Approver, Decision, Orion, Tool};
 
 const HOTKEYS: &[(&str, &str)] = &[
     ("Ctrl-C", "stop the AI mid-turn (twice at the prompt: quit)"),
     ("Shift-Tab", "cycle routing: auto → claude → local"),
+    ("Ctrl-T", "talk: listen until you pause (Enter finishes, Ctrl-C cancels)"),
     ("Ctrl-O", "show or hide reasoning and progress notes"),
     ("Alt-Enter", "new line in your message"),
     ("Ctrl-R / ↑ ↓", "search / browse your earlier messages"),
@@ -85,6 +87,8 @@ pub struct Terminal {
     answered_at: Option<Instant>,
     /// Ctrl-O toggles this.
     show_reasoning: bool,
+    /// Voice for the line-by-line chat; `None` for one-off prompts.
+    voice: Option<VoiceIo>,
     /// Whether the "reasoning hidden" hint was shown this turn.
     hinted: bool,
 }
@@ -99,6 +103,7 @@ impl Terminal {
             answered_at: None,
             show_reasoning: true,
             hinted: false,
+            voice: None,
         }
     }
 
@@ -150,6 +155,9 @@ impl Default for Terminal {
 
 impl Ui for Terminal {
     fn text(&mut self, text: &str) {
+        if let Some(v) = self.voice.as_mut() {
+            v.reply_text(text);
+        }
         if self.last == Last::Thinking {
             println!();
         }
@@ -246,6 +254,7 @@ struct Pending {
 enum Hotkey {
     CycleMode,
     ToggleReasoning,
+    Talk,
 }
 
 /// Rustyline handler for one hotkey: note the request and the line, and end
@@ -270,6 +279,7 @@ fn bind_hotkeys(editor: &mut DefaultEditor) -> Arc<Mutex<Option<Pending>>> {
     };
     editor.bind_sequence(KeyEvent(KeyCode::BackTab, Modifiers::NONE), handler(Hotkey::CycleMode));
     editor.bind_sequence(KeyEvent::ctrl('O'), handler(Hotkey::ToggleReasoning));
+    editor.bind_sequence(KeyEvent::ctrl('T'), handler(Hotkey::Talk));
     editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::ALT), EventHandler::Simple(Cmd::Newline));
     pending
 }
@@ -350,6 +360,9 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Optio
 fn run_plain(orion: &Orion, mut session: Session, saver: Saver, resumed: bool) -> Result<()> {
     let mut term = Terminal::new();
     term.show_reasoning = orion.policy().chat.show_reasoning;
+    if orion.policy().voice.enabled {
+        term.voice = Some(VoiceIo::new(&orion.policy().voice));
+    }
     let mut editor = DefaultEditor::new()?;
     let pending = bind_hotkeys(&mut editor);
     let history = orion.policy().audit_path().and_then(|p| Some(p.parent()?.join("chat_history")));
@@ -376,17 +389,40 @@ fn run_plain(orion: &Orion, mut session: Session, saver: Saver, resumed: bool) -
         let line = match line {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => {
-                if let Some(p) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                    hotkey(p.action, &mut session, &mut term);
-                    restore = Some((p.line, p.pos));
-                    continue;
+                let hotkey_pressed = pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+                match hotkey_pressed {
+                    Some(p) if matches!(p.action, Hotkey::Talk) => {
+                        let Some(text) = listen(&mut term) else {
+                            restore = Some((p.line, p.pos));
+                            continue;
+                        };
+                        let joined = if p.line.trim().is_empty() { text } else { format!("{} {text}", p.line.trim_end()) };
+                        if !term.voice.as_ref().is_some_and(|v| v.config.send_after_transcribe) {
+                            // Leave the transcript to check and edit.
+                            let end = joined.len();
+                            restore = Some((joined, end));
+                            continue;
+                        }
+                        println!("{prompt}{joined}");
+                        joined
+                    }
+                    Some(p) => {
+                        hotkey(p.action, &mut session, &mut term);
+                        restore = Some((p.line, p.pos));
+                        continue;
+                    }
+                    None => {
+                        if term.voice.as_mut().is_some_and(|v| v.hush()) {
+                            println!("{}", term.style.dim("  (stopped speaking)"));
+                        } else if last_ctrl_c.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                            break;
+                        } else {
+                            last_ctrl_c = Some(Instant::now());
+                            println!("{}", term.style.dim("  (Ctrl-C again to quit, or Ctrl-D)"));
+                        }
+                        continue;
+                    }
                 }
-                if last_ctrl_c.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
-                    break;
-                }
-                last_ctrl_c = Some(Instant::now());
-                println!("{}", term.style.dim("  (Ctrl-C again to quit, or Ctrl-D)"));
-                continue;
             }
             Err(ReadlineError::Eof) => break,
             Err(e) => return Err(e.into()),
@@ -397,6 +433,12 @@ fn run_plain(orion: &Orion, mut session: Session, saver: Saver, resumed: bool) -
             continue;
         }
         let _ = editor.add_history_entry(input);
+        if let Some(arg) = input.strip_prefix("/voice") {
+            if let Some(v) = term.voice.as_mut() {
+                println!("{}", v.command(arg.trim()));
+            }
+            continue;
+        }
         if let Some(cmd) = input.strip_prefix('/') {
             let mut out = String::new();
             let keep_going = command(cmd, orion, &mut session, &term.style, &saver, &mut out);
@@ -408,9 +450,15 @@ fn run_plain(orion: &Orion, mut session: Session, saver: Saver, resumed: bool) -
         }
         println!();
         term.hinted = false;
+        if let Some(v) = term.voice.as_mut() {
+            v.hush();
+        }
         if let Err(e) = session.turn(input, &mut term) {
             term.line_break();
             println!("{}", term.style.red(&format!("error: {e:#}")));
+        }
+        if let Some(v) = term.voice.as_mut() {
+            v.reply_done();
         }
         interrupt::clear();
         let mut out = String::new();
@@ -513,8 +561,75 @@ pub fn conversations(action: Option<(&str, &str)>) -> Result<()> {
     Ok(())
 }
 
+/// Ctrl-T in the line chat: record until a pause (or Enter), showing a
+/// meter, then transcribe. Ctrl-C cancels.
+fn listen(term: &mut Terminal) -> Option<String> {
+    let s = Style { on: term.style.on };
+    let voice = term.voice.as_mut()?;
+    voice.hush();
+    let fail = |e: &str| {
+        println!("\r\x1b[2K{}", s.yellow(&format!("  voice: {e}")));
+        None
+    };
+    let transcriber = match &voice.transcriber {
+        Ok(t) => t.clone(),
+        Err(e) => return fail(&format!("can't transcribe: {e}")),
+    };
+    let rec = match voice.recorder.as_ref().map(|r| r.start()) {
+        Ok(Ok(rec)) => rec,
+        Ok(Err(e)) => return fail(&format!("{e:#}")),
+        Err(e) => return fail(e),
+    };
+    interrupt::clear();
+    let stdin_ready = || {
+        let mut fds = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd, zero timeout.
+        unsafe { libc::poll(&mut fds, 1, 0) > 0 }
+    };
+    let mut levels: Vec<f32> = Vec::new();
+    loop {
+        if interrupt::requested() {
+            rec.cancel();
+            interrupt::clear();
+            println!("\r\x1b[2K{}", s.dim("  listening cancelled"));
+            return None;
+        }
+        if rec.should_stop() {
+            break;
+        }
+        if stdin_ready() {
+            let _ = interrupt::read_answer();
+            break;
+        }
+        levels.push(rec.level());
+        if levels.len() > 16 {
+            levels.remove(0);
+        }
+        let meter: String =
+            levels.iter().map(|l| ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'][((l * 7.0).round() as usize).min(7)]).collect();
+        print!(
+            "\r\x1b[2K  {} {meter} {}s {}",
+            s.red("● listening"),
+            rec.elapsed().as_secs(),
+            s.dim("(pause or Enter to finish, Ctrl-C cancels)")
+        );
+        let _ = io::stdout().flush();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    print!("\r\x1b[2K  {}", s.dim("transcribing…"));
+    let _ = io::stdout().flush();
+    let result = rec.finish().and_then(|wav| transcriber.transcribe(&wav));
+    interrupt::clear();
+    print!("\r\x1b[2K");
+    match result {
+        Ok(text) => Some(text),
+        Err(e) => fail(&format!("{e:#}")),
+    }
+}
+
 fn hotkey(action: Hotkey, session: &mut Session, term: &mut Terminal) {
     match action {
+        Hotkey::Talk => {}
         Hotkey::CycleMode => print!("{}", cycle_mode(session, &term.style)),
         Hotkey::ToggleReasoning => {
             term.show_reasoning = !term.show_reasoning;
@@ -617,6 +732,7 @@ pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style
             say!(out, "  /resume <n|id>          continue a saved conversation");
             say!(out, "  /title <text>           rename this conversation");
             say!(out, "  /exit                   leave (Ctrl-D works too)");
+            say!(out, "  /voice [speak on|off|test]  voice setup; Ctrl-T talks");
             say!(out, "  /keys                   the hotkeys");
         }
         "keys" => {

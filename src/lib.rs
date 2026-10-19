@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod policy;
 pub mod tool;
 pub mod tools;
+pub mod voice;
 
 use std::fmt;
 use std::time::Instant;
