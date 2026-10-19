@@ -1,6 +1,7 @@
-//! The conversation's own thread. The screen thread sends it work; it runs
-//! the session and reports everything back as events, so the screen keeps
-//! drawing and reading keys while the AI streams, thinks or runs tools.
+//! The conversation's own thread, shared by the full-screen chat and the
+//! graphical shell. The interface sends it work; it runs the session and
+//! reports everything back as events, so the interface stays live while
+//! the AI streams, thinks or runs tools.
 
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -8,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::super::store::Turn;
-use super::super::terminal::{self, preview, providers, routing, summary, Saver, Style};
-use super::super::{Mode, Provider, Session, Ui, Usage};
+use super::store::Turn;
+use super::terminal::{self, preview, providers, routing, summary, Saver, Style};
+use super::{Mode, Provider, Session, Ui, Usage};
 use crate::{interrupt, Decision, Orion, Tool};
 
 pub enum ToAgent {
@@ -58,6 +59,7 @@ pub struct Status {
     /// One line per provider: its model, or why it is unavailable.
     pub providers: Vec<String>,
     pub usage: Vec<(&'static str, Usage)>,
+    pub id: String,
     pub title: String,
     pub turns: usize,
     pub tools_auto: usize,
@@ -75,6 +77,7 @@ pub fn status(orion: &Orion, session: &Session) -> Status {
             .into_iter()
             .filter_map(|(p, label)| session.backend(p).map(|b| (label, b.usage())))
             .collect(),
+        id: session.id().to_string(),
         title: session.title(),
         turns: session.turns().len(),
         tools_auto: count(Decision::Allow),

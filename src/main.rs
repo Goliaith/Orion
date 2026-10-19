@@ -54,6 +54,30 @@ enum Cmd {
         #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
         resume: Option<String>,
     },
+    /// The graphical shell: a local web interface for the chat, for a browser or a kiosk.
+    Shell {
+        /// Always use the model served on this machine.
+        #[arg(long, conflicts_with_all = ["claude", "auto"])]
+        local: bool,
+        /// Always use Claude.
+        #[arg(long, conflicts_with = "auto")]
+        claude: bool,
+        /// Route each message to Claude or the local model (the default).
+        #[arg(long)]
+        auto: bool,
+        /// Use this model instead of the configured one (with --claude or --local).
+        #[arg(long)]
+        model: Option<String>,
+        /// Continue a saved conversation: the latest, or the one with this id (or id prefix).
+        #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
+        resume: Option<String>,
+        /// Port on 127.0.0.1 (default 7310; 0 picks a free one).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Open it in the default browser.
+        #[arg(long)]
+        open: bool,
+    },
     /// List, show or delete saved chat conversations.
     Conversations {
         #[command(subcommand)]
@@ -100,6 +124,15 @@ fn main() -> Result<()> {
                 _ => None,
             };
             terminal::run(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), plain)
+        }
+        Cmd::Shell { local, claude, auto, model, resume, port, open } => {
+            let mode = match (local, claude, auto) {
+                (true, _, _) => Some(Mode::Local),
+                (_, true, _) => Some(Mode::Claude),
+                (_, _, true) => Some(Mode::Auto),
+                _ => None,
+            };
+            terminal::run_shell(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), port, open)
         }
         Cmd::Conversations { action } => terminal::conversations(match &action {
             None | Some(ConversationCmd::List) => None,

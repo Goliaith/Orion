@@ -80,6 +80,42 @@ Firefox is using 3.1 GB of your 16 GB. I wrote the details to ~/orion-workspace/
 
 `ANTHROPIC_AUTH_TOKEN` (an OAuth access token) also works in place of an API key.
 
+### Graphical shell
+
+```sh
+orion shell            # prints an address like http://127.0.0.1:7310/?token=…
+orion shell --open     # and opens it in your browser
+```
+
+![The Orion shell: conversations on the left, the chat with routing, tool calls and an approval card in the middle, the machine panel on the right](docs/shell.png)
+
+`orion shell` serves Orion's graphical interface from this machine. It has the same conversation, routing, approvals and tools as the terminal chat, plus:
+
+- **A sidebar of saved conversations.** Click one to continue it, or start a new one.
+- **Routing at a glance:** an Auto / Claude / Local switch in the header (Alt+M cycles it), and every reply labeled with the model that wrote it and why.
+- **Live tool activity:** each tool call shows a spinner, then its time or the error. Reasoning is collapsible (the bulb button, or Alt+R).
+- **Approval cards** with Approve, Always allow this session, and Decline.
+- **A machine panel:** CPU with a sparkline, memory, each NVIDIA GPU's load, VRAM and temperature, the connected models, and token use.
+- **Voice:** the mic button (Alt+T) listens with a level meter and puts the transcript in the box. The speaker button reads replies aloud.
+- **Shared across tabs.** Every open tab or window shows the same live conversation, and one that opens late, or reloads, is caught up.
+- **Keyboard and layout:** Enter sends, Shift+Enter starts a new line, and Esc stops the AI. It follows the system's light or dark theme. On narrow screens the panels become slide-over drawers.
+
+**Make it the whole desktop.** On a machine dedicated to Orion, boot straight into it with a kiosk Wayland compositor:
+
+```sh
+cage -- contrib/orion-kiosk      # starts `orion shell`, then a full-screen browser on it
+```
+
+[`contrib/orion-shell.service`](contrib/orion-shell.service) runs the shell as a systemd user service instead.
+
+**Security.** A local web server is something other users and web pages could try to reach, so the shell is locked down:
+
+- **It listens on `127.0.0.1` only.** For another machine, use an SSH tunnel.
+- **Every run gets a random 128-bit token.** The printed address carries it, and on first load it is swapped for an `HttpOnly`, `SameSite=Strict` cookie and removed from the address bar. The address is also saved, readable only by you, in `~/.local/state/orion/shell-url`.
+- **Requests must name this server in `Host`,** which defeats DNS-rebinding attacks.
+- **Anything that changes state needs an `X-Orion` header.** A cross-site page can only send that after a CORS preflight, and the shell never approves one.
+- **The page loads nothing from outside,** and a strict Content-Security-Policy enforces it. Model output is HTML-escaped before it is rendered as Markdown.
+
 ### Full-screen interface
 
 On a terminal, `orion chat` opens full screen:
@@ -276,6 +312,7 @@ orion call system_info                        # call a tool yourself, exactly as
 orion call fs_list '{"path": "~"}'
 orion audit -n 20                             # recent calls, as JSON lines
 orion conversations                           # saved chats (see "Saved conversations")
+orion shell                                   # the graphical shell (see "Graphical shell")
 orion serve                                   # MCP server on stdin/stdout
 ```
 
@@ -326,8 +363,12 @@ src/
     http.rs     shared HTTP: retries, proxy rules, error bodies, SSE lines
     store.rs    saved conversations: atomic, private JSON files
     terminal.rs the line-by-line chat, shared commands, `orion conversations`
-    tui/        the full-screen chat: screen and keys (mod.rs), the conversation's
-                thread (agent.rs), the message editor (input.rs)
+    agent.rs    the conversation's own thread, shared by the full-screen chat and the shell
+    machine.rs  live CPU, memory and GPU readings for status displays
+    tui/        the full-screen chat: screen and keys (mod.rs), the message editor (input.rs)
+    shell/      the graphical shell: server, event hub and security (mod.rs),
+                minimal HTTP (http.rs), the page (shell.html)
+contrib/        orion-kiosk (boot into the shell), orion-shell.service
   interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
   voice/        listening and the pause detector (record.rs), speech to text
                 (transcribe.rs), text to speech and sentence splitting (speak.rs)
@@ -342,4 +383,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. **System daemon.** Run `oriond` as a systemd service on a Unix socket, with `orion serve` as a thin stdio bridge, so many agents share one policy and one log.
 3. **Isolation.** Run `proc_run` inside namespaces, cgroups and seccomp (or Landlock), with CPU, memory and GPU limits per call.
 4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~ and ~~voice~~ are done too. Still to come: a graphical shell, and wake-word listening.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~ and ~~a graphical shell~~ are done too. Still to come: wake-word listening.

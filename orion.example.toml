@@ -122,3 +122,8 @@ speak_model = "kokoro"
 speak_voice = "af_heart"
 play_command = ""               # plays {wav} from speak_url; empty: pw-play, paplay, aplay or ffplay
 # api_key_env = "VOICE_API_KEY" # bearer token for servers that want one
+
+# The graphical shell: `orion shell`, then open the printed address.
+[shell]
+port = 7310                     # on 127.0.0.1 only; 0 picks a free port
+open_browser = false            # or pass --open

@@ -344,6 +344,12 @@ pub(super) fn prepare<'a>(
     Ok((session, saver, resumed))
 }
 
+/// Run the graphical shell (see [`super::shell`]).
+pub fn run_shell(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Option<&str>, port: Option<u16>, open: bool) -> Result<()> {
+    let (session, saver, _) = prepare(orion, mode, model, resume)?;
+    super::shell::run(orion, session, saver, port, open)
+}
+
 /// Run the interactive chat until the user leaves: full screen when on a
 /// terminal (unless `plain`), else line by line. `mode` and `model`
 /// override the `[chat]` settings; `resume` continues a saved conversation

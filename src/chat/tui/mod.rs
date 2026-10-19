@@ -2,7 +2,6 @@
 //! ([`agent`]); this thread draws, reads keys, and answers approvals, so
 //! the screen stays live while the AI works.
 
-mod agent;
 mod input;
 
 use std::io;
@@ -23,7 +22,8 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use self::agent::{Answer, FromAgent, Status, ToAgent};
+use super::agent::{self, Answer, FromAgent, Status, ToAgent};
+use super::machine::{watch_machine, Machine};
 use self::input::Input;
 use super::store::Turn;
 use super::terminal::{clip, provider_label, Saver};
@@ -78,28 +78,6 @@ enum Entry {
 enum Prompt {
     Approve(Sender<Answer>),
     Confirm(Sender<bool>),
-}
-
-#[derive(Default, Clone)]
-struct Gpu {
-    name: String,
-    util: Option<u64>,
-    mem_used: Option<u64>,
-    mem_total: Option<u64>,
-    temp: Option<u64>,
-}
-
-#[derive(Default, Clone)]
-struct Machine {
-    host: String,
-    os: String,
-    cpu: Option<f64>,
-    cores: Option<u64>,
-    mem_total_kb: Option<u64>,
-    mem_avail_kb: Option<u64>,
-    gpus: Vec<Gpu>,
-    /// Display/compute devices without nvidia-smi readings.
-    other_gpus: Vec<String>,
 }
 
 struct App {
@@ -925,80 +903,6 @@ fn panel_lines(m: &Machine, s: &Status, width: usize) -> Vec<Line<'static>> {
     l
 }
 
-/// CPU busy fraction between two /proc/stat samples.
-fn cpu_sample() -> Option<(u64, u64)> {
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let nums: Vec<u64> = stat.lines().next()?.split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect();
-    let idle = nums.get(3)? + nums.get(4).copied().unwrap_or(0);
-    Some((nums.iter().sum(), idle))
-}
-
-fn read_machine(prev_cpu: &mut Option<(u64, u64)>, with_gpu: bool, last: &Machine) -> Machine {
-    let info = crate::tools::machine_info();
-    let now = cpu_sample();
-    let cpu = match (*prev_cpu, now) {
-        (Some((t0, i0)), Some((t1, i1))) if t1 > t0 => Some(1.0 - (i1 - i0) as f64 / (t1 - t0) as f64),
-        _ => None,
-    };
-    *prev_cpu = now;
-    let mut m = Machine {
-        host: info["hostname"].as_str().unwrap_or("this machine").to_string(),
-        os: info["os"].as_str().unwrap_or_default().to_string(),
-        cpu,
-        cores: info["cpu"]["logical_cores"].as_u64(),
-        mem_total_kb: info["memory_kb"]["total"].as_u64(),
-        mem_avail_kb: info["memory_kb"]["available"].as_u64(),
-        gpus: last.gpus.clone(),
-        other_gpus: last.other_gpus.clone(),
-    };
-    if with_gpu {
-        let g = crate::tools::gpu_status();
-        m.gpus = g["nvidia"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|x| Gpu {
-                        name: x["name"].as_str().unwrap_or("GPU").to_string(),
-                        util: x["utilization_pct"].as_u64(),
-                        mem_used: x["memory_used_mib"].as_u64(),
-                        mem_total: x["memory_total_mib"].as_u64(),
-                        temp: x["temperature_c"].as_u64(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        m.other_gpus = if m.gpus.is_empty() {
-            g["devices"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|d| d["vendor"].as_str()).filter(|v| *v != "unknown").map(str::to_string).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-    }
-    m
-}
-
-/// Sample the machine every two seconds (GPUs every four) until `stop`.
-fn watch_machine(tx: Sender<Machine>, stop: &AtomicBool) {
-    let mut prev = cpu_sample();
-    let mut last = Machine::default();
-    let mut tick = 0u64;
-    while !stop.load(Ordering::Relaxed) {
-        last = read_machine(&mut prev, tick.is_multiple_of(2), &last);
-        if tx.send(last.clone()).is_err() {
-            return;
-        }
-        tick += 1;
-        for _ in 0..20 {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-}
-
 /// Run the full-screen chat until the user quits.
 pub fn run(orion: &Orion, session: Session, saver: Saver) -> Result<()> {
     let (to_agent, agent_rx) = mpsc::channel();
@@ -1073,6 +977,7 @@ fn screen(mut app: App, from_agent: Receiver<FromAgent>, machine: Receiver<Machi
 mod tests {
     use ratatui::backend::TestBackend;
 
+    use super::super::machine::Gpu;
     use super::super::Provider;
     use ratatui::Terminal;
 

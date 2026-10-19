@@ -1,0 +1,43 @@
+#!/bin/sh
+# Start Orion's graphical shell and show it full screen.
+#
+# On a machine dedicated to Orion, run it as the whole session under a kiosk
+# Wayland compositor, for example from a display manager or a TTY login:
+#
+#     cage -- orion-kiosk
+#
+# Extra arguments go to `orion shell` (for example --local or --resume).
+set -eu
+
+url_file="${XDG_STATE_HOME:-$HOME/.local/state}/orion/shell-url"
+rm -f "$url_file"
+
+orion shell "$@" &
+shell=$!
+trap 'kill $shell 2>/dev/null' EXIT INT TERM
+
+# The shell writes its address (with this run's token) once it is listening.
+tries=0
+until [ -s "$url_file" ]; do
+    tries=$((tries + 1))
+    if [ $tries -gt 100 ] || ! kill -0 $shell 2>/dev/null; then
+        echo "orion shell did not start" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+url=$(cat "$url_file")
+
+for browser in chromium chromium-browser google-chrome brave-browser; do
+    if command -v "$browser" >/dev/null 2>&1; then
+        "$browser" --kiosk --app="$url" --no-first-run --disable-features=Translate \
+            --user-data-dir="${XDG_STATE_HOME:-$HOME/.local/state}/orion/kiosk-browser"
+        exit
+    fi
+done
+if command -v firefox >/dev/null 2>&1; then
+    firefox --kiosk "$url"
+    exit
+fi
+echo "no browser found: install chromium (or firefox)" >&2
+exit 1

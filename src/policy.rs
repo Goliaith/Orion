@@ -113,6 +113,8 @@ pub struct Policy {
     pub chat: crate::chat::ChatConfig,
     /// Voice input and output for the chat.
     pub voice: crate::voice::VoiceConfig,
+    /// The graphical shell (`orion shell`).
+    pub shell: crate::chat::shell::ShellConfig,
 }
 
 impl Policy {

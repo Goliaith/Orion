@@ -8,12 +8,15 @@
 //! In `auto` mode the [`router`] picks one for each message, and the
 //! [`Session`] keeps both in one conversation.
 
+mod agent;
 mod classifier;
 pub mod claude;
 pub(crate) mod http;
+mod machine;
 pub mod local;
 pub mod router;
 mod session;
+pub mod shell;
 pub mod store;
 pub mod terminal;
 mod tui;

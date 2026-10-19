@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orion</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238b7cf6'/%3E%3Cstop offset='1' stop-color='%235ec8f2'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='16' cy='16' r='13' fill='url(%23g)'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #0d0f14; --panel: #141821; --panel-2: #1a1f2b; --line: #262c3a; --text: #e7e9ef; --muted: #8a93a6; --faint: #5d6577;
+  --accent: #8b7cf6; --accent-soft: rgba(139,124,246,.14); --claude: #d97757; --local: #3fbf7f; --warn: #e6b450; --bad: #ef6b6b; --ok: #3fbf7f;
+  --code: #10131a; --radius: 12px; --shadow: 0 8px 30px rgba(0,0,0,.35);
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f2f6; --line: #e3e6ec; --text: #171a21; --muted: #5d6577; --faint: #8a93a6;
+    --accent: #6d5ce8; --accent-soft: rgba(109,92,232,.10); --code: #f3f4f8; --shadow: 0 8px 30px rgba(20,24,40,.10);
+    color-scheme: light;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+code, pre, .mono { font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace; font-size: 13px; }
+.hidden { display: none !important; }
+
+.app { display: grid; grid-template-columns: 260px minmax(0, 1fr) 300px; height: 100vh; }
+.app.no-left { grid-template-columns: 0 minmax(0, 1fr) 300px; }
+.app.no-right { grid-template-columns: 260px minmax(0, 1fr) 0; }
+.app.no-left.no-right { grid-template-columns: 0 minmax(0, 1fr) 0; }
+.side { background: var(--panel); overflow: hidden auto; min-width: 0; }
+.side.left { grid-column: 1; } main { grid-column: 2; } .side.right { grid-column: 3; }
+.app.no-left .side.left, .app.no-right .side.right { display: none; }
+.scrim { display: none; }
+.side.left { border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+.side.right { border-left: 1px solid var(--line); padding: 18px 18px 24px; }
+
+.brand { display: flex; align-items: center; gap: 10px; padding: 18px 18px 12px; font-weight: 650; font-size: 16px; letter-spacing: .2px; }
+.logo { width: 22px; height: 22px; border-radius: 50%; background: conic-gradient(from 210deg, var(--accent), #5ec8f2, var(--accent)); box-shadow: 0 0 18px var(--accent-soft); }
+.new { margin: 4px 14px 14px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; text-align: left; color: var(--text); display: flex; gap: 8px; align-items: center; }
+.new:hover { background: var(--panel-2); }
+.label { padding: 6px 18px; font-size: 11.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); }
+#convs { padding: 0 8px 16px; overflow-y: auto; }
+.conv { display: block; width: 100%; text-align: left; padding: 8px 10px; border-radius: 9px; color: var(--muted); }
+.conv:hover { background: var(--panel-2); color: var(--text); }
+.conv.active { background: var(--accent-soft); color: var(--text); }
+.conv .t { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
+.conv .m { font-size: 12px; color: var(--faint); }
+
+main { display: flex; flex-direction: column; min-width: 0; height: 100vh; }
+header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(8px); }
+.title { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.icon { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; color: var(--muted); }
+.icon:hover { background: var(--panel-2); color: var(--text); }
+.icon.on { color: var(--accent); background: var(--accent-soft); }
+.icon svg { width: 18px; height: 18px; }
+.seg { display: inline-flex; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
+.seg button { padding: 4px 12px; border-radius: 7px; color: var(--muted); font-size: 13.5px; }
+.seg button.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+.seg button[data-mode="claude"].on { color: var(--claude); }
+.seg button[data-mode="local"].on { color: var(--local); }
+.seg button[data-mode="auto"].on { color: var(--accent); }
+
+.log { flex: 1; overflow-y: auto; padding: 24px 0 12px; scroll-behavior: smooth; }
+.col { max-width: 820px; margin: 0 auto; padding: 0 24px; }
+.welcome { margin: 12vh auto 0; text-align: center; color: var(--muted); }
+.welcome h1 { font-size: 26px; color: var(--text); font-weight: 650; margin: 14px 0 6px; letter-spacing: -.2px; }
+.welcome .logo { width: 44px; height: 44px; margin: 0 auto; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 22px; }
+.chip { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 7px 14px; color: var(--text); font-size: 14px; }
+.chip:hover { border-color: var(--accent); }
+
+.msg { margin: 18px 0; }
+.user { display: flex; justify-content: flex-end; }
+.user .bubble { background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); padding: 10px 14px; border-radius: 16px 16px 4px 16px; max-width: 80%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.who { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 650; letter-spacing: .3px; margin-bottom: 4px; }
+.who::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.who.claude { color: var(--claude); } .who.local { color: var(--local); }
+.reply { overflow-wrap: anywhere; }
+.reply p { margin: 0 0 10px; } .reply p:last-child { margin-bottom: 0; }
+.reply h4 { margin: 14px 0 6px; font-size: 15px; }
+.reply ul, .reply ol { margin: 4px 0 10px; padding-left: 22px; }
+.reply code { background: var(--code); border: 1px solid var(--line); padding: 1px 5px; border-radius: 5px; }
+.reply pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; margin: 8px 0 12px; }
+.reply pre code { border: 0; padding: 0; background: none; }
+.route { color: var(--faint); font-size: 13px; margin: 14px 0 6px; display: flex; gap: 6px; align-items: center; }
+.route b { font-weight: 600; } .route .claude { color: var(--claude); } .route .local { color: var(--local); }
+details.thinking { color: var(--muted); font-size: 13.5px; margin: 6px 0; border-left: 2px solid var(--line); padding-left: 12px; }
+details.thinking summary { cursor: pointer; color: var(--faint); list-style: none; }
+details.thinking summary::-webkit-details-marker { display: none; }
+details.thinking div { white-space: pre-wrap; font-style: italic; margin-top: 4px; }
+.hide-reasoning details.thinking { display: none; }
+.tool { display: flex; align-items: center; gap: 8px; margin: 6px 0; padding: 7px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; font-size: 13.5px; }
+.tool .n { font-weight: 600; }
+.tool .a { color: var(--muted); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tool .s { font-size: 12.5px; white-space: nowrap; }
+.tool .s.ok { color: var(--ok); } .tool .s.bad { color: var(--bad); } .tool .s.run { color: var(--warn); }
+.tool-err { color: var(--bad); font-size: 13px; margin: -2px 0 8px 12px; overflow-wrap: anywhere; }
+.spin { width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; display: inline-block; animation: spin .8s linear infinite; vertical-align: -2px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.card { margin: 10px 0; border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--line)); background: color-mix(in srgb, var(--warn) 7%, var(--panel)); border-radius: var(--radius); padding: 14px 16px; }
+.card h3 { margin: 0 0 8px; font-size: 14.5px; display: flex; align-items: center; gap: 8px; }
+.card pre { margin: 0 0 12px; max-height: 240px; overflow: auto; background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; }
+.card .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn { padding: 7px 14px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel); }
+.btn:hover { border-color: var(--muted); }
+.btn.go { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.go:hover { filter: brightness(1.08); }
+.card .done { color: var(--muted); font-size: 13.5px; }
+.card.resolved { border-color: var(--line); background: var(--panel); }
+.notice { color: var(--warn); font-size: 13.5px; margin: 8px 0; }
+.error { color: var(--bad); font-size: 13.5px; margin: 8px 0; }
+.output { margin: 10px 0; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; white-space: pre-wrap; color: var(--muted); }
+.divider { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 12px; margin: 22px 0; text-transform: uppercase; letter-spacing: .8px; }
+.divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+
+.composer-wrap { padding: 8px 24px 18px; }
+.composer { max-width: 820px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 8px 8px 8px 14px; box-shadow: var(--shadow); }
+.composer:focus-within { border-color: color-mix(in srgb, var(--accent) 60%, var(--line)); }
+.row { display: flex; align-items: flex-end; gap: 6px; }
+textarea { flex: 1; resize: none; border: 0; outline: 0; background: none; color: var(--text); font: inherit; padding: 7px 0; max-height: 220px; }
+textarea::placeholder { color: var(--faint); }
+.send { height: 36px; min-width: 36px; padding: 0 14px; border-radius: 11px; background: var(--accent); color: #fff; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+.send:disabled { opacity: .45; cursor: default; }
+.send.stop { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
+.listening { display: flex; align-items: center; gap: 10px; color: var(--bad); font-size: 13.5px; padding: 4px 0 8px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.meter { display: inline-flex; gap: 2px; align-items: flex-end; height: 16px; }
+.meter i { width: 3px; background: var(--bad); border-radius: 2px; }
+.hint { max-width: 820px; margin: 6px auto 0; color: var(--faint); font-size: 12px; text-align: center; }
+.mic.live { color: #fff; background: var(--bad); }
+
+.panel h2 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); margin: 18px 0 10px; font-weight: 600; }
+.panel h2:first-child { margin-top: 0; }
+.host { font-weight: 650; } .os { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+.gauge { margin: 10px 0; }
+.gauge .top { display: flex; justify-content: space-between; font-size: 13px; }
+.gauge .top span:last-child { color: var(--muted); font-variant-numeric: tabular-nums; }
+.bar { height: 6px; background: var(--panel-2); border-radius: 99px; overflow: hidden; margin-top: 5px; }
+.bar i { display: block; height: 100%; border-radius: 99px; background: var(--ok); transition: width .6s ease; }
+.bar i.mid { background: var(--warn); } .bar i.high { background: var(--bad); }
+.spark { width: 100%; height: 34px; display: block; margin-top: 6px; }
+.spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+.spark polygon { fill: var(--accent-soft); }
+.kv { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; margin: 5px 0; }
+.kv span:first-child { color: var(--muted); } .kv span:last-child { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prov { display: flex; gap: 8px; align-items: baseline; font-size: 13px; margin: 6px 0; }
+.prov b { font-weight: 650; min-width: 52px; } .prov b.claude { color: var(--claude); } .prov b.local { color: var(--local); }
+.prov span { color: var(--muted); overflow-wrap: anywhere; } .prov span.bad { color: var(--bad); }
+.routing { color: var(--muted); font-size: 13px; }
+.conn { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: var(--warn); color: #111; padding: 6px 14px; border-radius: 99px; font-size: 13px; box-shadow: var(--shadow); }
+.toast { position: fixed; bottom: 110px; left: 50%; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--line); padding: 8px 14px; border-radius: 10px; font-size: 13.5px; box-shadow: var(--shadow); }
+
+/* Narrower screens: panels become drawers over the conversation. */
+@media (max-width: 1100px) {
+  .app, .app.no-right { grid-template-columns: 0 minmax(0, 1fr) 300px; }
+  .app.no-right { grid-template-columns: 0 minmax(0, 1fr) 0; }
+  .side.left { display: none; }
+  .app.show-left .side.left { display: flex; position: fixed; inset: 0 auto 0 0; width: 280px; z-index: 30; box-shadow: var(--shadow); }
+}
+@media (max-width: 820px) {
+  .app, .app.no-left, .app.no-right { grid-template-columns: 0 minmax(0, 1fr) 0; }
+  .side.right { display: none; }
+  .app.show-right .side.right { display: block; position: fixed; inset: 0 0 0 auto; width: min(320px, 88vw); z-index: 30; box-shadow: var(--shadow); }
+  .col, .composer-wrap { padding-left: 14px; padding-right: 14px; }
+  .seg button { padding: 4px 9px; }
+  .hint { display: none; }
+}
+@media (max-width: 1100px) { .app.show-left .scrim, .app.show-right .scrim { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 25; } }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="side left" id="left">
+    <div class="brand"><span class="logo"></span>Orion</div>
+    <button class="new" id="new"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>New conversation</button>
+    <div class="label">Conversations</div>
+    <nav id="convs"></nav>
+  </aside>
+
+  <main>
+    <header>
+      <button class="icon" id="toggleLeft" title="Conversations"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+      <div class="title" id="title">New conversation</div>
+      <div class="seg" id="mode" title="Routing (Alt+M cycles)">
+        <button data-mode="auto">Auto</button><button data-mode="claude">Claude</button><button data-mode="local">Local</button>
+      </div>
+      <button class="icon" id="reasoning" title="Show reasoning (Alt+R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/></svg></button>
+      <button class="icon" id="speak" title="Speak replies"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg></button>
+      <button class="icon" id="toggleRight" title="Machine panel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
+    </header>
+
+    <div class="log" id="log"><div class="col" id="col"></div></div>
+
+    <div class="composer-wrap">
+      <div class="composer">
+        <div class="listening hidden" id="listening"><span class="dot"></span><span id="voiceState">Listening</span><span class="meter" id="meter"></span><span id="secs"></span><span style="color:var(--faint)">pause to finish · Esc cancels</span></div>
+        <div class="row">
+          <textarea id="input" rows="1" placeholder="Ask Orion, or tell it what to do…" autofocus></textarea>
+          <button class="icon mic" id="mic" title="Talk (Alt+T)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+          <button class="send" id="send" title="Send (Enter)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
+        </div>
+      </div>
+      <div class="hint">Enter sends · Shift+Enter new line · Esc stops · Alt+T talk · Alt+M routing · risky actions ask first</div>
+    </div>
+  </main>
+
+  <div class="scrim" id="scrim"></div>
+  <aside class="side right panel" id="right">
+    <h2>Machine</h2>
+    <div class="host" id="host">…</div><div class="os" id="os"></div>
+    <div class="gauge"><div class="top"><span>CPU</span><span id="cpuv">–</span></div><div class="bar"><i id="cpub" style="width:0"></i></div>
+      <svg class="spark" id="spark" viewBox="0 0 100 30" preserveAspectRatio="none"></svg></div>
+    <div class="gauge"><div class="top"><span>Memory</span><span id="memv">–</span></div><div class="bar"><i id="memb" style="width:0"></i></div></div>
+    <div id="gpus"></div>
+    <h2>Models</h2>
+    <div id="provs"></div>
+    <div class="routing" id="routing"></div>
+    <h2>Session</h2>
+    <div id="sess"></div>
+  </aside>
+</div>
+<div class="conn hidden" id="conn">Reconnecting to Orion…</div>
+<div class="toast hidden" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const col = $("col"), log = $("log"), input = $("input");
+const state = { busy: true, who: "claude", mode: "auto", cur: null, thinking: null, tool: null, cards: {}, cpu: [], id: null, mic: false, speech: false, speak: false, listening: false, empty: true };
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function inline(s) {
+  return esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+}
+// A small, safe Markdown subset: everything is escaped first.
+function md(src) {
+  const out = []; let code = null, list = null, para = [];
+  const flushPara = () => { if (para.length) { out.push("<p>" + para.join("<br>") + "</p>"); para = []; } };
+  const flushList = () => { if (list) { out.push(`<${list.tag}>` + list.items.map(i => `<li>${i}</li>`).join("") + `</${list.tag}>`); list = null; } };
+  for (const line of src.split("\n")) {
+    if (code !== null) {
+      if (/^\s*```/.test(line)) { out.push("<pre><code>" + esc(code.join("\n")) + "</code></pre>"); code = null; } else code.push(line);
+      continue;
+    }
+    if (/^\s*```/.test(line)) { flushPara(); flushList(); code = []; continue; }
+    let m;
+    if ((m = line.match(/^#{1,4}\s+(.*)/))) { flushPara(); flushList(); out.push("<h4>" + inline(m[1]) + "</h4>"); continue; }
+    if ((m = line.match(/^\s*[-*•]\s+(.*)/)) || (m = line.match(/^\s*\d+[.)]\s+(.*)/))) {
+      flushPara();
+      const tag = /^\s*\d/.test(line) ? "ol" : "ul";
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
+      list.items.push(inline(m[1])); continue;
+    }
+    if (!line.trim()) { flushPara(); flushList(); continue; }
+    flushList(); para.push(inline(line));
+  }
+  if (code !== null) out.push("<pre><code>" + esc(code.join("\n")) + "</code></pre>");
+  flushPara(); flushList();
+  return out.join("");
+}
+
+function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
+function nearBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 140; }
+function add(node) { const stick = nearBottom(); clearWelcome(); col.appendChild(node); if (stick) log.scrollTop = log.scrollHeight; return node; }
+function endBlocks() { state.cur = null; state.thinking = null; }
+
+function welcome() {
+  col.innerHTML = "";
+  state.empty = true;
+  const w = el("div", "welcome");
+  w.innerHTML = `<div class="logo"></div><h1>What should Orion do?</h1><div>Ask about this machine, or have Orion work on it. Anything risky asks you first.</div>`;
+  const chips = el("div", "chips");
+  for (const s of ["How full is my disk?", "What's using the most memory?", "Which GPU do I have?", "Plan a cleanup of my home folder"]) {
+    const c = el("button", "chip"); c.textContent = s; c.onclick = () => send(s); chips.appendChild(c);
+  }
+  w.appendChild(chips); col.appendChild(w);
+}
+function clearWelcome() { if (state.empty) { col.innerHTML = ""; state.empty = false; } }
+
+function userMsg(text) { endBlocks(); const m = el("div", "msg user"); const b = el("div", "bubble"); b.textContent = text; m.appendChild(b); add(m); }
+function replyBlock(who) {
+  const m = el("div", "msg");
+  m.innerHTML = `<div class="who ${who}">${who === "claude" ? "Claude" : "Local model"}</div><div class="reply"></div>`;
+  m._text = ""; return add(m);
+}
+function appendText(t) {
+  state.thinking = null;
+  if (!state.cur) { if (!t.trim()) return; state.cur = replyBlock(state.who); t = t.replace(/^\s+/, ""); }
+  state.cur._text += t;
+  const stick = nearBottom();
+  state.cur.querySelector(".reply").innerHTML = md(state.cur._text);
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+function appendThinking(t) {
+  state.cur = null;
+  if (!state.thinking) {
+    const d = el("details", "thinking"); d.open = true;
+    d.innerHTML = "<summary>Reasoning</summary><div></div>"; state.thinking = add(d);
+  }
+  state.thinking.querySelector("div").textContent += t;
+  if (nearBottom()) log.scrollTop = log.scrollHeight;
+}
+function route(ev) {
+  endBlocks(); state.who = ev.who;
+  const r = el("div", "route");
+  r.innerHTML = `→ <b class="${ev.who}">${ev.who === "claude" ? "Claude" : "Local model"}</b> <span>${esc(ev.model)}</span>${ev.reason ? " · " + esc(ev.reason) : ""}`;
+  add(r);
+}
+function toolStart(ev) {
+  endBlocks();
+  const t = el("div", "tool");
+  t.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--accent)"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 0 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H1a2 2 0 0 1 0-4h.1A1.7 1.7 0 0 0 4.6 7a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 2.9-1.2V1a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9h.1a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" transform="scale(.8) translate(3 3)"/></svg>`
+    + `<span class="n">${esc(ev.name)}</span><span class="a mono">${esc(ev.args || "")}</span><span class="s run"><span class="spin"></span></span>`;
+  state.tool = add(t);
+}
+function toolEnd(ev) {
+  const t = state.tool; if (!t) return;
+  const s = t.querySelector(".s");
+  if (ev.ok) { s.className = "s ok"; s.textContent = `✓ ${ev.ms} ms`; }
+  else { s.className = "s bad"; s.textContent = "✗ failed"; const e = el("div", "tool-err"); e.textContent = ev.detail; t.after(e); }
+  state.tool = null;
+}
+function approveCard(ev) {
+  endBlocks();
+  const c = el("div", "card");
+  c.innerHTML = `<h3><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--warn)" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg><span>Approve <code>${esc(ev.tool)}</code>?</span></h3>`
+    + `<pre class="mono">${esc(ev.preview)}</pre><div class="acts"><button class="btn go" data-a="yes">Approve</button><button class="btn" data-a="always">Always allow this session</button><button class="btn" data-a="no">Decline</button></div>`;
+  c.querySelectorAll("button").forEach(b => b.onclick = () => answer(ev.id, b.dataset.a));
+  state.cards[ev.id] = c; add(c);
+}
+function confirmCard(ev) {
+  endBlocks();
+  const c = el("div", "card");
+  c.innerHTML = `<h3><span>${esc(ev.question)}</span></h3><div class="acts"><button class="btn go" data-a="yes">Yes</button><button class="btn" data-a="no">No</button></div>`;
+  c.querySelectorAll("button").forEach(b => b.onclick = () => answer(ev.id, b.dataset.a));
+  state.cards[ev.id] = c; add(c);
+}
+function answered(ev) {
+  const c = state.cards[ev.id]; if (!c) return;
+  c.classList.add("resolved");
+  const acts = c.querySelector(".acts");
+  if (acts) acts.outerHTML = `<div class="done">${ev.answer === "yes" ? "✓ Approved" : ev.answer === "always" ? "✓ Approved for the rest of this session" : "Declined"}</div>`;
+}
+function system(cls, text) { endBlocks(); const e = el("div", cls); e.textContent = text; add(e); }
+function transcript(turns) {
+  col.innerHTML = ""; state.empty = false; state.cards = {}; endBlocks();
+  if (!turns.length) { welcome(); return; }
+  add(el("div", "divider", `Earlier · ${turns.length} message${turns.length === 1 ? "" : "s"}`));
+  for (const t of turns) {
+    userMsg(t.user);
+    for (const tool of t.tools) { const x = el("div", "tool"); x.innerHTML = `<span class="a mono">⚙ ${esc(tool)}</span>`; add(x); }
+    if (t.reply.trim()) { const r = replyBlock(t.who); r._text = t.reply; r.querySelector(".reply").innerHTML = md(t.reply); }
+    endBlocks();
+  }
+  add(el("div", "divider", "Now"));
+  log.scrollTop = log.scrollHeight;
+}
+
+function setBusy(on) {
+  state.busy = on;
+  const b = $("send");
+  b.classList.toggle("stop", on);
+  b.title = on ? "Stop (Esc)" : "Send (Enter)";
+  b.innerHTML = on
+    ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>Stop`
+    : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>`;
+}
+function status(s) {
+  state.mode = s.mode; state.id = s.id;
+  document.querySelectorAll("#mode button").forEach(b => b.classList.toggle("on", b.dataset.mode === s.mode));
+  $("title").textContent = s.title || "New conversation";
+  document.title = s.title ? `${s.title} · Orion` : "Orion";
+  if (s.mode !== "auto") state.who = s.mode;
+  $("provs").innerHTML = s.providers.map(p => {
+    const [name, ...rest] = p.split(/\s+/); const r = rest.join(" ");
+    return `<div class="prov"><b class="${name}">${name === "claude" ? "Claude" : "Local"}</b><span class="${r.startsWith("unavailable") ? "bad" : ""}">${esc(r)}</span></div>`;
+  }).join("");
+  $("routing").textContent = s.routing ? "Routing: " + s.routing : "";
+  const k = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+  $("sess").innerHTML = `<div class="kv"><span>Messages</span><span>${s.turns}</span></div>`
+    + s.usage.map(u => `<div class="kv"><span>${u.label === "claude" ? "Claude" : "Local"}</span><span title="${u.cached ? k(u.cached) + " input tokens read from cache" : ""}">${k(u.input)} in · ${k(u.output)} out</span></div>`
+      + (u.cached ? `<div class="kv"><span></span><span style="color:var(--faint)">${k(u.cached)} from cache</span></div>` : "")).join("")
+    + `<div class="kv"><span>Tools</span><span>${s.tools_auto} automatic · ${s.tools_ask} ask first</span></div>`;
+  refreshConvs();
+}
+function gauge(frac) { return frac > 0.9 ? "high" : frac > 0.7 ? "mid" : ""; }
+function machine(m) {
+  $("host").textContent = m.host || "This machine"; $("os").textContent = m.os || "";
+  if (m.cpu != null) {
+    const pct = Math.round(m.cpu * 100); $("cpuv").textContent = `${pct}%${m.cores ? " · " + m.cores + " cores" : ""}`;
+    const b = $("cpub"); b.style.width = pct + "%"; b.className = gauge(m.cpu);
+    state.cpu.push(m.cpu); if (state.cpu.length > 40) state.cpu.shift();
+    const n = state.cpu.length, x = i => (n > 1 ? i / (n - 1) * 100 : 100).toFixed(1);
+    const pts = state.cpu.map((v, i) => `${x(i)},${(29 - Math.max(v, 0.02) * 27).toFixed(1)}`);
+    $("spark").innerHTML = n > 1 ? `<polygon points="0,30 ${pts.join(" ")} 100,30"/><polyline points="${pts.join(" ")}"/>` : "";
+  }
+  if (m.mem_total_kb) {
+    const used = m.mem_total_kb - (m.mem_avail_kb || 0), f = used / m.mem_total_kb, g = x => (x / 1048576).toFixed(1);
+    $("memv").textContent = `${g(used)} / ${g(m.mem_total_kb)} GB`; const b = $("memb"); b.style.width = (f * 100).toFixed(0) + "%"; b.className = gauge(f);
+  }
+  let html = "";
+  for (const [i, gpu] of (m.gpus || []).entries()) {
+    const name = esc(gpu.name.replace("NVIDIA ", "").replace("GeForce ", ""));
+    if (gpu.util != null) html += `<div class="gauge"><div class="top"><span>GPU ${i} · ${name}</span><span>${gpu.util}%${gpu.temp != null ? " · " + gpu.temp + "°C" : ""}</span></div><div class="bar"><i class="${gauge(gpu.util / 100)}" style="width:${gpu.util}%"></i></div></div>`;
+    if (gpu.mem_total) { const f = gpu.mem_used / gpu.mem_total; html += `<div class="gauge"><div class="top"><span>VRAM</span><span>${(gpu.mem_used / 1024).toFixed(1)} / ${(gpu.mem_total / 1024).toFixed(0)} GB</span></div><div class="bar"><i class="${gauge(f)}" style="width:${(f * 100).toFixed(0)}%"></i></div></div>`; }
+  }
+  for (const v of m.other_gpus || []) html += `<div class="kv"><span>GPU</span><span>${esc(v)}</span></div>`;
+  if (!html) html = `<div class="kv"><span>GPU</span><span>none found</span></div>`;
+  $("gpus").innerHTML = html;
+}
+
+let toastTimer;
+function toast(text) { const t = $("toast"); t.textContent = text; t.classList.remove("hidden"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.add("hidden"), 3500); }
+
+async function api(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-orion": "1" }, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+async function send(text) {
+  text = (text ?? input.value).trim(); if (!text) return;
+  if (state.busy) { toast("Orion is still working. Esc stops it."); return; }
+  try { await api("/api/send", { text }); input.value = ""; autosize(); } catch (e) { toast(e.message === "busy" ? "Orion is still working." : e.message); }
+}
+function answer(id, a) { api("/api/answer", { id, answer: a }).catch(e => toast(e.message)); }
+function stop() { api("/api/stop").catch(() => {}); }
+function setMode(m) { if (m !== state.mode) send("/use " + m); }
+
+async function refreshConvs() {
+  try {
+    const list = await (await fetch("/api/conversations")).json();
+    $("convs").innerHTML = "";
+    for (const c of list) {
+      const b = el("button", "conv" + (c.id === state.id ? " active" : ""));
+      b.innerHTML = `<span class="t">${esc(c.title || "Untitled")}</span><span class="m">${esc(c.ago)} · ${c.turns} msg</span>`;
+      b.onclick = () => { closeDrawers(); if (c.id !== state.id) send("/resume " + c.id); };
+      $("convs").appendChild(b);
+    }
+    if (!list.length) $("convs").innerHTML = `<div class="label" style="text-transform:none;letter-spacing:0">Conversations you have will appear here.</div>`;
+  } catch {}
+}
+
+function voiceEv(ev) {
+  const box = $("listening"), mic = $("mic");
+  state.listening = ev.state === "listening";
+  box.classList.toggle("hidden", ev.state === "idle");
+  mic.classList.toggle("live", state.listening);
+  $("voiceState").textContent = ev.state === "transcribing" ? "Transcribing…" : "Listening";
+  if (ev.state === "listening") {
+    const m = $("meter"); m._lv = (m._lv || []).concat(ev.level).slice(-16);
+    m.innerHTML = m._lv.map(l => `<i style="height:${Math.max(2, l * 16)}px"></i>`).join("");
+    $("secs").textContent = ev.secs + "s";
+  } else { $("meter").innerHTML = ""; $("meter")._lv = []; $("secs").textContent = ""; }
+}
+async function talk() {
+  if (!state.mic) { toast("Voice input isn't set up: see /voice"); return; }
+  try { await api("/api/voice", { action: state.listening ? "stop" : "start" }); } catch (e) { toast(e.message); }
+}
+
+function handle(ev) {
+  switch (ev.type) {
+    case "hello":
+      state.mic = ev.mic; state.speech = ev.speech; state.speak = ev.speak_replies;
+      document.body.classList.toggle("hide-reasoning", !ev.show_reasoning);
+      $("reasoning").classList.toggle("on", ev.show_reasoning);
+      $("speak").classList.toggle("on", ev.speak_replies);
+      $("mic").style.opacity = ev.mic ? 1 : .45;
+      welcome(); break;
+    case "reset": welcome(); break;
+    case "transcript": transcript(ev.turns); break;
+    case "user": userMsg(ev.text); break;
+    case "route": route(ev); break;
+    case "thinking": appendThinking(ev.text); break;
+    case "text": appendText(ev.text); break;
+    case "tool_start": toolStart(ev); break;
+    case "tool_end": toolEnd(ev); break;
+    case "approve": approveCard(ev); break;
+    case "confirm": confirmCard(ev); break;
+    case "answered": answered(ev); break;
+    case "notice": system("notice", ev.text); break;
+    case "error": system("error", "Error: " + ev.text); break;
+    case "output": system("output", ev.text); break;
+    case "status": status(ev); break;
+    case "machine": machine(ev.machine); break;
+    case "busy": setBusy(ev.on); if (!ev.on) endBlocks(); break;
+    case "voice": voiceEv(ev); break;
+    case "heard": input.value = (input.value.trim() ? input.value.trim() + " " : "") + ev.text; autosize(); input.focus(); break;
+    case "voice_error": toast("Voice: " + ev.text); break;
+    case "speaking": $("speak").title = ev.on ? "Speaking · click or Esc to stop" : "Speak replies"; break;
+    case "speak_replies": state.speak = ev.on; $("speak").classList.toggle("on", ev.on); break;
+  }
+}
+
+function connect() {
+  const es = new EventSource("/api/events");
+  es.onopen = () => $("conn").classList.add("hidden");
+  es.onmessage = (m) => handle(JSON.parse(m.data));
+  es.onerror = () => { $("conn").classList.remove("hidden"); };
+}
+
+function autosize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 220) + "px"; }
+input.addEventListener("input", autosize);
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (state.listening) api("/api/voice", { action: "cancel" });
+    else if (state.busy) stop();
+    else api("/api/stop").catch(() => {});
+  }
+  if (e.altKey && e.code === "KeyT") { e.preventDefault(); talk(); }
+  if (e.altKey && e.code === "KeyM") { e.preventDefault(); const order = ["auto", "claude", "local"]; setMode(order[(order.indexOf(state.mode) + 1) % 3]); }
+  if (e.altKey && e.code === "KeyR") { e.preventDefault(); $("reasoning").click(); }
+});
+$("send").onclick = () => state.busy ? stop() : send();
+$("mic").onclick = talk;
+$("new").onclick = () => { closeDrawers(); send("/new"); };
+$("mode").onclick = (e) => { const m = e.target.dataset && e.target.dataset.mode; if (m) setMode(m); };
+$("reasoning").onclick = () => { const on = document.body.classList.toggle("hide-reasoning"); $("reasoning").classList.toggle("on", !on); };
+$("speak").onclick = () => send(state.speak ? "/voice speak off" : "/voice speak on");
+// Wide screens show or hide the panels; narrow ones open them as drawers.
+function togglePanel(side) {
+  const app = $("app"), narrow = window.innerWidth <= (side === "left" ? 1100 : 820);
+  if (narrow) { app.classList.remove(side === "left" ? "show-right" : "show-left"); app.classList.toggle("show-" + side); }
+  else app.classList.toggle("no-" + side);
+}
+function closeDrawers() { $("app").classList.remove("show-left", "show-right"); }
+$("toggleLeft").onclick = () => togglePanel("left");
+$("toggleRight").onclick = () => togglePanel("right");
+$("scrim").onclick = closeDrawers;
+setBusy(true);
+connect();
+</script>
+</body>
+</html>

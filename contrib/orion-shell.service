@@ -1,0 +1,19 @@
+# Orion's graphical shell as a systemd user service:
+#
+#     cp contrib/orion-shell.service ~/.config/systemd/user/
+#     systemctl --user enable --now orion-shell
+#
+# Then open the address in ~/.local/state/orion/shell-url
+# (or `journalctl --user -u orion-shell`) in a browser on this machine.
+[Unit]
+Description=Orion graphical shell
+After=network.target
+
+[Service]
+ExecStart=%h/.cargo/bin/orion shell
+Restart=on-failure
+# Put ANTHROPIC_API_KEY here, or in ~/.config/orion/env (one VAR=value per line).
+EnvironmentFile=-%h/.config/orion/env
+
+[Install]
+WantedBy=default.target
