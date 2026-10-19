@@ -1,0 +1,651 @@
+//! The system package manager (apt, dnf or pacman): what is installed, what
+//! is available, and installing or removing packages within `[packages]`.
+//!
+//! Installs run outside the sandbox, as root (see `[admin] elevate`): a
+//! package's install scripts can do anything, which is why `pkg_install`
+//! is an `execute` tool.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use anyhow::{bail, ensure, Result};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use super::exec::{self, glob_match};
+use crate::policy::Policy;
+use crate::tool::{parse_args, Preapproval, Risk, Tool};
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Manager {
+    Apt,
+    Dnf,
+    Pacman,
+}
+
+impl Manager {
+    fn name(self) -> &'static str {
+        match self {
+            Manager::Apt => "apt",
+            Manager::Dnf => "dnf",
+            Manager::Pacman => "pacman",
+        }
+    }
+}
+
+fn manager(policy: &Policy) -> Result<Manager> {
+    Ok(match policy.packages.manager.as_str() {
+        "apt" => Manager::Apt,
+        "dnf" => Manager::Dnf,
+        "pacman" => Manager::Pacman,
+        "auto" if exec::installed("apt-get") && exec::installed("dpkg-query") => Manager::Apt,
+        "auto" if exec::installed("dnf") && exec::installed("rpm") => Manager::Dnf,
+        "auto" if exec::installed("pacman") => Manager::Pacman,
+        "auto" => bail!("no supported package manager (apt, dnf or pacman) is installed"),
+        other => bail!("packages.manager must be auto, apt, dnf or pacman, not {other:?}"),
+    })
+}
+
+/// Package names as the managers write them. Anything that could be read
+/// as an option is refused.
+fn package_name(raw: &str) -> Result<&str> {
+    let ok = !raw.is_empty()
+        && raw.len() <= 200
+        && raw.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && raw.chars().all(|c| c.is_ascii_alphanumeric() || "+-._:@".contains(c));
+    ensure!(ok, "{raw:?} is not a package name");
+    Ok(raw)
+}
+
+struct Installed {
+    name: String,
+    version: String,
+    size_kib: Option<u64>,
+    summary: String,
+}
+
+fn installed(m: Manager) -> Result<Vec<Installed>> {
+    let text = match m {
+        Manager::Apt => exec::output(
+            "dpkg-query",
+            &["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\t${Installed-Size}\t${binary:Summary}\n"],
+        )?,
+        Manager::Dnf => {
+            exec::output("rpm", &["-qa", "--qf", "ii\t%{NAME}\t%{VERSION}-%{RELEASE}\t%{SIZE}\t%{SUMMARY}\n"])?
+        }
+        Manager::Pacman => exec::output("pacman", &["-Q"])?
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .map(|(n, v)| format!("ii\t{n}\t{v}\t\t\n"))
+            .collect(),
+    };
+    Ok(text
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            // dpkg lists removed-but-configured packages too ("rc").
+            if f.len() < 5 || !f[0].starts_with("ii") {
+                return None;
+            }
+            let size = f[3].parse::<u64>().ok().map(|n| if m == Manager::Dnf { n / 1024 } else { n });
+            Some(Installed { name: f[1].into(), version: f[2].into(), size_kib: size, summary: f[4].into() })
+        })
+        .collect())
+}
+
+/// `apt-cache search`, `dnf search` or `pacman -Ss`: (name, summary).
+fn parse_search(m: Manager, text: &str) -> Vec<(String, String)> {
+    match m {
+        Manager::Apt => text
+            .lines()
+            .filter_map(|l| l.split_once(" - "))
+            .map(|(n, s)| (n.trim().to_string(), s.trim().to_string()))
+            .collect(),
+        Manager::Dnf => text
+            .lines()
+            .filter(|l| !l.starts_with('=') && !l.starts_with(' '))
+            .filter_map(|l| l.split_once(" : "))
+            .map(|(n, s)| {
+                // name.arch
+                let n = n.trim();
+                let n = n.rsplit_once('.').map_or(n, |(name, _)| name);
+                (n.to_string(), s.trim().to_string())
+            })
+            .collect(),
+        Manager::Pacman => {
+            let mut out = Vec::new();
+            let mut lines = text.lines().peekable();
+            while let Some(head) = lines.next() {
+                let Some(name) = head.split_whitespace().next().and_then(|n| n.split('/').nth(1)) else { continue };
+                let summary = match lines.peek() {
+                    Some(l) if l.starts_with(' ') => lines.next().unwrap_or_default().trim(),
+                    _ => "",
+                };
+                out.push((name.to_string(), summary.to_string()));
+            }
+            out
+        }
+    }
+}
+
+/// `Key: value` lines (apt-cache show, dnf info, pacman -Si), with
+/// continuation lines folded in.
+fn parse_fields(text: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut last: Option<String> = None;
+    for line in text.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(v) = last.as_ref().and_then(|k| out.get_mut(k)) {
+                let t = line.trim().trim_start_matches(": ").trim();
+                if !t.is_empty() && t != "." {
+                    v.push(' ');
+                    v.push_str(t);
+                }
+            }
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim().to_string();
+            if !k.is_empty() && !k.contains(' ') || matches!(k.as_str(), "Install Date" | "Installed Size" | "Depends On") {
+                out.entry(k.clone()).or_insert_with(|| v.trim().to_string());
+                last = Some(k);
+            }
+        }
+    }
+    out
+}
+
+/// What `apt-get -s` would do: (package, version) per action.
+#[derive(Default, Debug)]
+struct Plan {
+    install: Vec<(String, String)>,
+    remove: Vec<(String, String)>,
+}
+
+fn parse_apt_simulation(text: &str) -> Plan {
+    let mut plan = Plan::default();
+    for line in text.lines() {
+        let (list, rest) = match line.split_once(' ') {
+            Some(("Inst", rest)) => (&mut plan.install, rest),
+            Some(("Remv", rest)) => (&mut plan.remove, rest),
+            _ => continue,
+        };
+        let mut f = rest.split_whitespace();
+        let name = f.next().unwrap_or_default().to_string();
+        // "Inst sl (5.02-1 …)", "Inst x [old] (new …)", "Remv curl [8.5.0]"
+        let version = f
+            .find(|w| w.starts_with('('))
+            .or_else(|| rest.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .trim_matches(['(', ')', '[', ']'])
+            .to_string();
+        list.push((name, version));
+    }
+    plan
+}
+
+fn simulate(packages: &[String], remove: bool) -> Result<Plan> {
+    let mut args = vec!["-s", if remove { "remove" } else { "install" }, "--"];
+    args.extend(packages.iter().map(String::as_str));
+    match exec::output("apt-get", &args) {
+        Ok(text) => Ok(parse_apt_simulation(&text)),
+        Err(e) => {
+            // "apt-get: … E: Unable to locate package foo"
+            let msg = format!("{e:#}");
+            let reason = msg.lines().filter(|l| l.contains("E: ")).map(|l| l.trim_start_matches("apt-get: ")).collect::<Vec<_>>();
+            bail!("{}", if reason.is_empty() { msg } else { reason.join("; ") })
+        }
+    }
+}
+
+fn essential(name: &str) -> bool {
+    exec::output("dpkg-query", &["-W", "-f", "${Essential} ${Priority}", "--", name])
+        .is_ok_and(|s| s.starts_with("yes") || s.ends_with("required"))
+}
+
+pub struct PkgList;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListArgs {
+    filter: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+fn default_limit() -> usize {
+    200
+}
+
+impl Tool for PkgList {
+    fn name(&self) -> &'static str {
+        "pkg_list"
+    }
+
+    fn description(&self) -> &'static str {
+        "List installed system packages (apt, dnf or pacman) with versions, sizes and summaries. Filter by name."
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Read
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "filter": { "type": "string", "description": "Case-insensitive substring of the package name." },
+                "limit": { "type": "integer", "minimum": 1, "default": 200 }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
+        let a: ListArgs = parse_args(args)?;
+        let m = manager(policy)?;
+        let all = installed(m)?;
+        let total = all.len();
+        let filter = a.filter.map(|f| f.to_lowercase());
+        let matched: Vec<&Installed> =
+            all.iter().filter(|p| filter.as_ref().is_none_or(|f| p.name.to_lowercase().contains(f))).collect();
+        Ok(json!({
+            "manager": m.name(),
+            "installed": total,
+            "matched": matched.len(),
+            "truncated": matched.len() > a.limit,
+            "packages": matched.iter().take(a.limit).map(|p| json!({
+                "name": p.name, "version": p.version, "size_kib": p.size_kib, "summary": p.summary,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+}
+
+pub struct PkgSearch;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchArgs {
+    query: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    50
+}
+
+impl Tool for PkgSearch {
+    fn name(&self) -> &'static str {
+        "pkg_search"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search the package repositories by name and description. Exact name matches come first; \
+         each result says whether it is installed."
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Read
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "default": 50 }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+
+    fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
+        let a: SearchArgs = parse_args(args)?;
+        let q = a.query.trim();
+        ensure!(!q.is_empty() && !q.starts_with('-'), "{:?} is not a search", a.query);
+        let m = manager(policy)?;
+        let text = match m {
+            Manager::Apt => exec::output("apt-cache", &["search", "--", q])?,
+            Manager::Dnf => exec::output("dnf", &["-q", "search", "--", q])?,
+            Manager::Pacman => exec::output("pacman", &["-Ss", "--", q]).unwrap_or_default(),
+        };
+        let mut hits = parse_search(m, &text);
+        let ql = q.to_lowercase();
+        hits.sort_by_key(|(n, _)| (n.to_lowercase() != ql, !n.to_lowercase().contains(&ql), n.len()));
+        hits.dedup_by(|a, b| a.0 == b.0);
+        let have: BTreeMap<String, String> = installed(m)?.into_iter().map(|p| (p.name, p.version)).collect();
+        let total = hits.len();
+        Ok(json!({
+            "manager": m.name(),
+            "matched": total,
+            "truncated": total > a.limit,
+            "packages": hits.into_iter().take(a.limit).map(|(name, summary)| json!({
+                "installed": have.get(&name), "name": name, "summary": summary,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+}
+
+pub struct PkgInfo;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InfoArgs {
+    name: String,
+}
+
+impl Tool for PkgInfo {
+    fn name(&self) -> &'static str {
+        "pkg_info"
+    }
+
+    fn description(&self) -> &'static str {
+        "Describe one package: the installed version and the newest available one, its description, \
+         size, dependencies and homepage."
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Read
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": ["name"],
+            "additionalProperties": false
+        })
+    }
+
+    fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
+        let a: InfoArgs = parse_args(args)?;
+        let name = package_name(&a.name)?;
+        let m = manager(policy)?;
+        let installed_version =
+            installed(m)?.into_iter().find(|p| p.name == name).map(|p| p.version);
+        let (f, candidate) = match m {
+            Manager::Apt => {
+                let show = exec::output("apt-cache", &["show", "--no-all-versions", "--", name]);
+                let show = show.map_err(|_| anyhow::anyhow!("there is no package {name}"))?;
+                let policy_text = exec::output("apt-cache", &["policy", "--", name]).unwrap_or_default();
+                let candidate = policy_text
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("Candidate:"))
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| v != "(none)");
+                (parse_fields(&show), candidate)
+            }
+            Manager::Dnf => {
+                let f = parse_fields(&exec::output("dnf", &["-q", "info", "--", name])?);
+                let v = f.get("Version").map(|v| format!("{v}-{}", f.get("Release").cloned().unwrap_or_default()));
+                (f, v)
+            }
+            Manager::Pacman => {
+                let text = exec::output("pacman", &["-Si", "--", name]).or_else(|_| exec::output("pacman", &["-Qi", "--", name]))?;
+                let f = parse_fields(&text);
+                let v = f.get("Version").cloned();
+                (f, v)
+            }
+        };
+        let field = |keys: &[&str]| keys.iter().find_map(|k| f.get(*k)).cloned();
+        Ok(json!({
+            "manager": m.name(),
+            "name": name,
+            "installed": installed_version,
+            "available": candidate,
+            "update": installed_version.is_some() && candidate.is_some() && installed_version != candidate,
+            "summary": field(&["Description", "Summary"]),
+            "size": f.get("Installed-Size").map(|kib| format!("{kib} KiB")).or_else(|| field(&["Installed Size", "Size"])),
+            "depends": field(&["Depends", "Depends On"]),
+            "homepage": field(&["Homepage", "URL"]),
+            "section": field(&["Section", "Repository", "Repo"]),
+        }))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChangeArgs {
+    packages: Vec<String>,
+}
+
+fn change_schema(verb: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "packages": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 50,
+                          "description": format!("Package names to {verb}.") }
+        },
+        "required": ["packages"],
+        "additionalProperties": false
+    })
+}
+
+/// Validate the names, and for apt, work out exactly what would change.
+fn check_change(policy: &Policy, args: &Value, remove: bool) -> Result<(Manager, Vec<String>, Option<Plan>)> {
+    let a: ChangeArgs = parse_args(args.clone())?;
+    ensure!(!a.packages.is_empty() && a.packages.len() <= 50, "name 1 to 50 packages");
+    for p in &a.packages {
+        package_name(p)?;
+    }
+    let m = manager(policy)?;
+    let guard = |name: &str| -> Result<()> {
+        let bare = name.split(':').next().unwrap_or(name);
+        if let Some(p) = policy.packages.protected.iter().find(|p| glob_match(p, bare)) {
+            bail!("{name} is protected (packages.protected: {p:?}); no approval can remove it");
+        }
+        if m == Manager::Apt && essential(name) {
+            bail!("{name} is essential: the system needs it");
+        }
+        Ok(())
+    };
+    if remove {
+        a.packages.iter().try_for_each(|p| guard(p))?;
+    }
+    let plan = if m == Manager::Apt { Some(simulate(&a.packages, remove)?) } else { None };
+    if remove {
+        // Removing a package also removes what depends on it.
+        for (name, _) in plan.iter().flat_map(|p| &p.remove) {
+            guard(name).map_err(|e| anyhow::anyhow!("removing these would also remove {name}: {e:#}"))?;
+        }
+    }
+    Ok((m, a.packages, plan))
+}
+
+fn change(policy: &Policy, args: Value, remove: bool) -> Result<Value> {
+    let (m, packages, plan) = check_change(policy, &args, remove)?;
+    let mut argv: Vec<String> = match (m, remove) {
+        (Manager::Apt, r) => {
+            vec!["DEBIAN_FRONTEND=noninteractive".into(), "apt-get".into(), if r { "remove" } else { "install" }.into()]
+                .into_iter()
+                .chain(["-y", "-q", "-o", "Dpkg::Options::=--force-confold"].map(String::from))
+                .collect()
+        }
+        (Manager::Dnf, r) => vec!["dnf".into(), if r { "remove" } else { "install" }.into(), "-y".into(), "-q".into()],
+        (Manager::Pacman, false) => ["pacman", "-S", "--noconfirm", "--needed"].map(String::from).to_vec(),
+        (Manager::Pacman, true) => ["pacman", "-R", "--noconfirm"].map(String::from).to_vec(),
+    };
+    argv.push("--".into());
+    argv.extend(packages.iter().cloned());
+    // `env` carries DEBIAN_FRONTEND through sudo, which resets the environment.
+    let program = if m == Manager::Apt { "env".to_string() } else { argv.remove(0) };
+    let prefix = exec::elevation(&policy.admin.elevate)?;
+    let cmd = exec::command_as(prefix.as_deref(), &program, &argv);
+    let done = exec::run(cmd, None, Duration::from_secs(policy.packages.timeout_secs.max(30)), 256 << 10)?;
+    // The last lines, each as it ended up (progress counters redraw with \r).
+    let tail = |s: &str| {
+        let lines: Vec<&str> = s.lines().map(|l| l.rsplit('\r').next().unwrap_or(l)).collect();
+        lines[lines.len().saturating_sub(20)..].join("\n")
+    };
+    let changed = plan.map(|p| {
+        let list = if remove { p.remove } else { p.install };
+        list.into_iter().map(|(name, version)| json!({ "name": name, "version": version })).collect::<Vec<_>>()
+    });
+    let mut out = json!({
+        "ok": done.success(),
+        "manager": m.name(),
+        "requested": packages,
+        if remove { "removed" } else { "installed" }: if done.success() { changed } else { None },
+        "elevated": prefix.is_some(),
+        "duration_secs": done.duration.as_secs(),
+        "output": tail(&done.stdout),
+    });
+    if !done.success() {
+        let mut why = done.complaint();
+        if why.contains("a password is required") {
+            why.push_str(" (sudo needs a password here; see [admin] elevate in the Orion policy)");
+        }
+        out["error"] = json!(tail(&why));
+    }
+    Ok(out)
+}
+
+pub struct PkgInstall;
+
+impl Tool for PkgInstall {
+    fn name(&self) -> &'static str {
+        "pkg_install"
+    }
+
+    fn description(&self) -> &'static str {
+        "Install system packages with the package manager (apt, dnf or pacman), as root and outside the \
+         sandbox. Unknown names are reported before anything runs. Returns every package that was \
+         installed, dependencies included."
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Execute
+    }
+
+    fn input_schema(&self) -> Value {
+        change_schema("install")
+    }
+
+    fn preapproval(&self, policy: &Policy, args: &Value) -> Preapproval {
+        let names: Vec<&str> = args
+            .get("packages")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        match names.iter().find(|n| !policy.packages.allowed.iter().any(|p| glob_match(p, n))) {
+            None if !names.is_empty() => Preapproval::Granted,
+            None => Preapproval::Refused("no packages named".into()),
+            Some(n) => Preapproval::Refused(format!("{n:?} is not in packages.allowed")),
+        }
+    }
+
+    fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
+        check_change(policy, args, false).map(drop)
+    }
+
+    fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
+        change(policy, args, false)
+    }
+}
+
+pub struct PkgRemove;
+
+impl Tool for PkgRemove {
+    fn name(&self) -> &'static str {
+        "pkg_remove"
+    }
+
+    fn description(&self) -> &'static str {
+        "Remove system packages. Refused, before anything runs, if it would take away a package the system \
+         needs or one the policy protects (the kernel, systemd, sudo, ssh, …), including as a dependent."
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Execute
+    }
+
+    fn input_schema(&self) -> Value {
+        change_schema("remove")
+    }
+
+    fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
+        check_change(policy, args, true).map(drop)
+    }
+
+    fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
+        change(policy, args, true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_names() {
+        for ok in ["jq", "g++", "libc6:i386", "python3.12", "nvidia-driver-550"] {
+            assert!(package_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "-y", "--force", "a b", "x;y", "../x", "$(id)"] {
+            assert!(package_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn parses_manager_output() {
+        let plan = parse_apt_simulation(
+            "Inst sl (5.02-1 Ubuntu:24.04/noble [amd64])\nInst libjq1 [1.6] (1.7.1-3 Ubuntu [amd64])\n\
+             Conf sl (5.02-1 Ubuntu:24.04/noble [amd64])\nRemv curl [8.5.0-2ubuntu10.15]\n",
+        );
+        assert_eq!(plan.install, [("sl".into(), "5.02-1".into()), ("libjq1".into(), "1.7.1-3".into())]);
+        assert_eq!(plan.remove, [("curl".into(), "8.5.0-2ubuntu10.15".into())]);
+
+        let apt = parse_search(Manager::Apt, "jq - lightweight JSON processor\njc - JSON CLI output\n");
+        assert_eq!(apt[0], ("jq".into(), "lightweight JSON processor".into()));
+        let dnf = parse_search(
+            Manager::Dnf,
+            "======= Name Exactly Matched: jq =======\njq.x86_64 : Command-line JSON processor\n",
+        );
+        assert_eq!(dnf, [("jq".into(), "Command-line JSON processor".into())]);
+        let pac = parse_search(
+            Manager::Pacman,
+            "extra/jq 1.7.1-2 [installed]\n    Command-line JSON processor\ncore/jx 1-1\n    x\n",
+        );
+        assert_eq!(pac[0], ("jq".into(), "Command-line JSON processor".into()));
+        assert_eq!(pac[1].0, "jx");
+
+        let f = parse_fields("Package: jq\nDescription: lightweight\n and flexible\n .\nDepends: libc6\n");
+        assert_eq!(f["Description"], "lightweight and flexible");
+        assert_eq!(f["Depends"], "libc6");
+        let f = parse_fields("Name            : jq\nInstalled Size  : 1.2 MiB\nDepends On      : glibc\n");
+        assert_eq!(f["Installed Size"], "1.2 MiB");
+        assert_eq!(f["Depends On"], "glibc");
+    }
+
+    #[test]
+    fn install_preapproval() {
+        let p = Policy::from_toml("[packages]\nallowed = [\"python3-*\", \"jq\"]\n").unwrap();
+        let args = |names: &[&str]| json!({ "packages": names });
+        assert!(matches!(PkgInstall.preapproval(&p, &args(&["jq", "python3-numpy"])), Preapproval::Granted));
+        assert!(matches!(PkgInstall.preapproval(&p, &args(&["jq", "nginx"])), Preapproval::Refused(_)));
+        assert!(matches!(PkgInstall.preapproval(&p, &args(&[])), Preapproval::Refused(_)));
+    }
+
+    #[test]
+    fn checks_against_the_real_manager() {
+        if !exec::installed("dpkg-query") || !exec::installed("apt-get") {
+            return;
+        }
+        let p = Policy::from_toml("").unwrap();
+        let r = PkgList.call(&p, json!({ "filter": "dpkg" })).unwrap();
+        assert!(r["packages"].as_array().unwrap().iter().any(|x| x["name"] == "dpkg"), "{r}");
+        let r = PkgInfo.call(&p, json!({ "name": "dpkg" })).unwrap();
+        assert!(r["installed"].is_string(), "{r}");
+
+        // Unknown packages and protected or essential ones fail before any approval.
+        let err = PkgInstall.precheck(&p, &json!({ "packages": ["orion-no-such-package"] })).unwrap_err();
+        assert!(format!("{err:#}").contains("Unable to locate"), "{err:#}");
+        assert!(PkgInstall.precheck(&p, &json!({ "packages": ["--yes"] })).is_err());
+        let err = PkgRemove.precheck(&p, &json!({ "packages": ["dpkg"] })).unwrap_err();
+        assert!(format!("{err:#}").contains("protected"), "{err:#}");
+        let err = PkgRemove.precheck(&p, &json!({ "packages": ["coreutils"] })).unwrap_err();
+        assert!(format!("{err:#}").contains("essential"), "{err:#}");
+    }
+}

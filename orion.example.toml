@@ -35,6 +35,39 @@ allowed_commands = []
 timeout_secs = 30
 max_output_bytes = 65536   # per stream
 
+# How Orion gets root for system services and packages: "auto" (nothing when
+# Orion runs as root; otherwise services are tried directly, which polkit may
+# allow, then with `sudo -n`, and packages use `sudo -n`), "sudo", "pkexec"
+# (a graphical password prompt), or "none".
+[admin]
+elevate = "auto"
+
+# systemd units (svc_list, svc_status, svc_control).
+[services]
+allowed = []                    # units svc_control may act on without asking, e.g.
+                                # ["ollama.service", "llama-server.service"]
+# Units no approval can touch. `*` is a wildcard.
+protected = ["orion.*", "ssh.service", "sshd.service", "systemd-*", "dbus*", "polkit.service",
+             "NetworkManager.service", "systemd-networkd.service", "display-manager.service", "gdm*.service",
+             "sddm.service", "lightdm.service", "getty@*", "user@*", "user-runtime-dir@*", "*.target"]
+
+# The package manager (pkg_list, pkg_search, pkg_info, pkg_install, pkg_remove).
+[packages]
+manager = "auto"                # apt, dnf or pacman
+allowed = []                    # pkg_install without asking, e.g. ["python3-*", "jq"]
+# Packages no approval can remove, even as dependents. Packages the system
+# marks essential or required are protected as well.
+protected = ["sudo", "systemd", "systemd-*", "openssh-server", "openssh", "linux", "linux-image-*", "kernel",
+             "kernel-core", "bubblewrap", "apt", "dnf", "pacman", "dpkg", "rpm", "glibc", "libc6", "bash"]
+timeout_secs = 900
+
+# Local inference servers and the VRAM they share (model_status, model_load, ...).
+[models]
+servers = []                    # besides chat.local.base_url, e.g. ["http://127.0.0.1:11435"]
+discover = true                 # also look on the usual ports: 11434, 8080, 8000, 1234
+vram_reserve_mb = 1024          # kept free on each GPU; models load only within the rest
+keep_alive = "30m"              # how long a loaded model stays after its last use
+
 [audit]
 enabled = true
 # path = "~/.local/state/orion/audit.jsonl"

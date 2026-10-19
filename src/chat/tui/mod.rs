@@ -874,6 +874,26 @@ fn panel_lines(m: &Machine, s: &Status, width: usize) -> Vec<Line<'static>> {
     if m.gpus.is_empty() && m.other_gpus.is_empty() {
         l.push(Line::styled(" GPU  none found", dim));
     }
+    for (name, vram) in &m.loaded {
+        let size = format!("{:.1}G", *vram as f64 / 1024.0);
+        let name = clip(name, width.saturating_sub(size.len() + 4));
+        l.push(Line::from(vec![
+            Span::styled(" ● ", Style::new().fg(Color::Green)),
+            Span::raw(format!("{name:<w$} ", w = width.saturating_sub(size.len() + 4))),
+            Span::styled(size, dim),
+        ]));
+    }
+    match &m.failed {
+        Some(f) if !f.is_empty() => {
+            let units = f.iter().map(|u| u.trim_end_matches(".service")).collect::<Vec<_>>().join(", ");
+            let text = format!(" {} failed: {units}", if f.len() == 1 { "1 service" } else { "services" });
+            for row in wrap(&text, width) {
+                l.push(Line::styled(row, Style::new().fg(Color::Red)));
+            }
+        }
+        Some(_) => l.push(Line::styled(" services ok", dim)),
+        None => {}
+    }
 
     l.push(Line::raw(""));
     l.push(Line::styled(" Routing", head));
@@ -912,7 +932,7 @@ pub fn run(orion: &Orion, session: Session, saver: Saver) -> Result<()> {
     let show_reasoning = orion.policy().chat.show_reasoning;
     std::thread::scope(|scope| {
         scope.spawn(move || agent::run(orion, session, saver, agent_rx, agent_tx));
-        scope.spawn(|| watch_machine(machine_tx, &stop));
+        scope.spawn(|| watch_machine(orion.policy(), machine_tx, &stop));
         let app = App::new(to_agent, show_reasoning, &orion.policy().voice);
         let result = screen(app, from_agent, machine_rx);
         stop.store(true, Ordering::Relaxed);
@@ -1105,6 +1125,8 @@ mod tests {
             mem_total_kb: Some(16 * 1_048_576),
             mem_avail_kb: Some(7 * 1_048_576),
             gpus: vec![Gpu { name: "NVIDIA GeForce RTX 4070".into(), util: Some(42), mem_used: Some(3174), mem_total: Some(12282), temp: Some(61) }],
+            loaded: vec![("qwen3:8b".into(), 5427)],
+            failed: Some(vec!["nginx.service".into()]),
             ..Default::default()
         };
         let s = Status {
@@ -1113,7 +1135,7 @@ mod tests {
             ..Default::default()
         };
         let text: String = panel_lines(&m, &s, 32).iter().map(|l| l.to_string() + "\n").collect();
-        for want in ["box", "31%", "9.0/16G", "GPU0 RTX 4070", "42% 61°C", "3.1/12G", "judges the rest", "unavailable"] {
+        for want in ["box", "31%", "9.0/16G", "GPU0 RTX 4070", "42% 61°C", "3.1/12G", "qwen3:8b", "5.3G", "1 service failed: nginx", "judges the rest", "unavailable"] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }
     }

@@ -12,7 +12,7 @@ use crate::policy::Policy;
 pub enum Risk {
     /// Observes state only.
     Read,
-    /// Modifies files.
+    /// Changes the machine: files, services, loaded models.
     Write,
     /// Runs arbitrary programs.
     Execute,

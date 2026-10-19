@@ -1,5 +1,6 @@
 //! Live readings of the machine for status displays: CPU (from
-//! /proc/stat), memory, and GPUs. They bypass the policy and audit log, so
+//! /proc/stat), memory, GPUs, the models loaded on local inference servers
+//! and failed services. They bypass the policy and audit log, so
 //! interfaces can poll them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,6 +8,8 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use serde::Serialize;
+
+use crate::policy::Policy;
 
 #[derive(Default, Clone, Serialize)]
 pub struct Gpu {
@@ -28,6 +31,10 @@ pub struct Machine {
     pub gpus: Vec<Gpu>,
     /// Display/compute devices without nvidia-smi readings.
     pub other_gpus: Vec<String>,
+    /// Models loaded on local Ollama servers: (name, VRAM MiB).
+    pub loaded: Vec<(String, u64)>,
+    /// Failed system services; `None` when there is no systemd.
+    pub failed: Option<Vec<String>>,
 }
 
 /// CPU busy fraction between two /proc/stat samples.
@@ -55,6 +62,8 @@ fn read_machine(prev_cpu: &mut Option<(u64, u64)>, with_gpu: bool, last: &Machin
         mem_avail_kb: info["memory_kb"]["available"].as_u64(),
         gpus: last.gpus.clone(),
         other_gpus: last.other_gpus.clone(),
+        loaded: last.loaded.clone(),
+        failed: last.failed.clone(),
     };
     if with_gpu {
         let g = crate::tools::gpu_status();
@@ -84,13 +93,18 @@ fn read_machine(prev_cpu: &mut Option<(u64, u64)>, with_gpu: bool, last: &Machin
     m
 }
 
-/// Sample the machine every two seconds (GPUs every four) until `stop`.
-pub fn watch_machine(tx: Sender<Machine>, stop: &AtomicBool) {
+/// Sample the machine every two seconds (GPUs every four, models and
+/// services every eight) until `stop`.
+pub fn watch_machine(policy: &Policy, tx: Sender<Machine>, stop: &AtomicBool) {
     let mut prev = cpu_sample();
     let mut last = Machine::default();
     let mut tick = 0u64;
     while !stop.load(Ordering::Relaxed) {
         last = read_machine(&mut prev, tick.is_multiple_of(2), &last);
+        if tick.is_multiple_of(4) {
+            last.loaded = crate::tools::loaded_models(policy);
+            last.failed = crate::tools::failed_units();
+        }
         if tx.send(last.clone()).is_err() {
             return;
         }

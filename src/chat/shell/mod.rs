@@ -284,7 +284,7 @@ pub(super) fn run(orion: &Orion, session: Session, saver: Saver, port: Option<u1
     thread::scope(|scope| {
         scope.spawn(move || agent::run(orion, session, saver, agent_rx, agent_tx));
         scope.spawn(|| relay(&hub, from_agent));
-        scope.spawn(|| watch_machine(machine_tx, &stop));
+        scope.spawn(|| watch_machine(orion.policy(), machine_tx, &stop));
         scope.spawn(|| {
             for m in machine_rx {
                 let v = json!({ "type": "machine", "machine": m });

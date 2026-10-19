@@ -7,7 +7,8 @@ This repository holds the first pieces:
 - **The interface between the AI and the system.** A model never touches the machine directly. It talks to `orion`, which offers the machine as a small set of typed tools. A local policy decides what is allowed, and every call is written to an audit log.
 - **The front-end**, `orion chat`. You talk to an AI in your terminal, and it works on the machine through those same tools. Each message goes to Claude or to a model running on this machine's own hardware, whichever fits: private and simple work stays local, complex work goes to Claude. Anything risky stops and asks you first.
 - **The system service**, `orion daemon`: one policy, one audit log and one sandbox shared by every agent on the machine, on a Unix socket only you can reach.
-- **The sandbox.** Every program the AI starts runs confined: read-only outside its workspace, with your keys and secrets hidden, no network, no GPU, and limits on memory, CPU time and file size.
+- **A model of the machine**: services, packages, the network, the GPUs and the local models on them, so the AI can see what is running and manage it, within a VRAM budget for models.
+- **The sandbox.** Every program the AI starts with `proc_run` runs confined: read-only outside its workspace, with your keys and secrets hidden, no network, no GPU, and limits on memory, CPU time and file size.
 
 ```
    you ──▶ orion chat ──▶ Claude (API)  or  a local model (Ollama, llama.cpp, vLLM, …)
@@ -25,17 +26,30 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 
 ## Tools
 
-| Tool          | Risk    | Default | What it does |
-|---------------|---------|---------|--------------|
-| `system_info` | read    | allow   | Hostname, OS, kernel, CPU, memory, load, uptime |
-| `gpu_info`    | read    | allow   | GPUs by vendor; for NVIDIA, memory, utilization and temperature via `nvidia-smi` |
-| `fs_list`     | read    | allow   | Directory listing inside the readable roots |
-| `fs_read`     | read    | allow   | Read a file, or a byte range of one, inside the readable roots |
-| `fs_write`    | write   | ask     | Write or append to a file inside the writable roots |
-| `proc_list`   | read    | allow   | Processes, with filtering and sorting by memory |
-| `proc_run`    | execute | ask     | Run one program (no shell), with a timeout and an output cap |
+| Tool           | Risk    | Default | What it does |
+|----------------|---------|---------|--------------|
+| `system_info`  | read    | allow   | Hostname, OS, kernel, CPU, memory, load, uptime |
+| `gpu_info`     | read    | allow   | GPUs by vendor; for NVIDIA, memory, utilization, temperature and the processes using each card (`nvidia-smi`) |
+| `net_info`     | read    | allow   | Interfaces and addresses, default routes, DNS, and listening ports with the process behind each |
+| `fs_list`      | read    | allow   | Directory listing inside the readable roots |
+| `fs_read`      | read    | allow   | Read a file, or a byte range of one, inside the readable roots |
+| `fs_write`     | write   | ask     | Write or append to a file inside the writable roots |
+| `proc_list`    | read    | allow   | Processes, with filtering and sorting by memory |
+| `proc_run`     | execute | ask     | Run one program (no shell) in the [sandbox](#sandbox), with a timeout and an output cap |
+| `svc_list`     | read    | allow   | systemd units: running, failed or stopped, and enabled at boot |
+| `svc_status`   | read    | allow   | One unit's state, last result, memory, CPU, restarts and recent log |
+| `svc_control`  | write   | ask     | Start, stop, restart, reload, enable or disable a unit (critical ones are protected) |
+| `pkg_list`     | read    | allow   | Installed packages (apt, dnf or pacman) |
+| `pkg_search`   | read    | allow   | Search the repositories |
+| `pkg_info`     | read    | allow   | One package: installed and available versions, description, dependencies |
+| `pkg_install`  | execute | ask     | Install packages, as root and outside the sandbox |
+| `pkg_remove`   | execute | ask     | Remove packages, refused if the system or the policy needs them |
+| `model_status` | read    | allow   | Local inference servers, their models (available and loaded), and the VRAM budget |
+| `model_load`   | write   | ask     | Load a model on Ollama, within the VRAM budget (optionally unloading others) |
+| `model_unload` | write   | ask     | Unload a model, freeing its VRAM |
+| `model_pull`   | write   | ask     | Download a model onto Ollama |
 
-Out of the box the AI can look at the machine freely. Changing it (writing files, running programs) needs your approval each time. With no human present (`orion serve`), "ask" means no.
+Out of the box the AI can look at the machine freely. Changing it (writing files, running programs, managing services, packages and models) needs your approval each time. With no human present (`orion serve`), "ask" means no.
 
 ## Build
 
@@ -334,6 +348,43 @@ Or in a client's JSON config:
 { "mcpServers": { "orion": { "command": "/path/to/orion", "args": ["serve"] } } }
 ```
 
+## The machine
+
+Beyond files and processes, the AI sees and manages the parts of the machine an AI-first system cares about.
+
+### Services
+
+`svc_list`, `svc_status` and `svc_control` work on systemd units: the machine's (`scope: "system"`, the default) or your own (`"user"`).
+
+- **`svc_status` explains failures:** state, the last result (`exit-code`, `oom-kill`, …), restarts, memory, CPU time and the last log lines. When `svc_control` fails, the log comes with the error.
+- **Protected units can't be touched,** whatever you approve: ssh, networking, the display manager, `systemd-*`, D-Bus, polkit, logins, every `.target` (so no `reboot.target`) and Orion itself. Edit `[services] protected` to change the list. Only services, sockets, timers and paths can be controlled at all.
+- **`[services] allowed`** lists units the AI may control without asking (wildcards work), like `["ollama.service", "llama-server.service"]`.
+- **Root:** as a normal user, system units are tried directly first, which polkit may allow. If polkit refuses, Orion retries with `sudo -n`; see `[admin] elevate`.
+
+### Packages
+
+`pkg_list`, `pkg_search`, `pkg_info`, `pkg_install` and `pkg_remove` drive apt, dnf or pacman (detected automatically, or set `[packages] manager`).
+
+- **Nothing runs on a bad request.** Names that could be read as options are refused. On apt, the change is simulated before you are asked, so unknown packages fail first, and the result lists every package that changed, dependencies included.
+- **Removal is guarded.** A removal is refused, before you are asked, if it would take away a package the system marks essential or required, or one in `[packages] protected` (the kernel, systemd, sudo, ssh, libc, the package manager, bubblewrap, …). That holds even when the package would only go as a dependent of what you named.
+- **`[packages] allowed`** pre-approves installs by name (wildcards work), e.g. `["python3-*"]`.
+- **Installs run as root and outside the sandbox,** because package scripts need that. That is why both tools are `execute`. As a normal user Orion uses `sudo -n`, which needs a `NOPASSWD` rule for the package manager, or set `[admin] elevate = "pkexec"` for a graphical password prompt.
+
+### Network
+
+`net_info` reports each interface (kind, state, MAC, addresses, traffic), the default IPv4 and IPv6 routes, the DNS servers (including systemd-resolved's real upstream servers), and every listening TCP and UDP port with the process behind it. As a normal user, owners show only for your own processes.
+
+### Local models and VRAM
+
+`model_status` finds the inference servers on this machine: `chat.local.base_url`, anything in `[models] servers`, and whatever answers on the usual ports (Ollama 11434, llama.cpp 8080, vLLM 8000, LM Studio 1234). For each it shows the kind, the process serving it, the models it offers (with their size and estimated VRAM need), and on Ollama what is loaded, how much of it is on the GPU, and when it expires. Next to that is the GPU ledger: each card's memory, the processes using it, and what is free for models.
+
+- **The VRAM budget** is each GPU's memory less `[models] vram_reserve_mb` (1 GiB by default, for the desktop and other programs), less what is already in use. `model_load` checks a model fits before you are asked: about 1.15 × its size plus 512 MiB, for the KV cache and buffers.
+- **If it doesn't fit,** the load is refused with what is in the way. With `evict: true` Orion first unloads the models due to expire soonest (the least recently used), only as many as needed.
+- **`keep_alive`** sets how long a model stays loaded after its last use (`[models] keep_alive`, default `30m`; `-1` keeps it loaded).
+- **Loading and pulling work on Ollama.** llama.cpp, vLLM and LM Studio serve one fixed model each; manage those as services with `svc_control`.
+- The machine panel in the full-screen chat and the shell lists the loaded models with their VRAM, and any failed services.
+- Without NVIDIA readings (no `nvidia-smi`), loads aren't budgeted and `model_status` says so.
+
 ## System service
 
 `orion daemon` runs Orion as a long-lived service, so every agent on the machine shares one policy, one audit log and one sandbox:
@@ -371,7 +422,7 @@ The service reads `ANTHROPIC_API_KEY` and other variables from `~/.config/orion/
 
 ## Sandbox
 
-Every program the AI starts with `proc_run` runs in a sandbox, whatever the policy allows it to run. `orion tools` and `orion status` show which one, and the model is told, so it reports a refusal instead of trying to get around it.
+Every program the AI starts with `proc_run` runs in a sandbox, whatever the policy allows it to run. `orion tools` and `orion status` show which one, and the model is told, so it reports a refusal instead of trying to get around it. (The machine tools' own fixed commands, such as `systemctl` and the package manager, run outside it. Those tools take checked arguments, not programs, and have their own rules and protected lists.)
 
 | | bubblewrap | Landlock | limits only |
 |---|---|---|---|
@@ -399,6 +450,7 @@ Copy [`orion.example.toml`](orion.example.toml) to `~/.config/orion/orion.toml`,
 - `[proc]` sets `allowed_commands`: pre-approved programs, matched exactly. When `proc_run` is `ask`, these run without a prompt and anything else asks. When it is `allow`, only these run at all. `[proc]` also sets a timeout and an output cap. Once a program exits or times out, its whole process group is killed, so background children cannot linger.
 - `[audit]` controls the append-only JSONL log at `~/.local/state/orion/audit.jsonl`. It records each decision and, for `ask`, your answer. Long string arguments are truncated in the log.
 - `[chat]` holds the front-end settings above.
+- `[services]`, `[packages]`, `[models]` and `[admin]` configure [the machine](#the-machine) tools.
 - `[sandbox]` and `[daemon]` configure the [sandbox](#sandbox) and the [system service](#system-service).
 
 Unknown keys are an error, so a misspelled setting fails loudly instead of being ignored.
@@ -414,7 +466,9 @@ src/
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
   daemon.rs     the system service: socket, peer checks, live reload, the stdio bridge
   sandbox.rs    sandboxing for proc_run: bubblewrap, Landlock, resource limits
-  tools/        built-in tools: system, fs, process
+  tools/        built-in tools: system (and GPUs), fs, process, network, services
+                (systemd), packages, models (inference servers, VRAM budget);
+                exec.rs runs programs for them
   chat/
     mod.rs      config, the Backend and Ui traits
     session.rs  one conversation across both models: routing, catch-up, fallback, tool loop
@@ -446,5 +500,5 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
-4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
+4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. Next: GPU placement (which card a model goes on), network changes (Wi-Fi, firewall), disks and mounts, and updates.
 5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~ and ~~a graphical shell~~ are done too. Still to come: wake-word listening.

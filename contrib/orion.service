@@ -17,8 +17,10 @@ MemoryMax=8G
 TasksMax=1024
 CPUWeight=50
 
-# Hardening for the daemon itself. (If your bwrap is installed setuid, as on
-# some older distributions, remove NoNewPrivileges.)
+# Hardening for the daemon itself. NoNewPrivileges also stops sudo and pkexec,
+# so with it pkg_install and system services work only through polkit rules.
+# Remove it if you want Orion to use `sudo -n` ([admin] elevate), or if your
+# bwrap is installed setuid, as on some older distributions.
 NoNewPrivileges=yes
 LockPersonality=yes
 RestrictRealtime=yes

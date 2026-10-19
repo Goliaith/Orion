@@ -107,9 +107,14 @@ impl Http {
     }
 
     pub fn get_json(&self, path: &str) -> Result<Value> {
+        self.get_json_within(path, Duration::from_secs(600))
+    }
+
+    /// GET with a JSON reply, giving up after `timeout`.
+    pub fn get_json_within(&self, path: &str, timeout: Duration) -> Result<Value> {
         let (http, path) = (self.clone(), path.to_string());
         interrupt::wait(move || {
-            let resp = http.request("GET", &path, &[]).call().map_err(|e| http.describe(e))?;
+            let resp = http.request("GET", &path, &[]).timeout(timeout).call().map_err(|e| http.describe(e))?;
             let text = resp.into_string().context("reading the response")?;
             serde_json::from_str(&text).context("malformed JSON response")
         })

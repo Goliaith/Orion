@@ -1,9 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::process::ExitStatusExt;
-use std::process::Stdio;
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -197,94 +193,31 @@ impl Tool for ProcRun {
             }
             None => None,
         };
-        let (mut cmd, sandbox, guard) = crate::sandbox::command(policy, &a.command, &a.args, cwd.as_deref())?;
-        cmd.stdin(if a.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let (cmd, sandbox, guard) = crate::sandbox::command(policy, &a.command, &a.args, cwd.as_deref())?;
         let timeout = Duration::from_secs(
             a.timeout_secs.unwrap_or(policy.proc.timeout_secs).clamp(1, policy.proc.timeout_secs.max(1)),
         );
-
-        let mut child = cmd.spawn().with_context(|| format!("failed to start {:?}", a.command))?;
+        let done = super::exec::run(cmd, a.stdin, timeout, policy.proc.max_output_bytes)?;
         drop(guard);
-        let pgid = child.id() as libc::pid_t;
-        if let (Some(input), Some(mut pipe)) = (a.stdin, child.stdin.take()) {
-            thread::spawn(move || {
-                let _ = pipe.write_all(input.as_bytes());
-            });
-        }
-        let cap = policy.proc.max_output_bytes;
-        let stdout = capture(child.stdout.take(), cap);
-        let stderr = capture(child.stderr.take(), cap);
-
-        let started = Instant::now();
-        let mut timed_out = false;
-        let mut interrupted = false;
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            if started.elapsed() >= timeout || crate::interrupt::requested() {
-                timed_out = !crate::interrupt::requested();
-                interrupted = !timed_out;
-                kill_group(pgid);
-                break child.wait()?;
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        // Kill leftover background children too: they would keep the output
-        // pipes open and block the readers forever.
-        kill_group(pgid);
-        if interrupted {
-            let _ = (stdout.join(), stderr.join());
-            return Err(crate::interrupt::Interrupted.into());
-        }
-
-        let (stdout, stdout_truncated) = stdout.join().unwrap_or_default();
-        let (stderr, stderr_truncated) = stderr.join().unwrap_or_default();
         Ok(json!({
-            "exit_code": status.code(),
-            "signal": status.signal(),
-            "timed_out": timed_out,
-            "duration_ms": started.elapsed().as_millis(),
-            "stdout": stdout,
-            "stderr": stderr,
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
+            "exit_code": done.status.code(),
+            "signal": done.signal(),
+            "timed_out": done.timed_out,
+            "duration_ms": done.duration.as_millis(),
+            "stdout": done.stdout,
+            "stderr": done.stderr,
+            "stdout_truncated": done.stdout_truncated,
+            "stderr_truncated": done.stderr_truncated,
             "sandbox": sandbox.name(),
         }))
     }
 }
 
-fn kill_group(pgid: libc::pid_t) {
-    // SAFETY: kill(2) has no memory-safety preconditions; ESRCH is expected
-    // when the group is already gone.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
-    }
-}
-
-/// Read a stream to EOF, keeping the first `cap` bytes.
-fn capture(stream: Option<impl Read + Send + 'static>, cap: usize) -> JoinHandle<(String, bool)> {
-    thread::spawn(move || {
-        let Some(mut stream) = stream else { return (String::new(), false) };
-        let mut kept = Vec::new();
-        let mut truncated = false;
-        let mut chunk = [0u8; 8192];
-        while let Ok(n) = stream.read(&mut chunk) {
-            if n == 0 {
-                break;
-            }
-            let room = cap.saturating_sub(kept.len());
-            kept.extend_from_slice(&chunk[..n.min(room)]);
-            truncated |= n > room;
-        }
-        (String::from_utf8_lossy(&kept).into_owned(), truncated)
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Instant;
+
     use super::*;
 
     fn policy(commands: &str) -> Policy {

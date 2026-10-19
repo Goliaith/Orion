@@ -147,6 +147,7 @@ textarea::placeholder { color: var(--faint); }
 .spark polygon { fill: var(--accent-soft); }
 .kv { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; margin: 5px 0; }
 .kv span:first-child { color: var(--muted); } .kv span:last-child { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kv.failed span { color: var(--bad) !important; } .kv .dot { color: var(--ok); font-weight: normal; }
 .prov { display: flex; gap: 8px; align-items: baseline; font-size: 13px; margin: 6px 0; }
 .prov b { font-weight: 650; min-width: 52px; } .prov b.claude { color: var(--claude); } .prov b.local { color: var(--local); }
 .prov span { color: var(--muted); overflow-wrap: anywhere; } .prov span.bad { color: var(--bad); }
@@ -410,6 +411,8 @@ function machine(m) {
   }
   for (const v of m.other_gpus || []) html += `<div class="kv"><span>GPU</span><span>${esc(v)}</span></div>`;
   if (!html) html = `<div class="kv"><span>GPU</span><span>none found</span></div>`;
+  for (const [name, vram] of m.loaded || []) html += `<div class="kv"><span><b class="dot">●</b> ${esc(name)}</span><span>${(vram / 1024).toFixed(1)} GB</span></div>`;
+  if (m.failed && m.failed.length) html += `<div class="kv failed"><span>Failed</span><span>${esc(m.failed.map(u => u.replace(/\.service$/, "")).join(", "))}</span></div>`;
   $("gpus").innerHTML = html;
 }
 

@@ -96,7 +96,8 @@ impl Tool for GpuInfo {
 
     fn description(&self) -> &'static str {
         "List GPUs. Every display/compute device comes with its vendor. For NVIDIA cards, \
-         nvidia-smi also reports memory, utilization, temperature and the driver version."
+         nvidia-smi also reports memory, utilization, temperature, the driver version and \
+         which processes use the card's memory."
     }
 
     fn risk(&self) -> Risk {
@@ -115,7 +116,18 @@ impl Tool for GpuInfo {
 
 /// What `gpu_info` reports.
 pub fn gpus() -> Value {
-    json!({ "devices": drm_devices(), "nvidia": nvidia_smi() })
+    let mut nvidia = nvidia_smi();
+    let procs = gpu_processes();
+    if let Some(cards) = nvidia.as_array_mut() {
+        for card in cards {
+            card["processes"] = procs
+                .iter()
+                .filter(|p| card["uuid"] == p.3.as_str())
+                .map(|(pid, name, mib, _)| json!({ "pid": pid, "name": name, "memory_mib": mib }))
+                .collect();
+        }
+    }
+    json!({ "devices": drm_devices(), "nvidia": nvidia })
 }
 
 /// Cards under /sys/class/drm, identified by PCI vendor.
@@ -143,8 +155,8 @@ fn drm_devices() -> Vec<Value> {
 
 /// `null` when nvidia-smi is absent or fails.
 fn nvidia_smi() -> Value {
-    const FIELDS: [&str; 7] =
-        ["index", "name", "memory.total", "memory.used", "utilization.gpu", "temperature.gpu", "driver_version"];
+    const FIELDS: [&str; 8] =
+        ["index", "name", "memory.total", "memory.used", "utilization.gpu", "temperature.gpu", "driver_version", "uuid"];
     let out = Command::new("nvidia-smi")
         .arg(format!("--query-gpu={}", FIELDS.join(",")))
         .arg("--format=csv,noheader,nounits")
@@ -165,7 +177,24 @@ fn nvidia_smi() -> Value {
                 "utilization_pct": num(get(4)),
                 "temperature_c": num(get(5)),
                 "driver_version": get(6),
+                "uuid": get(7),
             })
+        })
+        .collect()
+}
+
+/// Processes using NVIDIA GPU memory: (pid, name, MiB, GPU uuid).
+pub fn gpu_processes() -> Vec<(u32, String, u64, String)> {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-compute-apps=pid,process_name,used_memory,gpu_uuid", "--format=csv,noheader,nounits"])
+        .output();
+    let Some(out) = out.ok().filter(|o| o.status.success()) else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split(',').map(str::trim).collect();
+            let name = f.get(1)?.rsplit('/').next().unwrap_or_default().to_string();
+            Some((f.first()?.parse().ok()?, name, f.get(2)?.parse().unwrap_or(0), f.get(3)?.to_string()))
         })
         .collect()
 }

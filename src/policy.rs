@@ -81,6 +81,95 @@ impl Default for ProcPolicy {
     }
 }
 
+/// `[admin]`: how Orion gets root for system services and packages.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminPolicy {
+    /// `auto`: nothing when Orion runs as root; otherwise system services
+    /// are tried directly (polkit may allow them) and then with `sudo -n`,
+    /// and packages use `sudo -n`. Or `sudo`, `pkexec`, or `none`.
+    pub elevate: String,
+}
+
+impl Default for AdminPolicy {
+    fn default() -> Self {
+        Self { elevate: "auto".into() }
+    }
+}
+
+/// `[services]`: systemd units.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServicesPolicy {
+    /// Units `svc_control` may start, stop and restart without asking (`*`
+    /// wildcards). When `svc_control` is `allow`, only these.
+    pub allowed: Vec<String>,
+    /// Units no approval can touch: what keeps the machine reachable and
+    /// Orion itself running.
+    pub protected: Vec<String>,
+}
+
+impl Default for ServicesPolicy {
+    fn default() -> Self {
+        let protected = [
+            "orion.*", "ssh.service", "sshd.service", "systemd-*", "dbus*", "polkit.service",
+            "NetworkManager.service", "systemd-networkd.service", "display-manager.service", "gdm*.service",
+            "sddm.service", "lightdm.service", "getty@*", "user@*", "user-runtime-dir@*", "*.target",
+        ];
+        Self { allowed: Vec::new(), protected: protected.map(String::from).to_vec() }
+    }
+}
+
+/// `[packages]`: the system package manager.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PackagesPolicy {
+    /// `auto`, `apt`, `dnf` or `pacman`.
+    pub manager: String,
+    /// Packages `pkg_install` may install without asking (`*` wildcards).
+    pub allowed: Vec<String>,
+    /// Packages no approval can remove. Packages the manager marks
+    /// essential are protected as well.
+    pub protected: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+impl Default for PackagesPolicy {
+    fn default() -> Self {
+        let protected = [
+            "sudo", "systemd", "systemd-*", "openssh-server", "openssh", "linux", "linux-image-*", "kernel",
+            "kernel-core", "bubblewrap", "apt", "dnf", "pacman", "dpkg", "rpm", "glibc", "libc6", "bash",
+        ];
+        Self {
+            manager: "auto".into(),
+            allowed: Vec::new(),
+            protected: protected.map(String::from).to_vec(),
+            timeout_secs: 900,
+        }
+    }
+}
+
+/// `[models]`: local inference servers and the VRAM they share.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelsPolicy {
+    /// Inference servers to manage besides `chat.local.base_url` and the
+    /// usual local ports (Ollama, llama.cpp, vLLM, LM Studio).
+    pub servers: Vec<String>,
+    /// Look for servers on the usual local ports.
+    pub discover: bool,
+    /// VRAM kept free on each GPU for the desktop and other programs, in MiB.
+    pub vram_reserve_mb: u64,
+    /// How long a model stays loaded after its last use, by default.
+    pub keep_alive: String,
+}
+
+impl Default for ModelsPolicy {
+    fn default() -> Self {
+        Self { servers: Vec::new(), discover: true, vram_reserve_mb: 1024, keep_alive: "30m".into() }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuditPolicy {
@@ -108,6 +197,10 @@ pub struct Policy {
     pub tools: BTreeMap<String, Decision>,
     pub fs: FsPolicy,
     pub proc: ProcPolicy,
+    pub admin: AdminPolicy,
+    pub services: ServicesPolicy,
+    pub packages: PackagesPolicy,
+    pub models: ModelsPolicy,
     pub audit: AuditPolicy,
     /// Settings for the `orion chat` front-end.
     pub chat: crate::chat::ChatConfig,
