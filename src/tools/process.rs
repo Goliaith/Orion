@@ -215,12 +215,14 @@ impl Tool for ProcRun {
 
         let started = Instant::now();
         let mut timed_out = false;
+        let mut interrupted = false;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
-            if started.elapsed() >= timeout {
-                timed_out = true;
+            if started.elapsed() >= timeout || crate::interrupt::requested() {
+                timed_out = !crate::interrupt::requested();
+                interrupted = !timed_out;
                 kill_group(pgid);
                 break child.wait()?;
             }
@@ -229,6 +231,10 @@ impl Tool for ProcRun {
         // Kill leftover background children too: they would keep the output
         // pipes open and block the readers forever.
         kill_group(pgid);
+        if interrupted {
+            let _ = (stdout.join(), stderr.join());
+            return Err(crate::interrupt::Interrupted.into());
+        }
 
         let (stdout, stdout_truncated) = stdout.join().unwrap_or_default();
         let (stderr, stderr_truncated) = stderr.join().unwrap_or_default();
@@ -308,6 +314,20 @@ mod tests {
         let r = ProcRun.call(&p, json!({ "command": "sh", "args": ["-c", "sleep 30 & echo ok"] })).unwrap();
         assert_eq!(r["stdout"], "ok\n");
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn ctrl_c_stops_the_program() {
+        let flag = crate::interrupt::test_flag::install();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let p = policy(r#"["*"]"#);
+        let err = ProcRun.call(&p, json!({ "command": "sleep", "args": ["30"] })).unwrap_err();
+        assert!(crate::interrupt::is_interrupt(&err));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

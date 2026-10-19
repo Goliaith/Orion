@@ -9,6 +9,7 @@
 
 pub mod audit;
 pub mod chat;
+pub mod interrupt;
 pub mod mcp;
 pub mod policy;
 pub mod tool;

@@ -224,6 +224,8 @@ impl Router {
                 let secs = start.elapsed().as_secs_f64();
                 (v.provider, format!("{}: {} ({secs:.1}s)", c.name(), v.reason))
             }
+            // Ctrl-C while classifying is not the classifier's fault.
+            Err(e) if crate::interrupt::is_interrupt(&e) => self.rules(text),
             Err(e) => {
                 let failures = self.classifier_failures.get() + 1;
                 self.classifier_failures.set(failures);

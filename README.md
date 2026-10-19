@@ -53,9 +53,11 @@ orion chat
 
 ```
 Orion
-claude-opus-5-5 · effort high · 7 tools (5 automatic, 2 ask first) · /help for commands
+  claude  claude-opus-5-5 · effort high
+  local   qwen3:8b · local at http://127.0.0.1:11434/v1
+routing: auto (private → local; qwen3:8b judges the rest) · 7 tools (5 automatic, 2 ask first) · /help · Shift-Tab switches routing
 
-orion › what's eating my memory? write a short report
+orion auto › what's eating my memory? write a short report
 
 I'll check the hardware and the biggest processes.
   ⚙ system_info
@@ -73,29 +75,49 @@ Firefox is using 3.1 GB of your 16 GB. I wrote the details to ~/orion-workspace/
 - **Streaming.** Replies stream as they are written. The model's progress notes and reasoning show dimmed, so long tasks don't sit silent.
 - **Every tool call is visible**, with its arguments and whether it worked.
 - **Approval prompts** show the full arguments of anything that changes the machine. `a` approves that tool for the rest of the session.
-- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/clear`, `/exit`, plus `@claude` / `@local` prefixes. Line history is kept in `~/.local/state/orion/chat_history`.
+- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/keys`, `/clear`, `/exit`, plus `@claude` / `@local` prefixes and the [hotkeys](#hotkeys). Line history is kept in `~/.local/state/orion/chat_history`.
 - Settings live under `[chat]` in the policy file: the mode (`provider = "auto"`, `"claude"` or `"local"`) and the sections `[chat.claude]` (model, default `claude-opus-5-5`; effort; progress notes; fallbacks), `[chat.local]` and `[chat.router]`.
 
 `ANTHROPIC_AUTH_TOKEN` (an OAuth access token) also works in place of an API key.
+
+### Hotkeys
+
+| Key | What it does |
+|---|---|
+| **Ctrl-C** | Stops the AI mid-turn: a streaming reply, a long think, a running program or an approval prompt. Any partial reply is kept and marked as interrupted, so the model knows where it stopped. At the prompt, press it twice to quit. |
+| **Shift-Tab** | Cycles routing between auto, claude and local, keeping what you've typed. Models that can't be reached are skipped. |
+| **Ctrl-O** | Shows or hides reasoning and progress notes (default: `show_reasoning` under `[chat]`). |
+| **Alt-Enter** | Starts a new line, for multi-line messages. Pasting multi-line text also works. |
+| **Ctrl-R**, **↑ ↓** | Search and browse your earlier messages. |
+| **Ctrl-L** / **Ctrl-D** | Clear the screen / quit. |
+
+The prompt shows the current routing (`orion auto ›`), and `/keys` lists the hotkeys. What Ctrl-C does underneath:
+
+- **Network calls run on a worker thread.** The chat walks away from them, and the connection is dropped, which stops generation on the server rather than letting it run on in the background.
+- **Programs started by the AI are killed** along with their whole process group.
+- **An open approval prompt counts as "no".**
+- **Every tool call the model already made still gets an answer** ("interrupted by the user"), so the conversation stays valid for the next message.
+- **An interrupt is never treated as a failure,** so it doesn't trigger a fallback to the other model.
+- **A second Ctrl-C** before the first is handled quits Orion outright, as an escape hatch if something hangs.
 
 ### Automatic routing
 
 With both Claude and a local model available, `orion chat` (mode `auto`, the default) picks a model for every message and says which one it chose and why:
 
 ```
-orion › how full is my disk?
+orion auto › how full is my disk?
 → the local model (qwen3:8b) · short request
   ⚙ proc_run {"args":["-h","/"],"command":"df"}
 Your root disk is 28% full.
 
-orion › plan a cleanup of my home directory
+orion auto › plan a cleanup of my home directory
 → Claude (claude-opus-5-5) · complex: "plan"
 Plan: 1) clear ~/.cache (2.1 GB), 2) empty Trash, 3) prune old Downloads. Start with the cache?
 
-orion › yes
+orion auto › yes
 → Claude (claude-opus-5-5) · follow-up
 
-orion › my bank password is hunter2, remember it
+orion auto › my bank password is hunter2, remember it
 → the local model (qwen3:8b) · private: mentions "password"
 ```
 
@@ -201,7 +223,8 @@ src/
     claude.rs   Claude backend: streaming Messages API client (SSE)
     local.rs    local backend: OpenAI-compatible chat completions (Ollama, llama.cpp, vLLM, LM Studio)
     http.rs     shared HTTP: retries, proxy rules, error bodies, SSE lines
-    terminal.rs the interactive terminal UI
+    terminal.rs the interactive terminal UI and hotkeys
+  interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
 tests/stdio.rs  end-to-end MCP session against the real binary
 ```
 
@@ -213,4 +236,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. **System daemon.** Run `oriond` as a systemd service on a Unix socket, with `orion serve` as a thin stdio bridge, so many agents share one policy and one log.
 3. **Isolation.** Run `proc_run` inside namespaces, cgroups and seccomp (or Landlock), with CPU, memory and GPU limits per call.
 4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. Still to come: hotkeys such as Ctrl-C to interrupt a reply, saving and resuming conversations, a full-screen TUI, voice, and a graphical shell.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O) are done too. Still to come: saving and resuming conversations, a full-screen TUI, voice, and a graphical shell.

@@ -44,6 +44,7 @@ enabled = true
 provider = "auto"               # auto: route each message; or always "claude" / "local"
                                 # (`orion chat --claude/--local/--auto` overrides)
 max_tool_rounds = 50            # model calls per message before stopping
+show_reasoning = true           # reasoning and progress notes (Ctrl-O toggles)
 
 # Claude. Needs ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN).
 [chat.claude]

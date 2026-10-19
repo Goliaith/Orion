@@ -1,17 +1,31 @@
-//! The interactive terminal: line editing, streamed output, tool activity
-//! and approval prompts.
+//! The interactive terminal: line editing, hotkeys, streamed output, tool
+//! activity and approval prompts.
 
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::{
+    Cmd, ConditionalEventHandler, DefaultEditor, Event, EventContext, EventHandler, KeyCode, KeyEvent, Modifiers,
+    RepeatCount,
+};
 use serde_json::Value;
 
 use super::{router, Mode, Provider, Session, Ui};
-use crate::{Approver, Decision, Orion, Tool};
+use crate::{interrupt, Approver, Decision, Orion, Tool};
+
+const HOTKEYS: &[(&str, &str)] = &[
+    ("Ctrl-C", "stop the AI mid-turn (twice at the prompt: quit)"),
+    ("Shift-Tab", "cycle routing: auto → claude → local"),
+    ("Ctrl-O", "show or hide reasoning and progress notes"),
+    ("Alt-Enter", "new line in your message"),
+    ("Ctrl-R / ↑ ↓", "search / browse your earlier messages"),
+    ("Ctrl-L", "clear the screen"),
+    ("Ctrl-D", "quit"),
+];
 
 struct Style {
     on: bool,
@@ -57,12 +71,23 @@ pub struct Terminal {
     /// When the last prompt was answered, so tool timings leave out the
     /// time the user took to decide.
     answered_at: Option<Instant>,
+    /// Ctrl-O toggles this.
+    show_reasoning: bool,
+    /// Whether the "reasoning hidden" hint was shown this turn.
+    hinted: bool,
 }
 
 impl Terminal {
     pub fn new() -> Self {
         let on = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        Self { style: Style { on }, last: Last::Line, always: HashSet::new(), answered_at: None }
+        Self {
+            style: Style { on },
+            last: Last::Line,
+            always: HashSet::new(),
+            answered_at: None,
+            show_reasoning: true,
+            hinted: false,
+        }
     }
 
     fn line_break(&mut self) {
@@ -85,12 +110,13 @@ impl Terminal {
         loop {
             print!("  {} ", s.yellow("[y]es / [n]o / [a]lways for this session ›"));
             let _ = io::stdout().flush();
-            let mut answer = String::new();
-            let read = io::stdin().read_line(&mut answer).unwrap_or(0);
+            // Ctrl-C (or EOF) here means no.
+            let answer = interrupt::read_answer();
             self.answered_at = Some(Instant::now());
-            if read == 0 {
+            let Some(answer) = answer else {
+                println!();
                 return false;
-            }
+            };
             match answer.trim().to_ascii_lowercase().as_str() {
                 "y" | "yes" => return true,
                 "n" | "no" | "" => return false,
@@ -121,6 +147,14 @@ impl Ui for Terminal {
     }
 
     fn thinking(&mut self, text: &str) {
+        if !self.show_reasoning {
+            if !self.hinted {
+                self.hinted = true;
+                self.line_break();
+                println!("{}", self.style.dim("  … reasoning hidden (Ctrl-O shows it)"));
+            }
+            return;
+        }
         if self.last == Last::Text {
             println!();
         }
@@ -168,8 +202,7 @@ impl Ui for Terminal {
         self.line_break();
         print!("  {} {} ", self.style.yellow("?"), self.style.yellow(&format!("{question} [y/N] ›")));
         let _ = io::stdout().flush();
-        let mut answer = String::new();
-        let _ = io::stdin().read_line(&mut answer);
+        let answer = interrupt::read_answer().unwrap_or_default();
         matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     }
 }
@@ -190,42 +223,127 @@ impl Approver for PromptApprover {
     }
 }
 
+/// What a hotkey asked for, with the line being edited so it can be put back.
+struct Pending {
+    action: Hotkey,
+    line: String,
+    pos: usize,
+}
+
+#[derive(Clone, Copy)]
+enum Hotkey {
+    CycleMode,
+    ToggleReasoning,
+}
+
+/// Rustyline handler for one hotkey: note the request and the line, and end
+/// this `readline` so the loop can act and restore the line.
+struct HotkeyHandler {
+    action: Hotkey,
+    pending: Arc<Mutex<Option<Pending>>>,
+}
+
+impl ConditionalEventHandler for HotkeyHandler {
+    fn handle(&self, _evt: &Event, _n: RepeatCount, _positive: bool, ctx: &EventContext) -> Option<Cmd> {
+        let p = Pending { action: self.action, line: ctx.line().to_string(), pos: ctx.pos() };
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+        Some(Cmd::Interrupt)
+    }
+}
+
+fn bind_hotkeys(editor: &mut DefaultEditor) -> Arc<Mutex<Option<Pending>>> {
+    let pending = Arc::new(Mutex::new(None));
+    let handler = |action| {
+        EventHandler::Conditional(Box::new(HotkeyHandler { action, pending: pending.clone() }))
+    };
+    editor.bind_sequence(KeyEvent(KeyCode::BackTab, Modifiers::NONE), handler(Hotkey::CycleMode));
+    editor.bind_sequence(KeyEvent::ctrl('O'), handler(Hotkey::ToggleReasoning));
+    editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::ALT), EventHandler::Simple(Cmd::Newline));
+    pending
+}
+
+fn next_mode(mode: Mode) -> Mode {
+    match mode {
+        Mode::Auto => Mode::Claude,
+        Mode::Claude => Mode::Local,
+        Mode::Local => Mode::Auto,
+    }
+}
+
+fn prompt(style: &Style, mode: Mode) -> String {
+    let mode = match mode {
+        Mode::Auto => "auto",
+        Mode::Claude => "claude",
+        Mode::Local => "local",
+    };
+    if style.on {
+        format!("\x1b[1;35morion\x1b[0m \x1b[2m{mode}\x1b[0m \x1b[1;35m›\x1b[0m ")
+    } else {
+        format!("orion {mode} › ")
+    }
+}
+
 /// Run the interactive chat until the user leaves. `mode` and `model`
 /// override the `[chat]` settings.
 pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>) -> Result<()> {
     let mut session = Session::start(orion, mode.unwrap_or(orion.policy().chat.mode), model)?;
     let mut term = Terminal::new();
+    term.show_reasoning = orion.policy().chat.show_reasoning;
     let mut editor = DefaultEditor::new()?;
+    let pending = bind_hotkeys(&mut editor);
     let history = orion.policy().audit_path().and_then(|p| Some(p.parent()?.join("chat_history")));
     if let Some(h) = &history {
         let _ = editor.load_history(h);
     }
+    // From here on Ctrl-C stops the AI instead of killing Orion.
+    interrupt::install();
 
     banner(&term.style, orion, &session);
-    let prompt = if term.style.on { "\x1b[1;35morion ›\x1b[0m ".to_string() } else { "orion › ".to_string() };
+    let mut restore: Option<(String, usize)> = None;
+    let mut last_ctrl_c: Option<Instant> = None;
     loop {
-        let line = match editor.readline(&prompt) {
+        let prompt = prompt(&term.style, session.mode);
+        let line = match restore.take() {
+            Some((line, pos)) => editor.readline_with_initial(&prompt, (&line[..pos], &line[pos..])),
+            None => editor.readline(&prompt),
+        };
+        let line = match line {
             Ok(line) => line,
-            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Interrupted) => {
+                if let Some(p) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    hotkey(p.action, &mut session, &mut term);
+                    restore = Some((p.line, p.pos));
+                    continue;
+                }
+                if last_ctrl_c.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                    break;
+                }
+                last_ctrl_c = Some(Instant::now());
+                println!("{}", term.style.dim("  (Ctrl-C again to quit, or Ctrl-D)"));
+                continue;
+            }
             Err(ReadlineError::Eof) => break,
             Err(e) => return Err(e.into()),
         };
+        last_ctrl_c = None;
         let input = line.trim();
         if input.is_empty() {
             continue;
         }
         let _ = editor.add_history_entry(input);
         if let Some(cmd) = input.strip_prefix('/') {
-            if !command(cmd, orion, &mut session, &term.style) {
+            if !command(cmd, orion, &mut session, &mut term) {
                 break;
             }
             continue;
         }
         println!();
+        term.hinted = false;
         if let Err(e) = session.turn(input, &mut term) {
             term.line_break();
             println!("{}", term.style.red(&format!("error: {e:#}")));
         }
+        interrupt::clear();
         term.line_break();
         println!();
     }
@@ -236,6 +354,35 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>) -> Result<()>
         let _ = editor.save_history(h);
     }
     Ok(())
+}
+
+fn hotkey(action: Hotkey, session: &mut Session, term: &mut Terminal) {
+    let s = &term.style;
+    match action {
+        Hotkey::CycleMode => {
+            // Skip modes whose model can't be reached.
+            let mut mode = next_mode(session.mode);
+            let mut errors = Vec::new();
+            for _ in 0..3 {
+                match session.set_mode(mode) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        errors.push(format!("{mode:?}: {}", format!("{e:#}").lines().next().unwrap_or_default()));
+                        mode = next_mode(mode);
+                    }
+                }
+            }
+            for e in errors {
+                println!("  {}", s.red(&format!("skipped {}", e.to_lowercase())));
+            }
+            println!("  {}", s.dim(&routing(session)));
+        }
+        Hotkey::ToggleReasoning => {
+            term.show_reasoning = !term.show_reasoning;
+            let state = if term.show_reasoning { "shown" } else { "hidden" };
+            println!("  {}", s.dim(&format!("reasoning {state}")));
+        }
+    }
 }
 
 fn routing(session: &Session) -> String {
@@ -269,7 +416,7 @@ fn banner(s: &Style, orion: &Orion, session: &Session) {
     println!(
         "{}",
         s.dim(&format!(
-            "{routing} · {} tools ({} automatic, {} ask first) · /help for commands",
+            "{routing} · {} tools ({} automatic, {} ask first) · /help · Shift-Tab switches routing",
             count(Decision::Allow) + count(Decision::Ask),
             count(Decision::Allow),
             count(Decision::Ask),
@@ -279,7 +426,8 @@ fn banner(s: &Style, orion: &Orion, session: &Session) {
 }
 
 /// Handle a slash command; `false` means quit.
-fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style) -> bool {
+fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal) -> bool {
+    let s = &term.style;
     let (name, arg) = cmd.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((cmd, ""));
     // `/model local qwen3:8b` names the provider; `/model qwen3:8b` means the current one.
     let (target, rest) = match arg.split_once(' ').unwrap_or((arg, "")) {
@@ -304,6 +452,15 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style) -> bool {
             println!("  /usage                  tokens used this session");
             println!("  /clear                  start a new conversation");
             println!("  /exit                   leave (Ctrl-D works too)");
+            println!();
+            for (key, what) in HOTKEYS {
+                println!("  {key:<23} {what}");
+            }
+        }
+        "keys" => {
+            for (key, what) in HOTKEYS {
+                println!("  {key:<14} {what}");
+            }
         }
         "tools" => {
             for (tool, decision) in orion.tools() {

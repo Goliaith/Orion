@@ -7,8 +7,11 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
+use crate::interrupt::{self, ChannelReader};
+
 const MAX_RETRIES: u32 = 3;
 
+#[derive(Clone)]
 pub struct Http {
     agent: ureq::Agent,
     base: String,
@@ -32,7 +35,7 @@ impl Http {
         &self.base
     }
 
-    fn request(&self, method: &str, path: &str, extra: &[(&str, String)]) -> ureq::Request {
+    fn request(&self, method: &str, path: &str, extra: &[(String, String)]) -> ureq::Request {
         let mut req = self.agent.request(method, &format!("{}{path}", self.base));
         for (k, v) in &self.headers {
             req = req.set(k, v);
@@ -46,39 +49,54 @@ impl Http {
     /// POST a JSON body and return the response body for streaming. Retries
     /// rate limits, overload and dropped connections that happen before the
     /// response starts; a server that refuses connections fails at once.
+    /// Ctrl-C interrupts both the wait for the response and its reads.
     pub fn post_stream(&self, path: &str, body: &Value, extra: &[(&str, String)]) -> Result<impl BufRead> {
         let body = serde_json::to_string(body)?;
-        let mut attempt = 0;
-        loop {
-            let req = self.request("POST", path, extra).set("content-type", "application/json");
-            let wait = match req.send_string(&body) {
-                Ok(resp) => return Ok(BufReader::new(resp.into_reader())),
-                Err(ureq::Error::Status(code, resp)) if retryable(code) && attempt < MAX_RETRIES => {
-                    resp.header("retry-after").and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs)
-                }
-                Err(e) => return Err(self.describe(e)),
-            };
-            attempt += 1;
-            thread::sleep(wait.unwrap_or(Duration::from_secs(1 << attempt)).min(Duration::from_secs(60)));
-        }
+        let extra: Vec<(String, String)> = extra.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let (http, path) = (self.clone(), path.to_string());
+        let reader = interrupt::wait(move || {
+            let mut attempt = 0;
+            loop {
+                let req = http.request("POST", &path, &extra).set("content-type", "application/json");
+                let wait = match req.send_string(&body) {
+                    Ok(resp) => return Ok(resp.into_reader()),
+                    Err(ureq::Error::Status(code, resp)) if retryable(code) && attempt < MAX_RETRIES => {
+                        resp.header("retry-after").and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs)
+                    }
+                    Err(e) => return Err(http.describe(e)),
+                };
+                attempt += 1;
+                thread::sleep(wait.unwrap_or(Duration::from_secs(1 << attempt)).min(Duration::from_secs(60)));
+                // The caller may have given up on us in the meantime.
+                interrupt::check()?;
+            }
+        })?;
+        Ok(BufReader::new(ChannelReader::spawn(reader)))
     }
 
     /// One quick POST with a JSON reply: no retries, and a timeout of its own.
     pub fn post_json(&self, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
-        let resp = self
-            .request("POST", path, &[])
-            .timeout(timeout)
-            .set("content-type", "application/json")
-            .send_string(&serde_json::to_string(body)?)
-            .map_err(|e| self.describe(e))?;
-        let text = resp.into_string().context("reading the response")?;
-        serde_json::from_str(&text).context("malformed JSON response")
+        let body = serde_json::to_string(body)?;
+        let (http, path) = (self.clone(), path.to_string());
+        interrupt::wait(move || {
+            let resp = http
+                .request("POST", &path, &[])
+                .timeout(timeout)
+                .set("content-type", "application/json")
+                .send_string(&body)
+                .map_err(|e| http.describe(e))?;
+            let text = resp.into_string().context("reading the response")?;
+            serde_json::from_str(&text).context("malformed JSON response")
+        })
     }
 
     pub fn get_json(&self, path: &str) -> Result<Value> {
-        let resp = self.request("GET", path, &[]).call().map_err(|e| self.describe(e))?;
-        let text = resp.into_string().context("reading the response")?;
-        serde_json::from_str(&text).context("malformed JSON response")
+        let (http, path) = (self.clone(), path.to_string());
+        interrupt::wait(move || {
+            let resp = http.request("GET", &path, &[]).call().map_err(|e| http.describe(e))?;
+            let text = resp.into_string().context("reading the response")?;
+            serde_json::from_str(&text).context("malformed JSON response")
+        })
     }
 
     fn describe(&self, e: ureq::Error) -> anyhow::Error {
@@ -153,6 +171,9 @@ pub fn non_empty_env(var: &str) -> Option<String> {
 pub fn sse_data(reader: impl BufRead) -> impl Iterator<Item = Result<String>> {
     reader.lines().filter_map(|line| match line {
         Ok(line) => line.strip_prefix("data:").map(|d| Ok(d.trim().to_string())),
+        Err(e) if e.get_ref().is_some_and(|inner| inner.is::<interrupt::Interrupted>()) => {
+            Some(Err(interrupt::Interrupted.into()))
+        }
         Err(e) => Some(Err(anyhow!(e).context("reading the response stream"))),
     })
 }

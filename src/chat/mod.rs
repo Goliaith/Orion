@@ -36,6 +36,8 @@ pub struct ChatConfig {
     pub mode: Mode,
     /// Model calls per user message before the turn is stopped.
     pub max_tool_rounds: usize,
+    /// Show reasoning and progress notes (Ctrl-O toggles it in the chat).
+    pub show_reasoning: bool,
     pub claude: claude::ClaudeConfig,
     pub local: local::LocalConfig,
     pub router: router::RouterConfig,
@@ -46,6 +48,7 @@ impl Default for ChatConfig {
         Self {
             mode: Mode::Auto,
             max_tool_rounds: 50,
+            show_reasoning: true,
             claude: Default::default(),
             local: Default::default(),
             router: Default::default(),

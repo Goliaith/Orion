@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 use super::classifier::LocalClassifier;
 use super::router::{self, Classifier, Route, RouteContext, Router, Strategy};
 use super::{connect, Backend, Event, Mode, Provider, Stop, ToolCall, ToolResult, Ui, UiApprover};
-use crate::Orion;
+use crate::{interrupt, Orion};
 
 /// A finished turn, as the other model will be told about it.
 struct TurnRecord {
@@ -243,6 +243,7 @@ impl<'a> Session<'a> {
     /// leading `@claude` or `@local` sends it to that model regardless of
     /// the mode.
     pub fn turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
+        interrupt::clear();
         let (forced, text) = match input.split_once(char::is_whitespace) {
             Some(("@claude", rest)) => (Some(Provider::Claude), rest.trim()),
             Some(("@local", rest)) => (Some(Provider::Local), rest.trim()),
@@ -264,6 +265,10 @@ impl<'a> Session<'a> {
                 }
             },
         };
+        if interrupt::requested() {
+            ui.notice("Interrupted.");
+            return Ok(());
+        }
         if self.slot(provider).backend.is_none() {
             let why = self.slot(provider).error.clone().unwrap_or_else(|| "not connected".into());
             bail!("{} is not available: {why}", router::name(provider));
@@ -279,6 +284,10 @@ impl<'a> Session<'a> {
         let started = !record.reply.is_empty() || !record.tools.is_empty();
         self.finish(record);
         let Err(e) = result else { return Ok(()) };
+        if interrupt::is_interrupt(&e) {
+            ui.notice("Interrupted.");
+            return Ok(());
+        }
 
         // In auto mode, a model that fails before saying anything hands the
         // message to the other one, but private messages never go to Claude.
@@ -290,7 +299,13 @@ impl<'a> Session<'a> {
         ui.route(router::name(other), &self.describe(other), "fallback");
         let (record, result) = self.run_on(other, text, private_reason.is_some(), ui);
         self.finish(record);
-        result
+        match result {
+            Err(e) if interrupt::is_interrupt(&e) => {
+                ui.notice("Interrupted.");
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     fn describe(&self, p: Provider) -> String {
@@ -344,7 +359,18 @@ impl<'a> Session<'a> {
                     ui.text(t);
                 }
                 Event::Thinking(t) => ui.thinking(t),
-            })?;
+            });
+            let reply = match reply {
+                Err(e) if interrupt::is_interrupt(&e) => {
+                    // Keep what was said, so the model knows where it stopped.
+                    if !record.reply.trim().is_empty() {
+                        record.reply = format!("{} [interrupted by the user]", record.reply.trim_end());
+                        backend.push_assistant_text(&record.reply);
+                    }
+                    return Err(e);
+                }
+                other => other?,
+            };
             match reply.stop {
                 Stop::Refused => {
                     ui.notice("The model declined this request.");
@@ -362,7 +388,9 @@ impl<'a> Session<'a> {
                 .calls
                 .iter()
                 .map(|call| {
-                    let (content, is_error) = if let Some(raw) = &call.invalid_input {
+                    let (content, is_error) = if interrupt::requested() {
+                        ("Not run: interrupted by the user.".to_string(), true)
+                    } else if let Some(raw) = &call.invalid_input {
                         (serde_json::json!({ "INVALID_JSON": raw }).to_string(), true)
                     } else if reply.stop == Stop::Truncated {
                         ("Not run: the tool input was cut off by the output limit.".to_string(), true)
@@ -374,6 +402,7 @@ impl<'a> Session<'a> {
                 })
                 .collect();
             backend.push_tool_results(results);
+            interrupt::check()?;
         }
         ui.notice(&format!("Stopped after {max_tool_rounds} model calls in one turn."));
         Ok(())
@@ -423,7 +452,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::rc::Rc;
 
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::super::test_support::{orion, Recorder};
     use super::super::{Reply, Usage};
@@ -573,6 +602,69 @@ mod tests {
         s.turn("design a backup scheme", &mut ui).unwrap();
         assert!(ui.out.contains("Claude failed (529 overloaded); trying the local model."), "{}", ui.out);
         assert!(ui.out.ends_with("Here's a rough design."));
+    }
+
+    /// Presses Ctrl-C when the first tool starts.
+    #[derive(Default)]
+    struct Impatient {
+        inner: Recorder,
+        flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    impl Ui for Impatient {
+        fn text(&mut self, t: &str) {
+            self.inner.text(t)
+        }
+        fn thinking(&mut self, t: &str) {
+            self.inner.thinking(t)
+        }
+        fn tool_start(&mut self, name: &str, input: &Value) {
+            if let Some(f) = &self.flag {
+                f.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.tool_start(name, input)
+        }
+        fn tool_end(&mut self, name: &str, r: &Result<Value, String>, took: Duration) {
+            self.inner.tool_end(name, r, took)
+        }
+        fn notice(&mut self, t: &str) {
+            self.inner.notice(t)
+        }
+        fn approve(&mut self, tool: &dyn crate::Tool, args: &Value) -> bool {
+            self.inner.approve(tool, args)
+        }
+    }
+
+    #[test]
+    fn ctrl_c_between_tools_answers_every_call_and_stops() {
+        let log = Log::default();
+        let orion = orion();
+        let info = |id: &str| ToolCall { id: id.into(), name: "system_info".into(), input: json!({}), invalid_input: None };
+        let local = Scripted::new("local", &log, vec![Ok(("Checking.".into(), vec![info("a"), info("b")])), say("never")]);
+        let mut s = Session::with_backends(&orion, Mode::Local, None, Some(local));
+        let mut ui = Impatient { flag: Some(interrupt::test_flag::install()), ..Default::default() };
+        s.turn("look around", &mut ui).unwrap();
+        assert!(ui.inner.out.ends_with("!Interrupted."), "{}", ui.inner.out);
+        let results = entries(&log, "local result");
+        assert_eq!(results, ["local result: ok", "local result: Not run: interrupted by the user."]);
+        // The next turn starts clean.
+        let mut next = Recorder::default();
+        s.turn("@local hi", &mut next).unwrap();
+        assert!(next.out.ends_with("never"), "{}", next.out);
+    }
+
+    #[test]
+    fn ctrl_c_mid_reply_keeps_the_partial_and_skips_fallback() {
+        let log = Log::default();
+        let orion = orion();
+        let claude = Scripted::new("claude", &log, vec![Err(interrupt::Interrupted.into())]);
+        let local = Scripted::new("local", &log, vec![]);
+        let mut s = Session::with_backends(&orion, Mode::Auto, Some(claude), Some(local));
+        let mut ui = Recorder::default();
+        s.turn("design a backup scheme", &mut ui).unwrap();
+        assert!(ui.out.ends_with("!Interrupted."), "{}", ui.out);
+        assert!(!ui.out.contains("trying"), "an interrupt is not a failure: {}", ui.out);
+        assert!(entries(&log, "local").is_empty());
     }
 
     #[test]
