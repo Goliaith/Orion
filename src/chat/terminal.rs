@@ -238,11 +238,12 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>) -> Result<()>
     Ok(())
 }
 
-fn mode_name(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Auto => "auto",
-        Mode::Claude => "claude",
-        Mode::Local => "local",
+fn routing(session: &Session) -> String {
+    match (session.mode, session.classifier_name()) {
+        (Mode::Auto, Some(judge)) => format!("routing: auto (private → local; {judge} judges the rest)"),
+        (Mode::Auto, None) => "routing: auto (private and simple → local, complex → Claude)".into(),
+        (Mode::Claude, _) => "routing: always Claude".into(),
+        (Mode::Local, _) => "routing: always local".into(),
     }
 }
 
@@ -264,11 +265,7 @@ fn banner(s: &Style, orion: &Orion, session: &Session) {
     for line in providers(s, session) {
         println!("{}", s.dim(&line));
     }
-    let routing = match session.mode {
-        Mode::Auto => "routing: auto (private and simple → local, complex → Claude)",
-        Mode::Claude => "routing: always Claude",
-        Mode::Local => "routing: always local",
-    };
+    let routing = routing(session);
     println!(
         "{}",
         s.dim(&format!(
@@ -299,7 +296,7 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style) -> bool {
         "help" | "?" => {
             println!("  @claude … / @local …    send one message to that model");
             println!("  /use auto|claude|local  route automatically, or pin a model (the conversation carries over)");
-            println!("  /route <text>           show where a message would go, without sending it");
+            println!("  /route <text>           show where a message would go (asks only the local judge)");
             println!("  /model [claude|local] [id]  show or switch a model");
             println!("  /models                 list the models the local server has");
             println!("  /effort <level>         set Claude's effort: low, medium, high, xhigh, max");
@@ -319,7 +316,7 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style) -> bool {
             }
         }
         "model" if rest.is_empty() => {
-            println!("  {}", s.dim(&format!("routing: {}", mode_name(session.mode))));
+            println!("  {}", s.dim(&routing(session)));
             providers(s, session).iter().for_each(|l| println!("{l}"));
         }
         "model" => match session.backend_mut(target) {
@@ -356,7 +353,7 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style) -> bool {
             };
             match session.set_mode(mode) {
                 Ok(()) => {
-                    println!("  {}", s.dim(&format!("routing: {}", mode_name(mode))));
+                    println!("  {}", s.dim(&routing(session)));
                     providers(s, session).iter().for_each(|l| println!("{l}"));
                 }
                 Err(e) => println!("  {}", s.red(&format!("{e:#}"))),

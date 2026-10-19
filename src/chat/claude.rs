@@ -166,6 +166,10 @@ impl Backend for ClaudeBackend {
         format!("{} · effort {}", self.config.model, self.config.effort)
     }
 
+    fn model(&self) -> String {
+        self.config.model.clone()
+    }
+
     fn set_model(&mut self, model: &str) {
         self.config.model = model.to_string();
     }

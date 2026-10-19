@@ -4,11 +4,12 @@
 //! other one handled. Private turns are never shown to Claude.
 
 use std::cell::RefCell;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-use super::router::{self, Route, RouteContext, Router};
+use super::classifier::LocalClassifier;
+use super::router::{self, Classifier, Route, RouteContext, Router, Strategy};
 use super::{connect, Backend, Event, Mode, Provider, Stop, ToolCall, ToolResult, Ui, UiApprover};
 use crate::Orion;
 
@@ -60,6 +61,8 @@ pub struct Session<'a> {
     orion: &'a Orion,
     pub mode: Mode,
     router: Router,
+    /// Judges complexity under `strategy = "model"`; needs the local server.
+    classifier: Option<Box<dyn Classifier>>,
     claude: Slot,
     local: Slot,
     log: Vec<TurnRecord>,
@@ -91,7 +94,33 @@ impl<'a> Session<'a> {
             let errors: Vec<String> = [&s.claude.error, &s.local.error].into_iter().flatten().cloned().collect();
             bail!("{}", errors.join("\n"));
         }
+        s.classifier = s.build_classifier();
         Ok(s)
+    }
+
+    fn build_classifier(&self) -> Option<Box<dyn Classifier>> {
+        let chat = &self.orion.policy().chat;
+        if chat.router.strategy != Strategy::Model {
+            return None;
+        }
+        let local = self.local.backend.as_ref()?;
+        let model = match chat.router.classifier_model.as_str() {
+            "" => local.model(),
+            m => m.to_string(),
+        };
+        let timeout = Duration::from_secs(chat.router.classifier_timeout_secs.max(1));
+        let c = LocalClassifier::new(&chat.local, model, chat.router.prefer, timeout).ok()?;
+        Some(Box::new(c))
+    }
+
+    /// Replace the classifier (tests use a scripted one).
+    pub fn set_classifier(&mut self, classifier: Option<Box<dyn Classifier>>) {
+        self.classifier = classifier;
+    }
+
+    /// The model judging complexity, while it is in use.
+    pub fn classifier_name(&self) -> Option<String> {
+        self.classifier.as_ref().filter(|_| self.router.uses_classifier()).map(|c| c.name())
     }
 
     pub fn with_backends(
@@ -105,6 +134,7 @@ impl<'a> Session<'a> {
             orion,
             mode,
             router: Router::new(chat.router.clone()),
+            classifier: None,
             claude: Slot { backend: claude, ..Default::default() },
             local: Slot { backend: local, ..Default::default() },
             log: Vec::new(),
@@ -172,6 +202,9 @@ impl<'a> Session<'a> {
                 }
             }
         }
+        if self.classifier.is_none() {
+            self.classifier = self.build_classifier();
+        }
         self.mode = mode;
         Ok(())
     }
@@ -199,10 +232,11 @@ impl<'a> Session<'a> {
     fn decide(&self, text: &str) -> Route {
         let ctx = RouteContext {
             previous: self.previous,
+            previous_text: self.log.last().map(|r| r.user.as_str()),
             claude_available: self.claude.backend.is_some(),
             local_available: self.local.backend.is_some(),
         };
-        self.router.route(text, &ctx)
+        self.router.route(text, &ctx, self.classifier.as_deref())
     }
 
     /// Send one user message and run tools until the model is done. A
@@ -414,6 +448,9 @@ mod tests {
         fn describe(&self) -> String {
             self.name.to_string()
         }
+        fn model(&self) -> String {
+            self.name.to_string()
+        }
         fn set_model(&mut self, _model: &str) {}
         fn push_user(&mut self, text: &str) {
             self.log.borrow_mut().push(format!("{} user: {text}", self.name));
@@ -467,6 +504,32 @@ mod tests {
         assert_eq!(c[0], "claude user: how full is my disk?");
         assert!(c[1].starts_with("claude assistant: [The local model handled this message.]\n\nDisk is 28% full."));
         assert_eq!(c[2], "claude user: plan a cleanup of my home directory");
+    }
+
+    struct Judge(Provider);
+
+    impl Classifier for Judge {
+        fn name(&self) -> String {
+            "judge".into()
+        }
+        fn classify(&self, _text: &str, _previous: Option<(Provider, &str)>) -> Result<router::Verdict> {
+            Ok(router::Verdict { provider: self.0, reason: "said so".into() })
+        }
+    }
+
+    #[test]
+    fn the_classifier_decides_complexity() {
+        let log = Log::default();
+        let orion = orion();
+        let claude = Scripted::new("claude", &log, vec![say("Sure.")]);
+        let local = Scripted::new("local", &log, vec![]);
+        let mut s = Session::with_backends(&orion, Mode::Auto, Some(claude), Some(local));
+        s.set_classifier(Some(Box::new(Judge(Provider::Claude))));
+        assert_eq!(s.classifier_name().as_deref(), Some("judge"));
+        let mut ui = Recorder::default();
+        // Rules would keep this local ("short request"); the classifier says Claude.
+        s.turn("how full is my disk?", &mut ui).unwrap();
+        assert!(ui.out.starts_with("→Claude(judge: said so ("), "{}", ui.out);
     }
 
     #[test]

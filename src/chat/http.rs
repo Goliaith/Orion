@@ -63,6 +63,18 @@ impl Http {
         }
     }
 
+    /// One quick POST with a JSON reply: no retries, and a timeout of its own.
+    pub fn post_json(&self, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
+        let resp = self
+            .request("POST", path, &[])
+            .timeout(timeout)
+            .set("content-type", "application/json")
+            .send_string(&serde_json::to_string(body)?)
+            .map_err(|e| self.describe(e))?;
+        let text = resp.into_string().context("reading the response")?;
+        serde_json::from_str(&text).context("malformed JSON response")
+    }
+
     pub fn get_json(&self, path: &str) -> Result<Value> {
         let resp = self.request("GET", path, &[]).call().map_err(|e| self.describe(e))?;
         let text = resp.into_string().context("reading the response")?;
@@ -73,7 +85,7 @@ impl Http {
         match e {
             ureq::Error::Status(code, resp) => {
                 let text = resp.into_string().unwrap_or_default();
-                anyhow!("{} returned {code}: {}", self.base, error_message(&text))
+                anyhow::Error::new(StatusError { base: self.base.clone(), code, message: error_message(&text) })
             }
             ureq::Error::Transport(t) if t.kind() == ureq::ErrorKind::ConnectionFailed => {
                 anyhow!("cannot connect to {}: is the server running?", self.base)
@@ -82,6 +94,22 @@ impl Http {
         }
     }
 }
+
+/// The server answered with an error status.
+#[derive(Debug)]
+pub struct StatusError {
+    pub base: String,
+    pub code: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} returned {}: {}", self.base, self.code, self.message)
+    }
+}
+
+impl std::error::Error for StatusError {}
 
 fn retryable(code: u16) -> bool {
     matches!(code, 408 | 409 | 429 | 500..=599)

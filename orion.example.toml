@@ -64,11 +64,18 @@ model = ""                      # empty: the first model the server lists
 # temperature = 0.6
 # api_key_env = "LOCAL_LLM_KEY" # for servers that want a bearer token
 
-# How `auto` picks a model for each message: private first (stays local),
-# then complex (Claude), else `prefer`. Short follow-ups ("yes, do it") stay
-# with whichever model answered last. Check a decision with `/route <text>`.
+# How `auto` picks a model for each message. Private messages stay local and
+# short follow-ups ("yes, do it") stay with the last model, both by rule.
+# Everything else is judged for complexity: by the local model (strategy =
+# "model"), or by the keyword rules below ("rules", and whenever the judge
+# fails). Check a decision with `/route <text>`.
 [chat.router]
-prefer = "local"                # where messages go when nothing points either way
+strategy = "model"              # model or rules
+classifier_model = ""           # empty: the chat's local model; a small one
+                                # (e.g. "qwen3:1.7b") makes routing faster
+classifier_timeout_secs = 15
+prefer = "local"                # where messages go when nothing points either
+                                # way, and the judge's pick when unsure
 # Words that make a message private (prefix match, ignoring case).
 private_words = ["password", "passwd", "passphrase", "credential", "private key", "api key",
                  "ssn", "social security", "credit card", "bank", "salary", "tax return",
@@ -77,6 +84,7 @@ detect_secrets = true           # pasted keys and tokens are private too
 # Claude never sees these: messages mentioning them stay local, and Claude's
 # tool calls that touch them are refused, whatever the policy allows.
 private_paths = ["~/.ssh", "~/.gnupg", "~/.password-store", "~/.aws", "~/.netrc"]
+# Used by strategy = "rules", and as the fallback for "model".
 complex_words = ["code", "script", "program", "debug", "refactor", "implement", "design",
                  "architect", "plan", "analyze", "analyse", "explain", "compare", "research",
                  "optimize", "optimise", "write", "draft", "review", "why", "strategy",

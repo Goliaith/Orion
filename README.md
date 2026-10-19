@@ -99,13 +99,15 @@ orion › my bank password is hunter2, remember it
 → the local model (qwen3:8b) · private: mentions "password"
 ```
 
-The rules, in order:
+How it decides, in order:
 
-1. **Private stays local.** A message is private if it contains a private word (password, bank, medical, …), something shaped like a key or token, or one of the `private_paths`. If no local model is available, Orion asks before sending it to Claude.
-2. **Complex goes to Claude:** code, complex words (debug, refactor, plan, explain, write, …), several questions or numbered steps, or a long message.
-3. **Short follow-ups** ("yes", "ok, go ahead", "thanks") stay with the model that answered last.
-4. **Everything else goes to `prefer`**, which is `local` by default.
+1. **Private stays local.** A message is private if it contains a private word (password, bank, medical, …), something shaped like a key or token, or one of the `private_paths`. If no local model is available, Orion asks before sending it to Claude. This is always a rule; no model can overrule it.
+2. **Short follow-ups** ("yes", "ok, go ahead", "thanks") stay with the model that answered last.
+3. **Everything else is judged on difficulty by the local model.** It is given a description of both options and the previous message, and answers `{"route": "claude"|"local", "reason": "…"}`. Its reason and how long it took are shown (`→ Claude (claude-opus-5-5) · qwen3:8b: multi-step migration planning (0.3s)`). When unsure it picks `prefer` (local by default).
+4. **If no local model is running, or the judge fails or times out,** keyword rules decide instead. They send code, complex words (debug, refactor, plan, explain, write, …), several questions or numbered steps, and long messages to Claude, and everything else to `prefer`. After three failures in a row the judge is switched off for the session. Set `strategy = "rules"` to always use the rules; they're instant, and cruder.
 5. **If the chosen model is down, or fails before replying, the other one answers.** Private messages never fall back to Claude.
+
+The judge runs on this machine, so a message is never sent to Claude just to decide where it should go, and private messages never reach the judge at all. A small, fast model works well as the judge (`classifier_model = "qwen3:1.7b"`) while a bigger one handles the chat. Orion asks for JSON mode and no reasoning pass (`chat_template_kwargs`), and if the server rejects those fields it retries without them, and remembers.
 
 **One conversation, two models.** Before a model answers, it is caught up on the turns the other model handled: their messages, replies and tool calls. Switching never loses context. **Private turns are never shown to Claude**, now or later.
 
@@ -115,11 +117,9 @@ Control it with:
 
 - `@claude …` or `@local …` sends one message to that model.
 - `/use auto|claude|local` switches mode; the conversation carries over.
-- `/route <text>` shows where a message would go, without sending it.
+- `/route <text>` shows where a message would go. Only the local judge sees it.
 - `orion chat --auto`, `--claude` and `--local` choose the starting mode.
 - The rules (word lists, private paths, `prefer`, length threshold) are configured under `[chat.router]`; see [`orion.example.toml`](orion.example.toml).
-
-The router is rule-based: fast, predictable and explained, and it never sends your message anywhere just to decide where to send it.
 
 ### Local models
 
@@ -196,7 +196,8 @@ src/
   chat/
     mod.rs      config, the Backend and Ui traits
     session.rs  one conversation across both models: routing, catch-up, fallback, tool loop
-    router.rs   the routing rules and the private-path guard
+    router.rs   the routing order, keyword rules and the private-path guard
+    classifier.rs  the local model as routing judge
     claude.rs   Claude backend: streaming Messages API client (SSE)
     local.rs    local backend: OpenAI-compatible chat completions (Ollama, llama.cpp, vLLM, LM Studio)
     http.rs     shared HTTP: retries, proxy rules, error bodies, SSE lines
@@ -212,4 +213,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. **System daemon.** Run `oriond` as a systemd service on a Unix socket, with `orion serve` as a thin stdio bridge, so many agents share one policy and one log.
 3. **Isolation.** Run `proc_run` inside namespaces, cgroups and seccomp (or Landlock), with CPU, memory and GPU limits per call.
 4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ are done. Still to come: interrupting a reply with Ctrl-C, saving and resuming conversations, a full-screen TUI, voice, a graphical shell, and an optional model-based router for the cases keyword rules get wrong.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. Still to come: hotkeys such as Ctrl-C to interrupt a reply, saving and resuming conversations, a full-screen TUI, voice, and a graphical shell.

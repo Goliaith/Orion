@@ -8,6 +8,7 @@
 //! In `auto` mode the [`router`] picks one for each message, and the
 //! [`Session`] keeps both in one conversation.
 
+mod classifier;
 pub mod claude;
 mod http;
 pub mod local;
@@ -139,6 +140,7 @@ pub struct Reply {
 pub trait Backend {
     /// One line for the banner, such as the model and its settings.
     fn describe(&self) -> String;
+    fn model(&self) -> String;
     fn set_model(&mut self, model: &str);
     fn set_effort(&mut self, _effort: &str) -> Result<(), String> {
         Err("this backend has no effort setting".into())
@@ -320,11 +322,16 @@ pub(crate) mod test_support {
                 let mut req = vec![0; len];
                 reader.read_exact(&mut req).unwrap();
                 tx.send((path, serde_json::from_slice(&req).unwrap_or(Value::Null))).unwrap();
+                // "STATUS 400 {...}" answers with that status.
+                let (status, body) = match body.strip_prefix("STATUS ") {
+                    Some(rest) => (rest[..3].to_string(), rest[4..].to_string()),
+                    None => ("200".to_string(), body),
+                };
                 let kind = if body.starts_with('{') { "application/json" } else { "text/event-stream" };
                 let mut stream = stream;
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .unwrap();

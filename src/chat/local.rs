@@ -39,6 +39,16 @@ impl Default for LocalConfig {
     }
 }
 
+/// The bearer token header, for servers configured with `api_key_env`.
+pub(super) fn auth_headers(config: &LocalConfig) -> Result<Vec<(String, String)>> {
+    if config.api_key_env.is_empty() {
+        return Ok(Vec::new());
+    }
+    let key = non_empty_env(&config.api_key_env)
+        .with_context(|| format!("{} is not set (chat.local.api_key_env)", config.api_key_env))?;
+    Ok(vec![("authorization".into(), format!("Bearer {key}"))])
+}
+
 pub struct LocalBackend {
     http: Http,
     config: LocalConfig,
@@ -52,14 +62,8 @@ pub struct LocalBackend {
 impl LocalBackend {
     /// Check that the server answers, and pick a model if none is set.
     pub fn connect(mut config: LocalConfig, system: String, tools: &[ToolSpec]) -> Result<Self> {
-        let mut headers = Vec::new();
-        if !config.api_key_env.is_empty() {
-            let key = non_empty_env(&config.api_key_env)
-                .with_context(|| format!("{} is not set (chat.local.api_key_env)", config.api_key_env))?;
-            headers.push(("authorization".into(), format!("Bearer {key}")));
-        }
         let mut backend = Self {
-            http: Http::new(&config.base_url, headers),
+            http: Http::new(&config.base_url, auth_headers(&config)?),
             tools: tools
                 .iter()
                 .map(|t| {
@@ -118,6 +122,10 @@ impl LocalBackend {
 impl Backend for LocalBackend {
     fn describe(&self) -> String {
         format!("{} · local at {}", self.config.model, self.http.base())
+    }
+
+    fn model(&self) -> String {
+        self.config.model.clone()
     }
 
     fn set_model(&mut self, model: &str) {
