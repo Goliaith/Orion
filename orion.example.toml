@@ -1,0 +1,36 @@
+# Orion policy. Copy to ~/.config/orion/orion.toml (or pass --config / set
+# ORION_CONFIG). Every key is optional; the values shown are the defaults
+# unless noted otherwise.
+
+# What happens to tools that have no entry under [tools], by risk level.
+[defaults]
+read = "allow"      # observe the machine
+write = "deny"      # change files
+execute = "deny"    # run programs
+
+# Per-tool overrides. Denied tools are hidden from the AI entirely.
+# Run `orion tools` to see the result.
+[tools]
+# fs_write = "allow"
+# proc_run = "allow"
+# gpu_info = "deny"
+
+[fs]
+# Trees the AI may read (write roots are readable too).
+read_roots = ["~"]
+# Trees the AI may write. Empty by default; for example:
+write_roots = []
+# write_roots = ["~/orion-workspace"]
+max_read_bytes = 1048576
+
+[proc]
+# Programs proc_run may start, matched exactly against the requested command.
+# "*" allows anything. Empty by default.
+allowed_commands = []
+# allowed_commands = ["git", "python3", "nvidia-smi", "ls", "uname"]
+timeout_secs = 30
+max_output_bytes = 65536   # per stream
+
+[audit]
+enabled = true
+# path = "~/.local/state/orion/audit.jsonl"
