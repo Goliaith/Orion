@@ -15,6 +15,8 @@ const MAX_LOGGED_STRING: usize = 512;
 
 pub struct Entry<'a> {
     pub tool: &'a str,
+    /// Who asked, when known (an MCP client and its process).
+    pub caller: Option<&'a str>,
     pub decision: Decision,
     /// The human's answer, for calls under `ask` that prompted one.
     pub approved: Option<bool>,
@@ -44,6 +46,7 @@ impl Audit {
         let line = json!({
             "ts_ms": ts_ms,
             "tool": entry.tool,
+            "caller": entry.caller,
             "decision": entry.decision,
             "approved": entry.approved,
             "ok": entry.error.is_none(),
@@ -101,6 +104,7 @@ mod tests {
         let args = json!({ "path": "/x", "content": "é".repeat(400) });
         audit.record(Entry {
             tool: "fs_write",
+            caller: Some("test"),
             decision: Decision::Deny,
             approved: None,
             args: &args,

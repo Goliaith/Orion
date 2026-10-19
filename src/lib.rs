@@ -9,9 +9,11 @@
 
 pub mod audit;
 pub mod chat;
+pub mod daemon;
 pub mod interrupt;
 pub mod mcp;
 pub mod policy;
+pub mod sandbox;
 pub mod tool;
 pub mod tools;
 pub mod voice;
@@ -78,6 +80,17 @@ impl Orion {
     /// Call a tool as the AI. `approver` answers `ask` decisions; without
     /// one they are denied.
     pub fn call(&self, name: &str, args: Value, approver: Option<&dyn Approver>) -> Result<Value, CallError> {
+        self.call_as(name, args, approver, None)
+    }
+
+    /// [`call`](Self::call), naming the caller in the audit log.
+    pub fn call_as(
+        &self,
+        name: &str,
+        args: Value,
+        approver: Option<&dyn Approver>,
+        caller: Option<&str>,
+    ) -> Result<Value, CallError> {
         let tool = self
             .tools
             .iter()
@@ -107,6 +120,7 @@ impl Orion {
         };
         self.audit.record(audit::Entry {
             tool: name,
+            caller,
             decision,
             approved,
             args: &args,

@@ -115,6 +115,10 @@ pub struct Policy {
     pub voice: crate::voice::VoiceConfig,
     /// The graphical shell (`orion shell`).
     pub shell: crate::chat::shell::ShellConfig,
+    /// Confinement for programs the AI runs.
+    pub sandbox: crate::sandbox::SandboxConfig,
+    /// The background service (`orion daemon`).
+    pub daemon: crate::daemon::DaemonConfig,
 }
 
 impl Policy {
@@ -160,6 +164,11 @@ impl Policy {
             Risk::Write => self.defaults.write,
             Risk::Execute => self.defaults.execute,
         }
+    }
+
+    /// `$XDG_CONFIG_HOME/orion/orion.toml`, whether or not it exists.
+    pub fn default_config_path() -> Option<PathBuf> {
+        xdg_dir("XDG_CONFIG_HOME", ".config").map(|d| d.join("orion/orion.toml"))
     }
 
     /// Orion's own state: `$XDG_STATE_HOME/orion`.

@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 use orion::chat::terminal::{self, PromptApprover};
 use orion::chat::Mode;
 use orion::mcp::Server;
-use orion::{audit, Approver, Orion, Policy};
+use orion::{audit, daemon, Approver, Orion, Policy};
 
 #[derive(Parser)]
 #[command(name = "orion", version, about = "The AI interface layer of an AI-first Linux system")]
@@ -84,7 +84,21 @@ enum Cmd {
         action: Option<ConversationCmd>,
     },
     /// Serve the tools over MCP on stdin/stdout (this is what AI clients launch).
-    Serve,
+    /// When the daemon runs, this bridges to it, so all agents share it.
+    Serve {
+        /// Serve in this process even if the daemon is running.
+        #[arg(long)]
+        direct: bool,
+    },
+    /// Run Orion as a background service that AI agents connect to over a
+    /// private Unix socket (see contrib/orion.service).
+    Daemon {
+        /// Listen here instead of $XDG_RUNTIME_DIR/orion/orion.sock.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Show whether the daemon is running, and what it is doing.
+    Status,
     /// Show every tool, its risk level, and what the policy decides for it.
     Tools,
     /// Call a tool directly, as the AI would, and print the result.
@@ -134,12 +148,53 @@ fn main() -> Result<()> {
             };
             terminal::run_shell(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), port, open)
         }
+        Cmd::Daemon { socket } => daemon::run(policy, source, socket),
+        Cmd::Status => {
+            let path = daemon::socket_path(&policy.daemon);
+            let st = match daemon::status(&policy.daemon) {
+                Ok(st) => st,
+                Err(_) => {
+                    println!("Orion daemon: not running ({})", path.display());
+                    println!("sandbox:      {}", orion::sandbox::describe(&policy));
+                    std::process::exit(1);
+                }
+            };
+            let up = st["uptime_secs"].as_u64().unwrap_or(0);
+            println!("Orion daemon: running, pid {}, up {}h {}m", st["pid"], up / 3600, up / 60 % 60);
+            println!("socket:       {}", st["socket"].as_str().unwrap_or_default());
+            let reload = match st["reload_error"].as_str() {
+                Some(e) => format!(" (last edit rejected: {e})"),
+                None => match st["reloads"].as_u64().unwrap_or(0) {
+                    1 => " (1 reload)".into(),
+                    n => format!(" ({n} reloads)"),
+                },
+            };
+            println!("policy:       {}{reload}", st["policy"].as_str().unwrap_or_default());
+            println!("tools:        {} allowed, {} ask, {} denied", st["tools"]["allow"], st["tools"]["ask"], st["tools"]["deny"]);
+            println!("sandbox:      {}", st["sandbox"].as_str().unwrap_or_default());
+            // Not counting this status query's own connection.
+            let active = st["connections"]["active"].as_u64().unwrap_or(1).saturating_sub(1);
+            let total = st["connections"]["total"].as_u64().unwrap_or(1).saturating_sub(1);
+            println!("agents:       {active} connected, {total} since start");
+            println!("tool calls:   {}", st["tool_calls"]);
+            if let Some(log) = st["audit_log"].as_str() {
+                println!("audit log:    {log}");
+            }
+            Ok(())
+        }
         Cmd::Conversations { action } => terminal::conversations(match &action {
             None | Some(ConversationCmd::List) => None,
             Some(ConversationCmd::Show { id }) => Some(("show", id.as_str())),
             Some(ConversationCmd::Delete { id }) => Some(("delete", id.as_str())),
         }),
-        Cmd::Serve => {
+        Cmd::Serve { direct } => {
+            // An explicit --config means this policy, not the daemon's.
+            if !direct && cli.config.is_none() {
+                if let Some(stream) = daemon::connect(&policy.daemon) {
+                    tracing::debug!("bridging to the Orion daemon");
+                    return daemon::bridge(stream);
+                }
+            }
             let orion = Orion::new(policy);
             tracing::info!(
                 policy = %source.as_deref().map_or("built-in defaults".into(), |p| p.display().to_string()),
@@ -155,6 +210,7 @@ fn main() -> Result<()> {
                 let summary = tool.description().split(". ").next().unwrap_or_default().trim_end_matches('.');
                 println!("{:<12} {:<8} {:<6} {summary}", tool.name(), tool.risk().as_str(), decision.as_str());
             }
+            println!("\nprograms run sandboxed: {}", orion::sandbox::describe(orion.policy()));
             Ok(())
         }
         Cmd::Call { name, args } => {

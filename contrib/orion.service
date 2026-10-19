@@ -1,0 +1,32 @@
+# The Orion daemon (`orion daemon`): one policy, one audit log and one
+# sandbox for every AI agent on this machine. Started by orion.socket.
+[Unit]
+Description=Orion: the AI interface to this machine
+Requires=orion.socket
+After=orion.socket
+
+[Service]
+ExecStart=%h/.cargo/bin/orion daemon
+Restart=on-failure
+# Put ANTHROPIC_API_KEY or other variables here, one VAR=value per line.
+EnvironmentFile=-%h/.config/orion/env
+
+# Everything Orion runs for the AI lives in this service's cgroup, so these
+# cap all of it together, on top of each program's own sandbox limits.
+MemoryMax=8G
+TasksMax=1024
+CPUWeight=50
+
+# Hardening for the daemon itself. (If your bwrap is installed setuid, as on
+# some older distributions, remove NoNewPrivileges.)
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=default.target

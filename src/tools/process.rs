@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Command, Stdio};
+use std::os::unix::process::ExitStatusExt;
+use std::process::Stdio;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -154,7 +154,9 @@ impl Tool for ProcRun {
     fn description(&self) -> &'static str {
         "Run a program with arguments and capture its exit status, stdout and stderr. No shell is \
          involved, so pipes, globs and redirects are not interpreted. Programs outside the policy's \
-         proc.allowed_commands need the user's approval. When it finishes or times out, its whole process group is killed."
+         proc.allowed_commands need the user's approval. Programs run sandboxed: they can write only in \
+         the writable roots and temporary directories, private paths are hidden, and the network is off \
+         unless the owner allowed it. When it finishes or times out, its whole process group is killed."
     }
 
     fn risk(&self) -> Risk {
@@ -187,22 +189,24 @@ impl Tool for ProcRun {
 
     fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
         let a: RunArgs = parse_args(args)?;
-        let mut cmd = Command::new(&a.command);
-        cmd.args(&a.args)
-            .stdin(if a.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        let cwd = match &a.cwd {
+            Some(cwd) => {
+                let dir = policy.check_read(cwd)?;
+                ensure!(dir.is_dir(), "{} is not a directory", dir.display());
+                Some(dir)
+            }
+            None => None,
+        };
+        let (mut cmd, sandbox, guard) = crate::sandbox::command(policy, &a.command, &a.args, cwd.as_deref())?;
+        cmd.stdin(if a.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        if let Some(cwd) = &a.cwd {
-            let dir = policy.check_read(cwd)?;
-            ensure!(dir.is_dir(), "{} is not a directory", dir.display());
-            cmd.current_dir(dir);
-        }
+            .stderr(Stdio::piped());
         let timeout = Duration::from_secs(
             a.timeout_secs.unwrap_or(policy.proc.timeout_secs).clamp(1, policy.proc.timeout_secs.max(1)),
         );
 
         let mut child = cmd.spawn().with_context(|| format!("failed to start {:?}", a.command))?;
+        drop(guard);
         let pgid = child.id() as libc::pid_t;
         if let (Some(input), Some(mut pipe)) = (a.stdin, child.stdin.take()) {
             thread::spawn(move || {
@@ -247,6 +251,7 @@ impl Tool for ProcRun {
             "stderr": stderr,
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
+            "sandbox": sandbox.name(),
         }))
     }
 }

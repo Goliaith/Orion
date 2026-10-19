@@ -1,0 +1,17 @@
+# The Orion daemon's socket, for systemd socket activation (user units):
+#
+#     cp contrib/orion.socket contrib/orion.service ~/.config/systemd/user/
+#     systemctl --user enable --now orion.socket
+#
+# The daemon then starts the first time an agent connects (for example
+# through `orion serve`), and `orion status` shows it.
+[Unit]
+Description=Orion socket: AI agents connect here
+
+[Socket]
+ListenStream=%t/orion/orion.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

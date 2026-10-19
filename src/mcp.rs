@@ -5,6 +5,7 @@
 //! tools are left out, and calling one anyway returns an error result.
 
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -27,13 +28,43 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const PARSE_ERROR: i64 = -32700;
 
+/// The current Orion, swappable while connections are open (the daemon
+/// reloads its policy this way).
+pub type Shared = Arc<RwLock<Arc<Orion>>>;
+
+/// Extra methods a host adds (the daemon's `orion/status`).
+pub type Extension = Arc<dyn Fn(&str, &Value) -> Option<Value> + Send + Sync>;
+
 pub struct Server {
-    orion: Orion,
+    orion: Shared,
+    /// Who is calling, for the audit log: the client's name from
+    /// `initialize`, plus whatever the host knows (a process id).
+    peer: String,
+    client: Mutex<Option<String>>,
+    extension: Option<Extension>,
 }
 
 impl Server {
     pub fn new(orion: Orion) -> Self {
-        Self { orion }
+        Self::shared(Arc::new(RwLock::new(Arc::new(orion))), String::new(), None)
+    }
+
+    pub fn shared(orion: Shared, peer: String, extension: Option<Extension>) -> Self {
+        Self { orion, peer, client: Mutex::new(None), extension }
+    }
+
+    fn orion(&self) -> Arc<Orion> {
+        self.orion.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn caller(&self) -> Option<String> {
+        let client = self.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match (client, self.peer.as_str()) {
+            (Some(c), "") => Some(c),
+            (Some(c), p) => Some(format!("{c} ({p})")),
+            (None, "") => None,
+            (None, p) => Some(p.to_string()),
+        }
     }
 
     /// Serve until `input` reaches EOF.
@@ -76,7 +107,10 @@ impl Server {
             "ping" => Ok(json!({})),
             "tools/list" => Ok(self.list_tools()),
             "tools/call" => self.call_tool(&params),
-            _ => Err((METHOD_NOT_FOUND, format!("method not found: {method}"))),
+            other => match self.extension.as_ref().and_then(|x| x(other, &params)) {
+                Some(v) => Ok(v),
+                None => Err((METHOD_NOT_FOUND, format!("method not found: {method}"))),
+            },
         };
         Some(match result {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
@@ -85,6 +119,10 @@ impl Server {
     }
 
     fn initialize(&self, params: &Value) -> Value {
+        if let Some(name) = params.pointer("/clientInfo/name").and_then(Value::as_str) {
+            let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+            *self.client.lock().unwrap_or_else(|e| e.into_inner()) = Some(name);
+        }
         let requested = params.get("protocolVersion").and_then(Value::as_str);
         let version = requested
             .and_then(|v| PROTOCOL_VERSIONS.iter().find(|s| **s == v))
@@ -98,8 +136,8 @@ impl Server {
     }
 
     fn list_tools(&self) -> Value {
-        let tools: Vec<Value> = self
-            .orion
+        let orion = self.orion();
+        let tools: Vec<Value> = orion
             .tools()
             .filter(|(_, d)| *d == Decision::Allow)
             .map(|(t, _)| {
@@ -123,7 +161,7 @@ impl Server {
             return Err((INVALID_PARAMS, "missing tool name".into()));
         };
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-        match self.orion.call(name, args, None) {
+        match self.orion().call_as(name, args, None, self.caller().as_deref()) {
             Ok(value) => {
                 let text = serde_json::to_string_pretty(&value).unwrap_or_default();
                 Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": false }))

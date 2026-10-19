@@ -2,10 +2,12 @@
 
 Orion is an operating system built around AI: Linux underneath, with a model as a first-class user of the machine.
 
-This repository holds the first two pieces:
+This repository holds the first pieces:
 
 - **The interface between the AI and the system.** A model never touches the machine directly. It talks to `orion`, which offers the machine as a small set of typed tools. A local policy decides what is allowed, and every call is written to an audit log.
 - **The front-end**, `orion chat`. You talk to an AI in your terminal, and it works on the machine through those same tools. Each message goes to Claude or to a model running on this machine's own hardware, whichever fits: private and simple work stays local, complex work goes to Claude. Anything risky stops and asks you first.
+- **The system service**, `orion daemon`: one policy, one audit log and one sandbox shared by every agent on the machine, on a Unix socket only you can reach.
+- **The sandbox.** Every program the AI starts runs confined: read-only outside its workspace, with your keys and secrets hidden, no network, no GPU, and limits on memory, CPU time and file size.
 
 ```
    you ──▶ orion chat ──▶ Claude (API)  or  a local model (Ollama, llama.cpp, vLLM, …)
@@ -313,7 +315,9 @@ orion call fs_list '{"path": "~"}'
 orion audit -n 20                             # recent calls, as JSON lines
 orion conversations                           # saved chats (see "Saved conversations")
 orion shell                                   # the graphical shell (see "Graphical shell")
-orion serve                                   # MCP server on stdin/stdout
+orion serve                                   # MCP server on stdin/stdout (through the daemon when it runs)
+orion daemon                                  # the system service (see "System service")
+orion status                                  # whether the daemon runs, and how
 ```
 
 ### Connect a model
@@ -330,6 +334,61 @@ Or in a client's JSON config:
 { "mcpServers": { "orion": { "command": "/path/to/orion", "args": ["serve"] } } }
 ```
 
+## System service
+
+`orion daemon` runs Orion as a long-lived service, so every agent on the machine shares one policy, one audit log and one sandbox:
+
+```sh
+orion daemon &      # or as a systemd user service, below
+orion status
+# Orion daemon: running, pid 4121, up 2h 13m
+# socket:       /run/user/1000/orion/orion.sock
+# policy:       /home/you/.config/orion/orion.toml (1 reload)
+# tools:        5 allowed, 2 ask, 0 denied
+# sandbox:      bubblewrap, read-only outside the writable roots, private paths hidden, no network, no GPU
+# agents:       2 connected, 9 since start
+# tool calls:   41
+# audit log:    /home/you/.local/state/orion/audit.jsonl
+```
+
+- **`orion serve` becomes a thin bridge.** When the daemon is running, `orion serve` connects to it and relays the MCP session, so nothing changes for clients: they still launch `orion serve`. With no daemon, or with `--direct` or an explicit `--config`, it serves in-process as before.
+- **It speaks MCP over a Unix socket** at `$XDG_RUNTIME_DIR/orion/orion.sock` (`[daemon] socket` changes it). The socket is `0600` in a `0700` directory, Orion refuses to start if that directory belongs to someone else or is open to others, and every connection's peer is checked with `SO_PEERCRED` (your uid, or root).
+- **Policy edits apply live.** The daemon watches the policy file and reloads it within two seconds; connected agents see the new tool list on their next call. A broken edit is reported in `orion status`, and the old policy stays in force.
+- **The audit log names the caller.** Each entry carries the client's name and pid (`"caller": "claude-code (pid 5312)"`), so you can tell agents apart.
+- **`orion status`** adds an `orion/status` method that any client can call; it exits 1 when the daemon isn't running.
+
+### As a systemd service
+
+`contrib/orion.socket` and `contrib/orion.service` set up a socket-activated user service: systemd holds the socket and starts the daemon on the first connection.
+
+```sh
+cp contrib/orion.socket contrib/orion.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now orion.socket
+```
+
+The service reads `ANTHROPIC_API_KEY` and other variables from `~/.config/orion/env`, caps everything Orion runs at 8 GiB of memory and 1024 tasks through its cgroup, and hardens the daemon itself (`NoNewPrivileges`, `ProtectKernel*`, `RestrictSUIDSGID`, …). `journalctl --user -u orion` shows its log.
+
+## Sandbox
+
+Every program the AI starts with `proc_run` runs in a sandbox, whatever the policy allows it to run. `orion tools` and `orion status` show which one, and the model is told, so it reports a refusal instead of trying to get around it.
+
+| | bubblewrap | Landlock | limits only |
+|---|---|---|---|
+| Filesystem | read-only, except the `write_roots` and a private `/tmp` | read-only, except the `write_roots`, `/tmp`, `/var/tmp`, `/dev/shm` | as the user |
+| Private paths (`~/.ssh`, `~/.gnupg`, …) | hidden: they don't exist | unreadable | readable |
+| Network | none (own network namespace) | no TCP connect or bind (kernel ABI 4+) | open |
+| GPU | no devices | no devices | open |
+| Other | own PID, IPC and hostname namespaces, all capabilities dropped | can't signal or reach abstract sockets outside the sandbox (ABI 6+) | |
+| Memory, CPU time, file size, no core dumps, no privilege gain | ✓ | ✓ | ✓ |
+
+- **`mode = "auto"`** uses bubblewrap if it is installed and works (`apt install bubblewrap`), else Landlock (Linux 5.13+, no install needed), else only the limits. `require = true` refuses to run programs rather than fall back to limits only.
+- **Hidden paths** are `[sandbox] hide` (your keys, password store, cloud credentials and Orion's own config, so a program can't loosen its policy) plus `chat.router.private_paths`.
+- **`network = true`** and **`gpu = true`** open those up, for example for package installs or CUDA work. Landlock can only restrict TCP, so for a full network block install bubblewrap.
+- **Limits** are per program: `memory_mb` (default 8192), `cpu_secs` (300) and `max_file_mb` (4096); `0` turns one off. Programs also can't gain privileges through setuid binaries.
+- Each result says which sandbox ran it (`"sandbox": "bubblewrap"`), and `orion tools` prints the current one.
+- Under Landlock, a directory that contains a hidden path is opened up entry by entry, so files created there later aren't readable. Bubblewrap has no such gap.
+
 ## Policy
 
 Copy [`orion.example.toml`](orion.example.toml) to `~/.config/orion/orion.toml`, or point `--config` or `ORION_CONFIG` at a file.
@@ -340,6 +399,7 @@ Copy [`orion.example.toml`](orion.example.toml) to `~/.config/orion/orion.toml`,
 - `[proc]` sets `allowed_commands`: pre-approved programs, matched exactly. When `proc_run` is `ask`, these run without a prompt and anything else asks. When it is `allow`, only these run at all. `[proc]` also sets a timeout and an output cap. Once a program exits or times out, its whole process group is killed, so background children cannot linger.
 - `[audit]` controls the append-only JSONL log at `~/.local/state/orion/audit.jsonl`. It records each decision and, for `ask`, your answer. Long string arguments are truncated in the log.
 - `[chat]` holds the front-end settings above.
+- `[sandbox]` and `[daemon]` configure the [sandbox](#sandbox) and the [system service](#system-service).
 
 Unknown keys are an error, so a misspelled setting fails loudly instead of being ignored.
 
@@ -352,6 +412,8 @@ src/
   policy.rs     policy file, decisions, path scoping
   audit.rs      JSONL audit log
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
+  daemon.rs     the system service: socket, peer checks, live reload, the stdio bridge
+  sandbox.rs    sandboxing for proc_run: bubblewrap, Landlock, resource limits
   tools/        built-in tools: system, fs, process
   chat/
     mod.rs      config, the Backend and Ui traits
@@ -368,11 +430,13 @@ src/
     tui/        the full-screen chat: screen and keys (mod.rs), the message editor (input.rs)
     shell/      the graphical shell: server, event hub and security (mod.rs),
                 minimal HTTP (http.rs), the page (shell.html)
-contrib/        orion-kiosk (boot into the shell), orion-shell.service
   interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
   voice/        listening and the pause detector (record.rs), speech to text
                 (transcribe.rs), text to speech and sentence splitting (speak.rs)
-tests/stdio.rs  end-to-end MCP session against the real binary
+contrib/        orion.socket and orion.service (the daemon), orion-kiosk (boot into
+                the shell), orion-shell.service
+tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
+                (daemon plus bridge)
 ```
 
 To add a capability, implement `Tool` in `src/tools/` and register it in `tools::builtin()`. Pick its `Risk` honestly, because that is what the policy defaults key off. Put checks that no approval should override in `precheck`, and argument-dependent pre-approval (like `proc_run`'s command list) in `preapproval`.
@@ -380,7 +444,7 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 ## Roadmap
 
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
-2. **System daemon.** Run `oriond` as a systemd service on a Unix socket, with `orion serve` as a thin stdio bridge, so many agents share one policy and one log.
-3. **Isolation.** Run `proc_run` inside namespaces, cgroups and seccomp (or Landlock), with CPU, memory and GPU limits per call.
+2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
+3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
 5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~ and ~~a graphical shell~~ are done too. Still to come: wake-word listening.

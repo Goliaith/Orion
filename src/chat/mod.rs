@@ -268,10 +268,14 @@ you are about to change. Keep replies short and plain: this is a terminal, so us
 Markdown.
 
 Policy limits: you can read under {read}. You can write under {write}; writes elsewhere fail and \
-no approval can override that. Programs that run without asking: {commands}.",
+no approval can override that. Programs that run without asking: {commands}.
+
+Programs you start run in a sandbox: {sandbox}. If a program fails because of it (no network, a \
+read-only path), say so rather than looking for a way around it.",
         read = paths(&policy.fs.read_roots),
         write = paths(&policy.fs.write_roots),
         commands = list(policy.proc.allowed_commands.clone()),
+        sandbox = crate::sandbox::describe(policy),
     )
 }
 

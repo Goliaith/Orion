@@ -127,3 +127,22 @@ play_command = ""               # plays {wav} from speak_url; empty: pw-play, pa
 [shell]
 port = 7310                     # on 127.0.0.1 only; 0 picks a free port
 open_browser = false            # or pass --open
+
+# Programs the AI starts (proc_run) run in a sandbox: read-only outside
+# fs.write_roots (and /tmp), with the paths below and chat.router.private_paths
+# hidden, no network, no GPU, and the limits below. Check with `orion tools`.
+[sandbox]
+mode = "auto"                   # auto: bubblewrap, else Landlock, else limits only;
+                                # or "bubblewrap", "landlock", "off"
+require = false                 # true: refuse to run programs with limits only
+network = false                 # Landlock can only block TCP; bubblewrap blocks all
+gpu = false                     # /dev/nvidia*, /dev/dri, /dev/kfd
+memory_mb = 8192                # per program; 0 for no limit
+cpu_secs = 300                  # CPU time per program
+max_file_mb = 4096              # largest file a program may write
+hide = ["~/.ssh", "~/.gnupg", "~/.password-store", "~/.aws", "~/.netrc", "~/.config/orion"]
+
+# `orion daemon`: one policy, audit log and sandbox for every agent. `orion
+# serve` connects to it when it is running.
+[daemon]
+socket = ""                     # empty: $XDG_RUNTIME_DIR/orion/orion.sock
