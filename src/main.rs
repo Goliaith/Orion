@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use orion::chat::terminal::{self, PromptApprover};
-use orion::chat::Provider;
+use orion::chat::Mode;
 use orion::mcp::Server;
 use orion::{audit, Approver, Orion, Policy};
 
@@ -25,10 +25,16 @@ struct Cli {
 enum Cmd {
     /// Talk to an AI in the terminal; it works on the machine through Orion's tools.
     Chat {
-        /// Use a model served on this machine instead of Claude.
-        #[arg(long)]
+        /// Always use the model served on this machine.
+        #[arg(long, conflicts_with_all = ["claude", "auto"])]
         local: bool,
-        /// Use this model instead of the configured one.
+        /// Always use Claude.
+        #[arg(long, conflicts_with = "auto")]
+        claude: bool,
+        /// Route each message to Claude or the local model (the default).
+        #[arg(long)]
+        auto: bool,
+        /// Use this model instead of the configured one (with --claude or --local).
         #[arg(long)]
         model: Option<String>,
     },
@@ -65,9 +71,14 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Cmd::Chat { local, model } => {
-            let provider = local.then_some(Provider::Local);
-            terminal::run(&Orion::new(policy), provider, model.as_deref())
+        Cmd::Chat { local, claude, auto, model } => {
+            let mode = match (local, claude, auto) {
+                (true, _, _) => Some(Mode::Local),
+                (_, true, _) => Some(Mode::Claude),
+                (_, _, true) => Some(Mode::Auto),
+                _ => None,
+            };
+            terminal::run(&Orion::new(policy), mode, model.as_deref())
         }
         Cmd::Serve => {
             let orion = Orion::new(policy);

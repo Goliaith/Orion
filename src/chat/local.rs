@@ -132,6 +132,10 @@ impl Backend for LocalBackend {
         self.messages.push(json!({ "role": "user", "content": text }));
     }
 
+    fn push_assistant_text(&mut self, text: &str) {
+        self.messages.push(json!({ "role": "assistant", "content": text }));
+    }
+
     fn respond(&mut self, on: &mut dyn FnMut(Event)) -> Result<Reply> {
         let reader = self
             .http
@@ -338,7 +342,7 @@ impl ThinkSplitter {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{fake_server, orion, Recorder};
-    use super::super::{offered_tools, Session};
+    use super::super::{offered_tools, Mode, Session};
     use super::*;
 
     fn chunks(deltas: &[Value]) -> String {
@@ -430,7 +434,7 @@ mod tests {
         let backend = LocalBackend::connect(config, "system".into(), &offered_tools(&orion)).unwrap();
         assert!(backend.describe().starts_with("llama3.2:3b"), "picks the first listed model, sorted");
 
-        let mut session = Session::new(&orion, Box::new(backend));
+        let mut session = Session::with_backends(&orion, Mode::Local, None, Some(Box::new(backend)));
         let mut ui = Recorder::default();
         session.turn("what is this?", &mut ui).unwrap();
         assert_eq!(ui.out, "[Check the host.]<system_info><ok>It is a Linux box.");

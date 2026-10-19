@@ -207,7 +207,7 @@ fn absolute(raw: &str) -> Result<PathBuf> {
 /// Canonicalize the longest existing prefix of `path` and append the rest.
 /// Rejects `..` in the non-existent part and dangling symlinks, either of
 /// which could otherwise point outside the root that was checked.
-fn resolve_lenient(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_lenient(path: &Path) -> Result<PathBuf> {
     if let Ok(real) = path.canonicalize() {
         return Ok(real);
     }

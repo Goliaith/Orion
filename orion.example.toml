@@ -41,7 +41,8 @@ enabled = true
 
 # The `orion chat` front-end.
 [chat]
-provider = "claude"             # claude, or local (`orion chat --local` overrides)
+provider = "auto"               # auto: route each message; or always "claude" / "local"
+                                # (`orion chat --claude/--local/--auto` overrides)
 max_tool_rounds = 50            # model calls per message before stopping
 
 # Claude. Needs ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN).
@@ -62,3 +63,22 @@ model = ""                      # empty: the first model the server lists
 # max_tokens = 8192             # unset: the server decides
 # temperature = 0.6
 # api_key_env = "LOCAL_LLM_KEY" # for servers that want a bearer token
+
+# How `auto` picks a model for each message: private first (stays local),
+# then complex (Claude), else `prefer`. Short follow-ups ("yes, do it") stay
+# with whichever model answered last. Check a decision with `/route <text>`.
+[chat.router]
+prefer = "local"                # where messages go when nothing points either way
+# Words that make a message private (prefix match, ignoring case).
+private_words = ["password", "passwd", "passphrase", "credential", "private key", "api key",
+                 "ssn", "social security", "credit card", "bank", "salary", "tax return",
+                 "medical", "diagnos", "therapy", "prescription"]
+detect_secrets = true           # pasted keys and tokens are private too
+# Claude never sees these: messages mentioning them stay local, and Claude's
+# tool calls that touch them are refused, whatever the policy allows.
+private_paths = ["~/.ssh", "~/.gnupg", "~/.password-store", "~/.aws", "~/.netrc"]
+complex_words = ["code", "script", "program", "debug", "refactor", "implement", "design",
+                 "architect", "plan", "analyze", "analyse", "explain", "compare", "research",
+                 "optimize", "optimise", "write", "draft", "review", "why", "strategy",
+                 "algorithm", "step by step"]
+long_request_words = 60         # longer messages go to Claude

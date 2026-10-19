@@ -5,7 +5,7 @@ Orion is an operating system built around AI: Linux underneath, with a model as 
 This repository holds the first two pieces:
 
 - **The interface between the AI and the system.** A model never touches the machine directly. It talks to `orion`, which offers the machine as a small set of typed tools. A local policy decides what is allowed, and every call is written to an audit log.
-- **The front-end**, `orion chat`. You talk to an AI in your terminal, either Claude or a model running on this machine's own hardware, and it works on the machine through those same tools. Anything risky stops and asks you first.
+- **The front-end**, `orion chat`. You talk to an AI in your terminal, and it works on the machine through those same tools. Each message goes to Claude or to a model running on this machine's own hardware, whichever fits: private and simple work stays local, complex work goes to Claude. Anything risky stops and asks you first.
 
 ```
    you ──▶ orion chat ──▶ Claude (API)  or  a local model (Ollama, llama.cpp, vLLM, …)
@@ -73,10 +73,53 @@ Firefox is using 3.1 GB of your 16 GB. I wrote the details to ~/orion-workspace/
 - **Streaming.** Replies stream as they are written. The model's progress notes and reasoning show dimmed, so long tasks don't sit silent.
 - **Every tool call is visible**, with its arguments and whether it worked.
 - **Approval prompts** show the full arguments of anything that changes the machine. `a` approves that tool for the rest of the session.
-- **Commands:** `/tools`, `/model`, `/models`, `/use claude|local`, `/effort`, `/usage`, `/clear`, `/exit`. Line history is kept in `~/.local/state/orion/chat_history`.
-- Settings live under `[chat]` in the policy file: the default provider, and per-provider sections `[chat.claude]` (model, default `claude-opus-5-5`; effort; progress notes; fallbacks) and `[chat.local]`.
+- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/clear`, `/exit`, plus `@claude` / `@local` prefixes. Line history is kept in `~/.local/state/orion/chat_history`.
+- Settings live under `[chat]` in the policy file: the mode (`provider = "auto"`, `"claude"` or `"local"`) and the sections `[chat.claude]` (model, default `claude-opus-5-5`; effort; progress notes; fallbacks), `[chat.local]` and `[chat.router]`.
 
 `ANTHROPIC_AUTH_TOKEN` (an OAuth access token) also works in place of an API key.
+
+### Automatic routing
+
+With both Claude and a local model available, `orion chat` (mode `auto`, the default) picks a model for every message and says which one it chose and why:
+
+```
+orion › how full is my disk?
+→ the local model (qwen3:8b) · short request
+  ⚙ proc_run {"args":["-h","/"],"command":"df"}
+Your root disk is 28% full.
+
+orion › plan a cleanup of my home directory
+→ Claude (claude-opus-5-5) · complex: "plan"
+Plan: 1) clear ~/.cache (2.1 GB), 2) empty Trash, 3) prune old Downloads. Start with the cache?
+
+orion › yes
+→ Claude (claude-opus-5-5) · follow-up
+
+orion › my bank password is hunter2, remember it
+→ the local model (qwen3:8b) · private: mentions "password"
+```
+
+The rules, in order:
+
+1. **Private stays local.** A message is private if it contains a private word (password, bank, medical, …), something shaped like a key or token, or one of the `private_paths`. If no local model is available, Orion asks before sending it to Claude.
+2. **Complex goes to Claude:** code, complex words (debug, refactor, plan, explain, write, …), several questions or numbered steps, or a long message.
+3. **Short follow-ups** ("yes", "ok, go ahead", "thanks") stay with the model that answered last.
+4. **Everything else goes to `prefer`**, which is `local` by default.
+5. **If the chosen model is down, or fails before replying, the other one answers.** Private messages never fall back to Claude.
+
+**One conversation, two models.** Before a model answers, it is caught up on the turns the other model handled: their messages, replies and tool calls. Switching never loses context. **Private turns are never shown to Claude**, now or later.
+
+**Claude never sees private files.** When Claude is answering, any tool call that refers to a `private_paths` entry (`~/.ssh`, `~/.gnupg`, `~/.aws`, …) is refused before it runs, whatever the policy allows. The check catches relative paths and symlinks too. The local model is not restricted this way.
+
+Control it with:
+
+- `@claude …` or `@local …` sends one message to that model.
+- `/use auto|claude|local` switches mode; the conversation carries over.
+- `/route <text>` shows where a message would go, without sending it.
+- `orion chat --auto`, `--claude` and `--local` choose the starting mode.
+- The rules (word lists, private paths, `prefer`, length threshold) are configured under `[chat.router]`; see [`orion.example.toml`](orion.example.toml).
+
+The router is rule-based: fast, predictable and explained, and it never sends your message anywhere just to decide where to send it.
 
 ### Local models
 
@@ -90,11 +133,11 @@ Orion can use a model running on your own GPU instead of Claude. Nothing leaves 
 | LM Studio | start the local server in the app | `http://127.0.0.1:1234/v1` |
 
 ```sh
-orion chat --local                    # first model the server lists
+orion chat --local                    # only the local model: first one the server lists
 orion chat --local --model qwen3:8b   # a specific one
 ```
 
-Or set `provider = "local"` under `[chat]` to make it the default. Inside a chat, `/models` lists what the server has, `/model <id>` switches, and `/use claude` or `/use local` swaps provider, which starts a new conversation.
+Inside a chat, `/models` lists what the server has, and `/model local <id>` switches model.
 
 Things to know:
 
@@ -151,7 +194,9 @@ src/
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
   tools/        built-in tools: system, fs, process
   chat/
-    mod.rs      the Backend trait and the tool loop: rounds, approvals, results
+    mod.rs      config, the Backend and Ui traits
+    session.rs  one conversation across both models: routing, catch-up, fallback, tool loop
+    router.rs   the routing rules and the private-path guard
     claude.rs   Claude backend: streaming Messages API client (SSE)
     local.rs    local backend: OpenAI-compatible chat completions (Ollama, llama.cpp, vLLM, LM Studio)
     http.rs     shared HTTP: retries, proxy rules, error bodies, SSE lines
@@ -167,4 +212,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. **System daemon.** Run `oriond` as a systemd service on a Unix socket, with `orion serve` as a thin stdio bridge, so many agents share one policy and one log.
 3. **Isolation.** Run `proc_run` inside namespaces, cgroups and seccomp (or Landlock), with CPU, memory and GPU limits per call.
 4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
-5. **Front-end, next steps.** ~~A terminal chat~~ and ~~local models~~ are done. Still to come: interrupting a reply with Ctrl-C, saving and resuming conversations, a full-screen TUI, voice, a graphical shell, and routing between local and hosted models automatically (for example, local for private or simple tasks).
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ are done. Still to come: interrupting a reply with Ctrl-C, saving and resuming conversations, a full-screen TUI, voice, a graphical shell, and an optional model-based router for the cases keyword rules get wrong.

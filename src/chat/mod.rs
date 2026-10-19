@@ -5,14 +5,20 @@
 //!
 //! The model is behind [`Backend`]: [`claude`] for the Claude API, [`local`]
 //! for models served on this machine (Ollama, llama.cpp, vLLM, LM Studio).
+//! In `auto` mode the [`router`] picks one for each message, and the
+//! [`Session`] keeps both in one conversation.
 
 pub mod claude;
 mod http;
 pub mod local;
+pub mod router;
+mod session;
 pub mod terminal;
 
+pub use session::Session;
+
 use std::cell::RefCell;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -24,27 +30,42 @@ use crate::{Approver, Decision, Orion, Policy, Tool};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatConfig {
-    pub provider: Provider,
+    /// `auto` routes each message; `claude` or `local` pins one.
+    #[serde(rename = "provider")]
+    pub mode: Mode,
     /// Model calls per user message before the turn is stopped.
     pub max_tool_rounds: usize,
     pub claude: claude::ClaudeConfig,
     pub local: local::LocalConfig,
+    pub router: router::RouterConfig,
 }
 
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
-            provider: Provider::Claude,
+            mode: Mode::Auto,
             max_tool_rounds: 50,
             claude: Default::default(),
             local: Default::default(),
+            router: Default::default(),
         }
     }
 }
 
+/// Where the model behind a message comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
+    Claude,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Route each message to Claude or the local model.
+    #[default]
+    Auto,
     Claude,
     Local,
 }
@@ -126,6 +147,9 @@ pub trait Backend {
         anyhow::bail!("this backend cannot list models")
     }
     fn push_user(&mut self, text: &str);
+    /// Record an assistant turn this backend did not produce (one the other
+    /// model handled), after the matching `push_user`.
+    fn push_assistant_text(&mut self, text: &str);
     fn respond(&mut self, on: &mut dyn FnMut(Event)) -> Result<Reply>;
     /// Answers to every call of the last reply, in order.
     fn push_tool_results(&mut self, results: Vec<ToolResult>);
@@ -142,6 +166,12 @@ pub trait Ui {
     fn notice(&mut self, text: &str);
     /// Answer an `ask` decision.
     fn approve(&mut self, tool: &dyn Tool, args: &Value) -> bool;
+    /// Which model is taking the message, and why.
+    fn route(&mut self, _to: &str, _model: &str, _reason: &str) {}
+    /// A yes/no question that is not about a tool call.
+    fn confirm(&mut self, _question: &str) -> bool {
+        false
+    }
 }
 
 struct UiApprover<'a>(RefCell<&'a mut dyn Ui>);
@@ -183,74 +213,6 @@ pub fn connect(orion: &Orion, provider: Provider, model: Option<&str>) -> Result
             Box::new(local::LocalBackend::connect(c, system, &tools)?)
         }
     })
-}
-
-/// One conversation: the tool loop around a backend.
-pub struct Session<'a> {
-    orion: &'a Orion,
-    pub backend: Box<dyn Backend>,
-    max_tool_rounds: usize,
-}
-
-impl<'a> Session<'a> {
-    pub fn new(orion: &'a Orion, backend: Box<dyn Backend>) -> Self {
-        Self { orion, backend, max_tool_rounds: orion.policy().chat.max_tool_rounds }
-    }
-
-    /// Send one user message and run tools until the model is done.
-    pub fn turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
-        self.backend.push_user(input);
-        for _ in 0..self.max_tool_rounds {
-            let reply = self.backend.respond(&mut |ev| match ev {
-                Event::Text(t) => ui.text(t),
-                Event::Thinking(t) => ui.thinking(t),
-            })?;
-            match reply.stop {
-                Stop::Refused => {
-                    ui.notice("The model declined this request.");
-                    return Ok(());
-                }
-                _ if reply.calls.is_empty() => {
-                    if reply.stop == Stop::Truncated {
-                        ui.notice("The reply hit the output limit and was cut off.");
-                    }
-                    return Ok(());
-                }
-                _ => {}
-            }
-            let results = reply
-                .calls
-                .iter()
-                .map(|call| {
-                    let (content, is_error) = if let Some(raw) = &call.invalid_input {
-                        (serde_json::json!({ "INVALID_JSON": raw }).to_string(), true)
-                    } else if reply.stop == Stop::Truncated {
-                        ("Not run: the tool input was cut off by the output limit.".to_string(), true)
-                    } else {
-                        self.run_tool(call, ui)
-                    };
-                    ToolResult { id: call.id.clone(), content, is_error }
-                })
-                .collect();
-            self.backend.push_tool_results(results);
-        }
-        ui.notice(&format!("Stopped after {} model calls in one turn.", self.max_tool_rounds));
-        Ok(())
-    }
-
-    fn run_tool(&self, call: &ToolCall, ui: &mut dyn Ui) -> (String, bool) {
-        ui.tool_start(&call.name, &call.input);
-        let start = Instant::now();
-        let result = {
-            let approver = UiApprover(RefCell::new(&mut *ui));
-            self.orion.call(&call.name, call.input.clone(), Some(&approver)).map_err(|e| e.to_string())
-        };
-        ui.tool_end(&call.name, &result, start.elapsed());
-        match result {
-            Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_default(), false),
-            Err(e) => (e, true),
-        }
-    }
 }
 
 fn system_prompt(policy: &Policy) -> String {
@@ -319,6 +281,9 @@ pub(crate) mod test_support {
         fn approve(&mut self, _tool: &dyn Tool, _args: &Value) -> bool {
             self.approvals += 1;
             false
+        }
+        fn route(&mut self, to: &str, _model: &str, reason: &str) {
+            self.out.push_str(&format!("→{to}({reason})"));
         }
     }
 

@@ -183,6 +183,10 @@ impl Backend for ClaudeBackend {
         self.messages.push(json!({ "role": "user", "content": text }));
     }
 
+    fn push_assistant_text(&mut self, text: &str) {
+        self.messages.push(json!({ "role": "assistant", "content": [{ "type": "text", "text": text }] }));
+    }
+
     fn respond(&mut self, on: &mut dyn FnMut(Event)) -> Result<Reply> {
         let msg = self.client.stream(&self.request_body(), &self.betas(), on)?;
         self.usage.add(&msg.usage);
@@ -351,7 +355,7 @@ pub fn parse_sse(reader: impl BufRead, on: &mut dyn FnMut(Event)) -> Result<Mess
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{fake_server, orion, Recorder};
-    use super::super::{offered_tools, Session};
+    use super::super::{offered_tools, Mode, Provider, Session};
     use super::*;
 
     fn sse(events: &[Value]) -> String {
@@ -440,13 +444,13 @@ mod tests {
             "system".into(),
             &offered_tools(&orion),
         );
-        let mut session = Session::new(&orion, Box::new(backend));
+        let mut session = Session::with_backends(&orion, Mode::Claude, Some(Box::new(backend)), None);
         let mut ui = Recorder::default();
         session.turn("what machine is this?", &mut ui).unwrap();
 
         assert_eq!(ui.out, "[Checking the host.]<system_info><ok><fs_write><err>Done.");
         assert_eq!(ui.approvals, 1, "fs_write is `ask` by default");
-        let usage = session.backend.usage();
+        let usage = session.backend(Provider::Claude).unwrap().usage();
         assert_eq!((usage.input_tokens, usage.output_tokens), (400, 25));
 
         let (path, req1) = requests.recv().unwrap();
