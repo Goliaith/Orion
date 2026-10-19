@@ -92,7 +92,7 @@ pub struct Verdict {
 
 /// Judges whether a message needs Claude. Only ever shown messages that
 /// passed the privacy rules, and it must run on this machine.
-pub trait Classifier {
+pub trait Classifier: Send {
     /// The model doing the judging, for display.
     fn name(&self) -> String;
     /// `previous` is the last message and which model answered it.

@@ -544,7 +544,7 @@ fn summarize(call: &ToolCall, content: &str, is_error: bool) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use serde_json::{json, Value};
 
@@ -552,7 +552,7 @@ mod tests {
     use super::super::{Reply, Usage};
     use super::*;
 
-    type Log = Rc<RefCell<Vec<String>>>;
+    type Log = Arc<Mutex<Vec<String>>>;
 
     /// Replies from a script and logs every push.
     struct Scripted {
@@ -571,7 +571,7 @@ mod tests {
 
         fn note(&mut self, entry: String) {
             self.history.push(entry.clone());
-            self.log.borrow_mut().push(entry);
+            self.log.lock().unwrap().push(entry);
         }
     }
 
@@ -600,7 +600,7 @@ mod tests {
         }
         fn push_tool_results(&mut self, results: Vec<ToolResult>) {
             for r in results {
-                self.log.borrow_mut().push(format!("{} result: {}", self.name, if r.is_error { &r.content } else { "ok" }));
+                self.log.lock().unwrap().push(format!("{} result: {}", self.name, if r.is_error { &r.content } else { "ok" }));
             }
         }
         fn clear(&mut self) {
@@ -623,7 +623,7 @@ mod tests {
     }
 
     fn entries(log: &Log, prefix: &str) -> Vec<String> {
-        log.borrow().iter().filter(|l| l.starts_with(prefix)).cloned().collect()
+        log.lock().unwrap().iter().filter(|l| l.starts_with(prefix)).cloned().collect()
     }
 
     #[test]
@@ -686,7 +686,7 @@ mod tests {
 
         s.turn("remember my bank password is hunter2", &mut ui).unwrap();
         s.turn("refactor the backup script", &mut ui).unwrap();
-        assert!(log.borrow().iter().filter(|l| l.starts_with("claude")).all(|l| !l.contains("hunter2")));
+        assert!(log.lock().unwrap().iter().filter(|l| l.starts_with("claude")).all(|l| !l.contains("hunter2")));
 
         // The local model hears about Claude's turn, though.
         s.turn("@local all good?", &mut ui).unwrap();
@@ -702,7 +702,7 @@ mod tests {
         let mut ui = Recorder::default(); // declines confirmations
         s.turn("my password is hunter2", &mut ui).unwrap();
         assert!(ui.out.contains("!Not sent."));
-        assert!(log.borrow().is_empty());
+        assert!(log.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -837,7 +837,7 @@ mod tests {
         let mut ui = Recorder::default();
         s.turn("@claude show the key file", &mut ui).unwrap();
         s.turn("@local show the key file", &mut ui).unwrap();
-        let results: Vec<String> = log.borrow().iter().filter(|l| l.contains(" result: ")).cloned().collect();
+        let results: Vec<String> = log.lock().unwrap().iter().filter(|l| l.contains(" result: ")).cloned().collect();
         assert!(results[0].starts_with("claude result: ~/.ssh is private"), "{results:?}");
         // The local model gets past the guard (and then fails normally: no such file here).
         assert!(!results[1].contains("is private"), "{results:?}");

@@ -46,6 +46,7 @@ provider = "auto"               # auto: route each message; or always "claude" /
 max_tool_rounds = 50            # model calls per message before stopping
 show_reasoning = true           # reasoning and progress notes (Ctrl-O toggles)
 save_conversations = true       # save after every message; resume with --resume
+interface = "tui"               # tui (full screen) or plain (line by line); --plain
 
 # Claude. Needs ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN).
 [chat.claude]

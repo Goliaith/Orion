@@ -16,6 +16,7 @@ pub mod router;
 mod session;
 pub mod store;
 pub mod terminal;
+mod tui;
 
 pub use session::Session;
 
@@ -41,6 +42,9 @@ pub struct ChatConfig {
     pub show_reasoning: bool,
     /// Save conversations after every message so they can be resumed.
     pub save_conversations: bool,
+    /// `tui` (full screen) or `plain` (line by line). Plain is also used
+    /// whenever input or output is not a terminal.
+    pub interface: Interface,
     pub claude: claude::ClaudeConfig,
     pub local: local::LocalConfig,
     pub router: router::RouterConfig,
@@ -53,11 +57,20 @@ impl Default for ChatConfig {
             max_tool_rounds: 50,
             show_reasoning: true,
             save_conversations: true,
+            interface: Interface::Tui,
             claude: Default::default(),
             local: Default::default(),
             router: Default::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Interface {
+    #[default]
+    Tui,
+    Plain,
 }
 
 /// Where the model behind a message comes from.
@@ -144,7 +157,7 @@ pub struct Reply {
 /// A model and the conversation history in that model's own format. A
 /// backend appends its replies to the history itself, so the session never
 /// rewrites what the model said.
-pub trait Backend {
+pub trait Backend: Send {
     /// One line for the banner, such as the model and its settings.
     fn describe(&self) -> String;
     fn model(&self) -> String;

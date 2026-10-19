@@ -28,8 +28,19 @@ const HOTKEYS: &[(&str, &str)] = &[
     ("Ctrl-D", "quit"),
 ];
 
-struct Style {
-    on: bool,
+/// `println!` into a `String`, so command output can go to either interface.
+macro_rules! say {
+    ($out:expr) => {{
+        $out.push('\n');
+    }};
+    ($out:expr, $($arg:tt)*) => {{
+        use std::fmt::Write as _;
+        let _ = writeln!($out, $($arg)*);
+    }};
+}
+
+pub(super) struct Style {
+    pub(super) on: bool,
 }
 
 impl Style {
@@ -284,10 +295,14 @@ fn prompt(style: &Style, mode: Mode) -> String {
     }
 }
 
-/// Run the interactive chat until the user leaves. `mode` and `model`
-/// override the `[chat]` settings; `resume` continues a saved conversation
-/// (by id or id prefix; empty for the latest).
-pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Option<&str>) -> Result<()> {
+/// Connect, and resume a saved conversation if asked: what both
+/// interfaces do before their first message.
+pub(super) fn prepare<'a>(
+    orion: &'a Orion,
+    mode: Option<Mode>,
+    model: Option<&str>,
+    resume: Option<&str>,
+) -> Result<(Session<'a>, Saver, bool)> {
     let store = Store::default_location();
     let saved = match (resume, &store) {
         (Some(q), Some(store)) => Some(store.load(q)?),
@@ -316,6 +331,23 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Optio
         }
     }
     let saver = Saver { store: store.filter(|_| orion.policy().chat.save_conversations) };
+    Ok((session, saver, resumed))
+}
+
+/// Run the interactive chat until the user leaves: full screen when on a
+/// terminal (unless `plain`), else line by line. `mode` and `model`
+/// override the `[chat]` settings; `resume` continues a saved conversation
+/// (by id or id prefix; empty for the latest).
+pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Option<&str>, plain: bool) -> Result<()> {
+    let (session, saver, resumed) = prepare(orion, mode, model, resume)?;
+    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if tty && !plain && orion.policy().chat.interface == super::Interface::Tui {
+        return super::tui::run(orion, session, saver);
+    }
+    run_plain(orion, session, saver, resumed)
+}
+
+fn run_plain(orion: &Orion, mut session: Session, saver: Saver, resumed: bool) -> Result<()> {
     let mut term = Terminal::new();
     term.show_reasoning = orion.policy().chat.show_reasoning;
     let mut editor = DefaultEditor::new()?;
@@ -329,7 +361,9 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Optio
 
     banner(&term.style, orion, &session);
     if resumed {
-        recap(&term.style, &session);
+        let mut out = String::new();
+        recap(&term.style, &session, &mut out);
+        print!("{out}");
     }
     let mut restore: Option<(String, usize)> = None;
     let mut last_ctrl_c: Option<Instant> = None;
@@ -364,7 +398,10 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Optio
         }
         let _ = editor.add_history_entry(input);
         if let Some(cmd) = input.strip_prefix('/') {
-            if !command(cmd, orion, &mut session, &mut term, &saver) {
+            let mut out = String::new();
+            let keep_going = command(cmd, orion, &mut session, &term.style, &saver, &mut out);
+            print!("{out}");
+            if !keep_going {
                 break;
             }
             continue;
@@ -376,7 +413,9 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Optio
             println!("{}", term.style.red(&format!("error: {e:#}")));
         }
         interrupt::clear();
-        saver.save(&session, &term.style);
+        let mut out = String::new();
+        saver.save(&session, &term.style, &mut out);
+        print!("{out}");
         term.line_break();
         println!();
     }
@@ -390,27 +429,27 @@ pub fn run(orion: &Orion, mode: Option<Mode>, model: Option<&str>, resume: Optio
 }
 
 /// Saves the conversation after each change, if saving is on.
-struct Saver {
-    store: Option<Store>,
+pub(super) struct Saver {
+    pub(super) store: Option<Store>,
 }
 
 impl Saver {
-    fn save(&self, session: &Session, s: &Style) {
+    pub(super) fn save(&self, session: &Session, s: &Style, out: &mut String) {
         let (Some(store), Some(conv)) = (&self.store, session.snapshot()) else { return };
         if let Err(e) = store.save(&conv) {
-            println!("{}", s.red(&format!("  could not save the conversation: {e:#}")));
+            say!(out, "{}", s.red(&format!("  could not save the conversation: {e:#}")));
         }
     }
 }
 
-fn provider_label(p: Provider) -> &'static str {
+pub(super) fn provider_label(p: Provider) -> &'static str {
     match p {
         Provider::Claude => "claude",
         Provider::Local => "local",
     }
 }
 
-fn clip(text: &str, max: usize) -> String {
+pub(super) fn clip(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
         flat
@@ -420,25 +459,25 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 /// What a resumed conversation was about: its title and the last exchange.
-fn recap(s: &Style, session: &Session) {
+pub(super) fn recap(s: &Style, session: &Session, out: &mut String) {
     let turns = session.turns();
-    println!(
+    say!(out, 
         "{}",
         s.bold(&format!("Resumed “{}” · {} message{}", session.title(), turns.len(), if turns.len() == 1 { "" } else { "s" }))
     );
     for t in turns.iter().rev().take(2).rev() {
-        print_turn(s, t, 160);
+        print_turn(s, t, 160, out);
     }
-    println!();
+    say!(out);
 }
 
-fn print_turn(s: &Style, t: &Turn, max: usize) {
-    println!("  {} {}", s.dim("you:"), clip(&t.user, max));
+pub(super) fn print_turn(s: &Style, t: &Turn, max: usize, out: &mut String) {
+    say!(out, "  {} {}", s.dim("you:"), clip(&t.user, max));
     for tool in &t.tools {
-        println!("    {} {}", s.cyan("⚙"), s.dim(&clip(tool, max)));
+        say!(out, "    {} {}", s.cyan("⚙"), s.dim(&clip(tool, max)));
     }
     let reply = if t.reply.trim().is_empty() { "(no reply)" } else { &t.reply };
-    println!("  {} {}", s.dim(&format!("{}:", provider_label(t.provider))), clip(reply, max * 2));
+    say!(out, "  {} {}", s.dim(&format!("{}:", provider_label(t.provider))), clip(reply, max * 2));
 }
 
 /// `orion conversations`: list, show or delete saved conversations.
@@ -463,8 +502,9 @@ pub fn conversations(action: Option<(&str, &str)>) -> Result<()> {
                 s.dim(&format!("{} · started {} · {} messages", c.id, store::local_time(c.created_ms, "%Y-%m-%d %H:%M"), c.turns.len()))
             );
             for t in &c.turns {
-                println!();
-                print_turn(&s, t, 10_000);
+                let mut out = String::from("\n");
+                print_turn(&s, t, 10_000, &mut out);
+                print!("{out}");
             }
         }
         Some(("delete", id)) => println!("deleted {}", store.delete(id)?),
@@ -474,35 +514,44 @@ pub fn conversations(action: Option<(&str, &str)>) -> Result<()> {
 }
 
 fn hotkey(action: Hotkey, session: &mut Session, term: &mut Terminal) {
-    let s = &term.style;
     match action {
-        Hotkey::CycleMode => {
-            // Skip modes whose model can't be reached.
-            let mut mode = next_mode(session.mode);
-            let mut errors = Vec::new();
-            for _ in 0..3 {
-                match session.set_mode(mode) {
-                    Ok(()) => break,
-                    Err(e) => {
-                        errors.push(format!("{mode:?}: {}", format!("{e:#}").lines().next().unwrap_or_default()));
-                        mode = next_mode(mode);
-                    }
-                }
-            }
-            for e in errors {
-                println!("  {}", s.red(&format!("skipped {}", e.to_lowercase())));
-            }
-            println!("  {}", s.dim(&routing(session)));
-        }
+        Hotkey::CycleMode => print!("{}", cycle_mode(session, &term.style)),
         Hotkey::ToggleReasoning => {
             term.show_reasoning = !term.show_reasoning;
             let state = if term.show_reasoning { "shown" } else { "hidden" };
-            println!("  {}", s.dim(&format!("reasoning {state}")));
+            println!("  {}", term.style.dim(&format!("reasoning {state}")));
         }
     }
 }
 
-fn routing(session: &Session) -> String {
+/// Switch to the next routing mode, skipping modes whose model can't be
+/// reached; returns what to show.
+pub(super) fn cycle_mode(session: &mut Session, s: &Style) -> String {
+    let mut out = String::new();
+    let mut mode = next_mode(session.mode);
+    for _ in 0..3 {
+        match session.set_mode(mode) {
+            Ok(()) => break,
+            Err(e) => {
+                let why = format!("{e:#}");
+                say!(out, "  {}", s.red(&format!("skipped {}: {}", mode_label(mode), why.lines().next().unwrap_or_default())));
+                mode = next_mode(mode);
+            }
+        }
+    }
+    say!(out, "  {}", s.dim(&routing(session)));
+    out
+}
+
+pub(super) fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Auto => "auto",
+        Mode::Claude => "claude",
+        Mode::Local => "local",
+    }
+}
+
+pub(super) fn routing(session: &Session) -> String {
     match (session.mode, session.classifier_name()) {
         (Mode::Auto, Some(judge)) => format!("routing: auto (private → local; {judge} judges the rest)"),
         (Mode::Auto, None) => "routing: auto (private and simple → local, complex → Claude)".into(),
@@ -512,7 +561,7 @@ fn routing(session: &Session) -> String {
 }
 
 /// One line per provider: its model, or why it is missing.
-fn providers(s: &Style, session: &Session) -> Vec<String> {
+pub(super) fn providers(s: &Style, session: &Session) -> Vec<String> {
     [(Provider::Claude, "claude"), (Provider::Local, "local ")]
         .into_iter()
         .filter_map(|(p, label)| match (session.backend(p), session.backend_error(p)) {
@@ -543,8 +592,7 @@ fn banner(s: &Style, orion: &Orion, session: &Session) {
 }
 
 /// Handle a slash command; `false` means quit.
-fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal, saver: &Saver) -> bool {
-    let s = &term.style;
+pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style, saver: &Saver, out: &mut String) -> bool {
     let (name, arg) = cmd.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((cmd, ""));
     // `/model local qwen3:8b` names the provider; `/model qwen3:8b` means the current one.
     let (target, rest) = match arg.split_once(' ').unwrap_or((arg, "")) {
@@ -552,34 +600,28 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal,
         ("local", rest) => (Provider::Local, rest.trim()),
         _ => (session.current(), arg),
     };
-    let missing = |p: Provider| println!("  {}", s.red(&format!("no {} backend connected; try /use {}", router::name(p), match p {
-        Provider::Claude => "claude",
-        Provider::Local => "local",
-    })));
+    let missing = |p: Provider| s.red(&format!("no {} backend connected; try /use {}", router::name(p), provider_label(p)));
     match name {
         "exit" | "quit" | "q" => return false,
         "help" | "?" => {
-            println!("  @claude … / @local …    send one message to that model");
-            println!("  /use auto|claude|local  route automatically, or pin a model (the conversation carries over)");
-            println!("  /route <text>           show where a message would go (asks only the local judge)");
-            println!("  /model [claude|local] [id]  show or switch a model");
-            println!("  /models                 list the models the local server has");
-            println!("  /effort <level>         set Claude's effort: low, medium, high, xhigh, max");
-            println!("  /tools                  what the AI can do, and what needs your approval");
-            println!("  /usage                  tokens used this session");
-            println!("  /new                    start a new conversation (this one stays saved)");
-            println!("  /history                saved conversations, most recent first");
-            println!("  /resume <n|id>          continue a saved conversation");
-            println!("  /title <text>           rename this conversation");
-            println!("  /exit                   leave (Ctrl-D works too)");
-            println!();
-            for (key, what) in HOTKEYS {
-                println!("  {key:<23} {what}");
-            }
+            say!(out, "  @claude … / @local …    send one message to that model");
+            say!(out, "  /use auto|claude|local  route automatically, or pin a model (the conversation carries over)");
+            say!(out, "  /route <text>           show where a message would go (asks only the local judge)");
+            say!(out, "  /model [claude|local] [id]  show or switch a model");
+            say!(out, "  /models                 list the models the local server has");
+            say!(out, "  /effort <level>         set Claude's effort: low, medium, high, xhigh, max");
+            say!(out, "  /tools                  what the AI can do, and what needs your approval");
+            say!(out, "  /usage                  tokens used this session");
+            say!(out, "  /new                    start a new conversation (this one stays saved)");
+            say!(out, "  /history                saved conversations, most recent first");
+            say!(out, "  /resume <n|id>          continue a saved conversation");
+            say!(out, "  /title <text>           rename this conversation");
+            say!(out, "  /exit                   leave (Ctrl-D works too)");
+            say!(out, "  /keys                   the hotkeys");
         }
         "keys" => {
             for (key, what) in HOTKEYS {
-                println!("  {key:<14} {what}");
+                say!(out, "  {key:<14} {what}");
             }
         }
         "tools" => {
@@ -589,34 +631,34 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal,
                     Decision::Ask => s.yellow("ask  "),
                     Decision::Deny => s.red("deny "),
                 };
-                println!("  {d}  {:<12} {}", tool.name(), s.dim(tool.risk().as_str()));
+                say!(out, "  {d}  {:<12} {}", tool.name(), s.dim(tool.risk().as_str()));
             }
         }
         "model" if rest.is_empty() => {
-            println!("  {}", s.dim(&routing(session)));
-            providers(s, session).iter().for_each(|l| println!("{l}"));
+            say!(out, "  {}", s.dim(&routing(session)));
+            providers(s, session).iter().for_each(|l| say!(out, "{l}"));
         }
         "model" => match session.backend_mut(target) {
             Some(b) => {
                 b.set_model(rest);
-                println!("  {}", b.describe());
+                say!(out, "  {}", b.describe());
             }
-            None => missing(target),
+            None => say!(out, "  {}", missing(target)),
         },
         "effort" => match session.backend_mut(Provider::Claude) {
             Some(b) => match b.set_effort(arg) {
-                Ok(()) => println!("  {}", b.describe()),
-                Err(e) => println!("  {}", s.red(&e)),
+                Ok(()) => say!(out, "  {}", b.describe()),
+                Err(e) => say!(out, "  {}", s.red(&e)),
             },
-            None => missing(Provider::Claude),
+            None => say!(out, "  {}", missing(Provider::Claude)),
         },
         "models" => match session.backend(Provider::Local) {
             Some(b) => match b.list_models() {
-                Ok(models) if models.is_empty() => println!("  {}", s.dim("no models installed")),
-                Ok(models) => models.iter().for_each(|m| println!("  {m}")),
-                Err(e) => println!("  {}", s.red(&format!("{e:#}"))),
+                Ok(models) if models.is_empty() => say!(out, "  {}", s.dim("no models installed")),
+                Ok(models) => models.iter().for_each(|m| say!(out, "  {m}")),
+                Err(e) => say!(out, "  {}", s.red(&format!("{e:#}"))),
             },
-            None => missing(Provider::Local),
+            None => say!(out, "  {}", missing(Provider::Local)),
         },
         "use" => {
             let mode = match arg {
@@ -624,20 +666,20 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal,
                 "claude" => Mode::Claude,
                 "local" => Mode::Local,
                 _ => {
-                    println!("  {}", s.red("usage: /use auto | claude | local"));
+                    say!(out, "  {}", s.red("usage: /use auto | claude | local"));
                     return true;
                 }
             };
             match session.set_mode(mode) {
                 Ok(()) => {
-                    println!("  {}", s.dim(&routing(session)));
-                    providers(s, session).iter().for_each(|l| println!("{l}"));
+                    say!(out, "  {}", s.dim(&routing(session)));
+                    providers(s, session).iter().for_each(|l| say!(out, "{l}"));
                 }
-                Err(e) => println!("  {}", s.red(&format!("{e:#}"))),
+                Err(e) => say!(out, "  {}", s.red(&format!("{e:#}"))),
             }
         }
-        "route" if arg.is_empty() => println!("  {}", s.red("usage: /route <message>")),
-        "route" => println!("  → {}", session.explain_route(arg)),
+        "route" if arg.is_empty() => say!(out, "  {}", s.red("usage: /route <message>")),
+        "route" => say!(out, "  → {}", session.explain_route(arg)),
         "usage" => {
             for (p, label) in [(Provider::Claude, "claude"), (Provider::Local, "local")] {
                 let Some(b) = session.backend(p) else { continue };
@@ -646,36 +688,36 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal,
                 if u.cache_read_input_tokens + u.cache_creation_input_tokens > 0 {
                     line += &format!(" · cache read {} · cache write {}", u.cache_read_input_tokens, u.cache_creation_input_tokens);
                 }
-                println!("{line}");
+                say!(out, "{line}");
             }
         }
         "clear" | "new" => {
             session.clear();
-            println!("  {}", s.dim("new conversation"));
+            say!(out, "  {}", s.dim("new conversation"));
         }
-        "title" if arg.is_empty() => println!("  {}", session.title()),
+        "title" if arg.is_empty() => say!(out, "  {}", session.title()),
         "title" => {
             session.set_title(arg);
-            saver.save(session, s);
-            println!("  {}", s.dim(&format!("title → {}", session.title())));
+            saver.save(session, s, out);
+            say!(out, "  {}", s.dim(&format!("title → {}", session.title())));
         }
         "history" => match &saver.store {
-            None => println!("  {}", s.dim("saving is off (chat.save_conversations)")),
+            None => say!(out, "  {}", s.dim("saving is off (chat.save_conversations)")),
             Some(store) => match store.list() {
-                Ok(all) if all.is_empty() => println!("  {}", s.dim("no saved conversations yet")),
+                Ok(all) if all.is_empty() => say!(out, "  {}", s.dim("no saved conversations yet")),
                 Ok(all) => {
                     for (i, c) in all.iter().take(20).enumerate() {
                         let here = if c.id == session.id() { s.green(" ← this one") } else { String::new() };
-                        println!("  {:>2}. {:<44} {}{here}", i + 1, clip(&c.title, 44), s.dim(&format!("{} · {} msg", store::ago(c.updated_ms), c.turns)));
+                        say!(out, "  {:>2}. {:<44} {}{here}", i + 1, clip(&c.title, 44), s.dim(&format!("{} · {} msg", store::ago(c.updated_ms), c.turns)));
                     }
-                    println!("  {}", s.dim("/resume <number> continues one"));
+                    say!(out, "  {}", s.dim("/resume <number> continues one"));
                 }
-                Err(e) => println!("  {}", s.red(&format!("{e:#}"))),
+                Err(e) => say!(out, "  {}", s.red(&format!("{e:#}"))),
             },
         },
         "resume" => {
             let Some(store) = &saver.store else {
-                println!("  {}", s.dim("saving is off (chat.save_conversations)"));
+                say!(out, "  {}", s.dim("saving is off (chat.save_conversations)"));
                 return true;
             };
             // A number picks from /history; anything else is an id (prefix).
@@ -686,19 +728,19 @@ fn command(cmd: &str, orion: &Orion, session: &mut Session, term: &mut Terminal,
             match query.map(|q| store.load(&q)) {
                 Some(Ok(conv)) => {
                     session.restore(conv);
-                    recap(s, session);
+                    recap(s, session, out);
                 }
-                Some(Err(e)) => println!("  {}", s.red(&format!("{e:#}"))),
-                None => println!("  {}", s.red("no conversation with that number; see /history")),
+                Some(Err(e)) => say!(out, "  {}", s.red(&format!("{e:#}"))),
+                None => say!(out, "  {}", s.red("no conversation with that number; see /history")),
             }
         }
-        _ => println!("  {}", s.red(&format!("unknown command /{cmd}; try /help"))),
+        _ => say!(out, "  {}", s.red(&format!("unknown command /{cmd}; try /help"))),
     }
     true
 }
 
 /// Arguments for an approval prompt: pretty JSON with long strings shortened.
-fn preview(args: &Value) -> String {
+pub(super) fn preview(args: &Value) -> String {
     fn shorten(v: &Value) -> Value {
         match v {
             Value::String(s) if s.len() > 400 => Value::String(format!("{}… ({} bytes)", truncate(s, 400), s.len())),
@@ -710,7 +752,7 @@ fn preview(args: &Value) -> String {
     serde_json::to_string_pretty(&shorten(args)).unwrap_or_default()
 }
 
-fn summary(input: &Value, max: usize) -> String {
+pub(super) fn summary(input: &Value, max: usize) -> String {
     match input {
         Value::Object(o) if o.is_empty() => String::new(),
         _ => truncate(&input.to_string(), max),

@@ -51,6 +51,12 @@ pub fn install() {
     }
 }
 
+/// Ask running work to stop, as Ctrl-C does. For interfaces that read
+/// Ctrl-C as a key (raw mode) rather than receiving SIGINT.
+pub fn request() {
+    SIGNALLED.store(true, Ordering::SeqCst);
+}
+
 pub fn requested() -> bool {
     SIGNALLED.load(Ordering::SeqCst) || test_flag::get()
 }

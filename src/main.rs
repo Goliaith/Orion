@@ -47,6 +47,9 @@ enum Cmd {
         /// Use this model instead of the configured one (with --claude or --local).
         #[arg(long)]
         model: Option<String>,
+        /// Line-by-line chat instead of the full-screen interface.
+        #[arg(long)]
+        plain: bool,
         /// Continue a saved conversation: the latest, or the one with this id (or id prefix).
         #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
         resume: Option<String>,
@@ -89,14 +92,14 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Cmd::Chat { local, claude, auto, model, resume } => {
+        Cmd::Chat { local, claude, auto, model, plain, resume } => {
             let mode = match (local, claude, auto) {
                 (true, _, _) => Some(Mode::Local),
                 (_, true, _) => Some(Mode::Claude),
                 (_, _, true) => Some(Mode::Auto),
                 _ => None,
             };
-            terminal::run(&Orion::new(policy), mode, model.as_deref(), resume.as_deref())
+            terminal::run(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), plain)
         }
         Cmd::Conversations { action } => terminal::conversations(match &action {
             None | Some(ConversationCmd::List) => None,

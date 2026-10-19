@@ -41,6 +41,13 @@ impl Tool for SystemInfo {
 
     fn call(&self, _policy: &Policy, args: Value) -> Result<Value> {
         let NoArgs {} = parse_args(args)?;
+        Ok(info())
+    }
+}
+
+/// What `system_info` reports.
+pub fn info() -> Value {
+    {
         let os = fs::read_to_string("/etc/os-release").ok().and_then(|s| {
             s.lines()
                 .find_map(|l| l.strip_prefix("PRETTY_NAME="))
@@ -64,7 +71,7 @@ impl Tool for SystemInfo {
             .unwrap_or_default();
         let uptime_secs = read_trim("/proc/uptime")
             .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
-        Ok(json!({
+        json!({
             "hostname": read_trim("/proc/sys/kernel/hostname"),
             "os": os,
             "kernel": read_trim("/proc/sys/kernel/osrelease"),
@@ -76,7 +83,7 @@ impl Tool for SystemInfo {
             "memory_kb": { "total": mem_kb("MemTotal"), "available": mem_kb("MemAvailable") },
             "load_average": load,
             "uptime_secs": uptime_secs,
-        }))
+        })
     }
 }
 
@@ -102,8 +109,13 @@ impl Tool for GpuInfo {
 
     fn call(&self, _policy: &Policy, args: Value) -> Result<Value> {
         let NoArgs {} = parse_args(args)?;
-        Ok(json!({ "devices": drm_devices(), "nvidia": nvidia_smi() }))
+        Ok(gpus())
     }
+}
+
+/// What `gpu_info` reports.
+pub fn gpus() -> Value {
+    json!({ "devices": drm_devices(), "nvidia": nvidia_smi() })
 }
 
 /// Cards under /sys/class/drm, identified by PCI vendor.

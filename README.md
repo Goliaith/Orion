@@ -80,6 +80,43 @@ Firefox is using 3.1 GB of your 16 GB. I wrote the details to ~/orion-workspace/
 
 `ANTHROPIC_AUTH_TOKEN` (an OAuth access token) also works in place of an API key.
 
+### Full-screen interface
+
+On a terminal, `orion chat` opens full screen:
+
+```
+┌ Orion · why is my machine slow? save a note ───────────────────────────────────┐┌ Machine ─────────────────────────┐
+│you     why is my machine slow? save a note                                     ││ vm                               │
+│        → Claude (claude-opus-5-5) · qwen3:8b: needs root-cause reasoning (0.3s)││ Ubuntu 24.04.5 LTS               │
+│        I'll check the hardware and what's using memory.                        ││ CPU  ██░░░░░░░░  18% ·4c         │
+│        ⚙ system_info   ✓ 0ms                                                   ││ RAM  ██████░░░░ 9.1/16G          │
+│        ⚙ proc_list {"limit":5,"sort":"memory"}  ✓ 4ms                          ││ GPU0 RTX 4070                    │
+│        ⚙ fs_write {"content":"4 cores, 16 GB RAM\n","create_dirs"…  ✓ 0ms      ││  use ████░░░░░░  42% 61°C        │
+│        ┌─ Approve fs_write?                                                    ││  mem ███░░░░░░░ 3.1/12G          │
+│        │ { "path": "~/orion-workspace/notes.txt", … }                          ││ Routing                          │
+│        └─ approved                                                             ││ auto (private → local; qwen3:8b  │
+│claude  This is a 4-core Xeon VM with 16 GB of RAM, mostly idle. I saved a note ││ judges the rest)                 │
+│        to ~/orion-workspace/notes.txt.                                         ││ claude claude-opus-5-5 · effor…  │
+│                                                                                ││ local  qwen3:8b · local at htt…  │
+│                                                                                ││ Session                          │
+│                                                                                ││ claude in 6.2k · out 150         │
+└────────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────┘
+┌ message · Enter sends · Alt-Enter new line ────────────────────────────────────────────────────────────────────────┐
+│›                                                                                                                   │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ AUTO   Shift-Tab routing · Ctrl-O reasoning · Ctrl-B panel · PgUp/PgDn scroll · /keys · Ctrl-D quit
+```
+
+- **The conversation:** your messages, routing decisions, reasoning (dimmed), every tool call with a live status (`…`, then `✓ 12ms` or `✗` with the error), and replies. Code blocks are highlighted.
+- **Approvals appear as cards** in the conversation, and you answer them with `y`, `n` or `a` (always, for this session).
+- **The machine panel** (Ctrl-B) shows live CPU and RAM, each NVIDIA GPU's load, VRAM and temperature, which models are connected and how routing works, and token use per model. It reads the machine directly, so polling never fills the audit log.
+- **The screen stays live while the AI works.** The conversation runs on its own thread, so you can scroll, read, or type your next message ahead. It sends when the AI is done.
+- **The status bar** shows the routing mode, a spinner while working, and the key hints.
+- **Keys:** the [hotkeys](#hotkeys) below work the same here. Also Ctrl-B (the panel), PgUp/PgDn or the mouse wheel (scroll; End jumps back to the latest), and Ctrl-J or Alt-Enter (new line). Pasted text keeps its line breaks. The mouse is captured for scrolling; hold Shift to select text in most terminals.
+- **Resuming** shows the whole earlier conversation above a "resumed" divider.
+
+`orion chat --plain`, or `interface = "plain"` under `[chat]`, keeps the line-by-line chat, and it's used automatically when input or output isn't a terminal. Both interfaces share the same session, commands and keys.
+
 ### Saved conversations
 
 Every conversation is saved after each message, so closing the terminal (or a crash) loses nothing:
@@ -258,7 +295,9 @@ src/
     local.rs    local backend: OpenAI-compatible chat completions (Ollama, llama.cpp, vLLM, LM Studio)
     http.rs     shared HTTP: retries, proxy rules, error bodies, SSE lines
     store.rs    saved conversations: atomic, private JSON files
-    terminal.rs the interactive terminal UI, hotkeys, `orion conversations`
+    terminal.rs the line-by-line chat, shared commands, `orion conversations`
+    tui/        the full-screen chat: screen and keys (mod.rs), the conversation's
+                thread (agent.rs), the message editor (input.rs)
   interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
 tests/stdio.rs  end-to-end MCP session against the real binary
 ```
@@ -271,4 +310,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. **System daemon.** Run `oriond` as a systemd service on a Unix socket, with `orion serve` as a thin stdio bridge, so many agents share one policy and one log.
 3. **Isolation.** Run `proc_run` inside namespaces, cgroups and seccomp (or Landlock), with CPU, memory and GPU limits per call.
 4. **Richer machine model.** Add services (systemd), packages, network, GPU scheduling and model or runtime management (local inference servers, VRAM budgeting).
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O) and ~~saved conversations~~ are done too. Still to come: a full-screen TUI, voice, and a graphical shell.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~ and ~~a full-screen TUI~~ are done too. Still to come: voice and a graphical shell.

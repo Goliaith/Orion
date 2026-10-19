@@ -6,6 +6,10 @@ mod system;
 
 use crate::tool::Tool;
 
+/// Machine and GPU readings for status displays. Unlike the tools, these
+/// bypass the policy and audit log, so a UI can poll them.
+pub use system::{gpus as gpu_status, info as machine_info};
+
 pub fn builtin() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(system::SystemInfo),
