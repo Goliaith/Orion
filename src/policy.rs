@@ -10,6 +10,9 @@ use crate::tool::Risk;
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
     Allow,
+    /// Allowed only if a human approves the call when it is made. With no
+    /// human present (`orion serve`), this acts as `deny`.
+    Ask,
     Deny,
 }
 
@@ -17,6 +20,7 @@ impl Decision {
     pub fn as_str(self) -> &'static str {
         match self {
             Decision::Allow => "allow",
+            Decision::Ask => "ask",
             Decision::Deny => "deny",
         }
     }
@@ -33,7 +37,7 @@ pub struct Defaults {
 
 impl Default for Defaults {
     fn default() -> Self {
-        Self { read: Decision::Allow, write: Decision::Deny, execute: Decision::Deny }
+        Self { read: Decision::Allow, write: Decision::Ask, execute: Decision::Ask }
     }
 }
 
@@ -42,7 +46,8 @@ impl Default for Defaults {
 pub struct FsPolicy {
     /// Trees the AI may read. Write roots are readable too.
     pub read_roots: Vec<PathBuf>,
-    /// Trees the AI may write.
+    /// Trees the AI may write. Writing still needs approval unless `fs_write`
+    /// is set to `allow`.
     pub write_roots: Vec<PathBuf>,
     /// Upper bound on a single `fs_read`.
     pub max_read_bytes: u64,
@@ -50,15 +55,20 @@ pub struct FsPolicy {
 
 impl Default for FsPolicy {
     fn default() -> Self {
-        Self { read_roots: vec![PathBuf::from("~")], write_roots: Vec::new(), max_read_bytes: 1 << 20 }
+        Self {
+            read_roots: vec![PathBuf::from("~")],
+            write_roots: vec![PathBuf::from("~/orion-workspace")],
+            max_read_bytes: 1 << 20,
+        }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProcPolicy {
-    /// Programs `proc_run` may start, matched exactly against `command`.
-    /// `"*"` allows any program.
+    /// Pre-approved programs, matched exactly against `command`; `"*"` matches
+    /// any. When `proc_run` is `allow`, only these run. When it is `ask`, these
+    /// run without a prompt and anything else needs approval.
     pub allowed_commands: Vec<String>,
     pub timeout_secs: u64,
     /// Per stream (stdout and stderr are capped separately).
@@ -99,6 +109,8 @@ pub struct Policy {
     pub fs: FsPolicy,
     pub proc: ProcPolicy,
     pub audit: AuditPolicy,
+    /// Settings for the `orion chat` front-end.
+    pub chat: crate::chat::ChatConfig,
 }
 
 impl Policy {
@@ -256,7 +268,7 @@ mod tests {
         assert_eq!(p.decide("fs_write", Risk::Write), Decision::Allow);
         assert_eq!(p.decide("system_info", Risk::Read), Decision::Deny);
         assert_eq!(p.decide("fs_read", Risk::Read), Decision::Allow);
-        assert_eq!(p.decide("proc_run", Risk::Execute), Decision::Deny);
+        assert_eq!(p.decide("proc_run", Risk::Execute), Decision::Ask);
     }
 
     #[test]

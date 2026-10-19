@@ -1,8 +1,8 @@
 //! Model Context Protocol server: newline-delimited JSON-RPC 2.0 over stdio.
 //!
-//! Only the tools capability is implemented. Tools the policy denies are left
-//! out of `tools/list`, so the model is never offered something it cannot
-//! use. Calling one anyway returns an error result.
+//! Only the tools capability is implemented. There is no human to answer
+//! approval prompts here, so only `allow` tools are listed; `ask` and `deny`
+//! tools are left out, and calling one anyway returns an error result.
 
 use std::io::{BufRead, Write};
 
@@ -19,7 +19,8 @@ pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05
 
 const INSTRUCTIONS: &str = "Orion exposes this Linux machine as tools. A local policy governs every call \
 and every call is audited. File paths must be absolute or start with ~/. proc_run runs a single program \
-without a shell. If a tool is missing from the list, the policy has disabled it.";
+without a shell. If a tool is missing from the list, the policy has disabled it or requires interactive \
+approval, which is only available in `orion chat`.";
 
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -122,7 +123,7 @@ impl Server {
             return Err((INVALID_PARAMS, "missing tool name".into()));
         };
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-        match self.orion.call(name, args) {
+        match self.orion.call(name, args, None) {
             Ok(value) => {
                 let text = serde_json::to_string_pretty(&value).unwrap_or_default();
                 Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": false }))

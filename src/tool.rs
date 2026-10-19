@@ -39,6 +39,27 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the `arguments` object.
     fn input_schema(&self) -> Value;
     fn call(&self, policy: &Policy, args: Value) -> Result<Value>;
+
+    /// Whether the policy pre-approves this particular call, for tools whose
+    /// policy depends on their arguments (such as `proc_run`'s command list).
+    fn preapproval(&self, _policy: &Policy, _args: &Value) -> Preapproval {
+        Preapproval::NotApplicable
+    }
+
+    /// Hard checks that no approval can override (such as path scopes). They
+    /// run before the user is asked, so nobody approves a call that would fail.
+    fn precheck(&self, _policy: &Policy, _args: &Value) -> Result<()> {
+        Ok(())
+    }
+}
+
+pub enum Preapproval {
+    /// The tool has no per-call rule; the tool-level decision stands.
+    NotApplicable,
+    /// Runs under `allow` or `ask` without a prompt.
+    Granted,
+    /// Refused under `allow`; under `ask` a human can still approve it.
+    Refused(String),
 }
 
 /// Deserialize tool arguments; a missing/null argument object counts as `{}`.

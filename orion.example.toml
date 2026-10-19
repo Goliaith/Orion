@@ -2,35 +2,49 @@
 # ORION_CONFIG). Every key is optional; the values shown are the defaults
 # unless noted otherwise.
 
-# What happens to tools that have no entry under [tools], by risk level.
+# What happens to tools that have no entry under [tools], by risk level:
+#   allow  run without asking
+#   ask    stop and ask you first (in `orion chat` / `orion call`); with no
+#          human present (`orion serve`) this acts as deny
+#   deny   never; the tool is not even offered to the AI
 [defaults]
 read = "allow"      # observe the machine
-write = "deny"      # change files
-execute = "deny"    # run programs
+write = "ask"       # change files
+execute = "ask"     # run programs
 
-# Per-tool overrides. Denied tools are hidden from the AI entirely.
-# Run `orion tools` to see the result.
+# Per-tool overrides. Run `orion tools` to see the result.
 [tools]
 # fs_write = "allow"
-# proc_run = "allow"
+# proc_run = "deny"
 # gpu_info = "deny"
 
 [fs]
 # Trees the AI may read (write roots are readable too).
 read_roots = ["~"]
-# Trees the AI may write. Empty by default; for example:
-write_roots = []
-# write_roots = ["~/orion-workspace"]
+# Trees the AI may write. This is a hard limit: approving a write outside
+# these roots is not possible.
+write_roots = ["~/orion-workspace"]
 max_read_bytes = 1048576
 
 [proc]
-# Programs proc_run may start, matched exactly against the requested command.
-# "*" allows anything. Empty by default.
+# Pre-approved programs, matched exactly against the requested command
+# ("*" matches any). With proc_run = "ask", these run without a prompt and
+# anything else asks you. With proc_run = "allow", only these run at all.
 allowed_commands = []
-# allowed_commands = ["git", "python3", "nvidia-smi", "ls", "uname"]
+# allowed_commands = ["uname", "df", "free", "nvidia-smi", "git"]
 timeout_secs = 30
 max_output_bytes = 65536   # per stream
 
 [audit]
 enabled = true
 # path = "~/.local/state/orion/audit.jsonl"
+
+# The `orion chat` front-end. Needs ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN).
+[chat]
+model = "claude-opus-5-5"
+effort = "high"                 # low, medium, high, xhigh, max
+max_tokens = 64000
+thinking_display = "updates"    # updates (progress notes), summarized, omitted
+fallbacks = true                # retry declined requests on another model
+max_tool_rounds = 50            # model calls per message before stopping
+base_url = "https://api.anthropic.com"   # ANTHROPIC_BASE_URL overrides

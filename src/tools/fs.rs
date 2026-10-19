@@ -187,6 +187,11 @@ impl Tool for FsWrite {
         })
     }
 
+    fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+        policy.check_write(path).map(drop)
+    }
+
     fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
         let a: WriteArgs = parse_args(args)?;
         let path = policy.check_write(&a.path)?;

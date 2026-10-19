@@ -5,8 +5,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use orion::chat::terminal::{self, PromptApprover};
 use orion::mcp::Server;
-use orion::{audit, Orion, Policy};
+use orion::{audit, Approver, Orion, Policy};
 
 #[derive(Parser)]
 #[command(name = "orion", version, about = "The AI interface layer of an AI-first Linux system")]
@@ -21,6 +22,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Talk to Claude in the terminal; it works on the machine through Orion's tools.
+    Chat,
     /// Serve the tools over MCP on stdin/stdout (this is what AI clients launch).
     Serve,
     /// Show every tool, its risk level, and what the policy decides for it.
@@ -54,6 +57,7 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Cmd::Chat => terminal::run(&Orion::new(policy)),
         Cmd::Serve => {
             let orion = Orion::new(policy);
             tracing::info!(
@@ -75,7 +79,8 @@ fn main() -> Result<()> {
         Cmd::Call { name, args } => {
             let args = serde_json::from_str(&args).context("arguments must be a JSON object")?;
             let orion = Orion::new(policy);
-            let value = orion.call(&name, args)?;
+            let approver = PromptApprover::new();
+            let value = orion.call(&name, args, approver.as_ref().map(|a| a as &dyn Approver))?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }

@@ -16,6 +16,8 @@ const MAX_LOGGED_STRING: usize = 512;
 pub struct Entry<'a> {
     pub tool: &'a str,
     pub decision: Decision,
+    /// The human's answer, for calls under `ask` that prompted one.
+    pub approved: Option<bool>,
     pub args: &'a Value,
     pub error: Option<String>,
     pub duration: Duration,
@@ -43,6 +45,7 @@ impl Audit {
             "ts_ms": ts_ms,
             "tool": entry.tool,
             "decision": entry.decision,
+            "approved": entry.approved,
             "ok": entry.error.is_none(),
             "error": entry.error,
             "duration_ms": entry.duration.as_millis(),
@@ -99,6 +102,7 @@ mod tests {
         audit.record(Entry {
             tool: "fs_write",
             decision: Decision::Deny,
+            approved: None,
             args: &args,
             error: Some("denied".into()),
             duration: Duration::from_millis(3),

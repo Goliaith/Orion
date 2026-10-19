@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::policy::Policy;
-use crate::tool::{parse_args, Risk, Tool};
+use crate::tool::{parse_args, Preapproval, Risk, Tool};
 
 pub struct ProcList;
 
@@ -153,8 +153,8 @@ impl Tool for ProcRun {
 
     fn description(&self) -> &'static str {
         "Run a program with arguments and capture its exit status, stdout and stderr. No shell is \
-         involved, so pipes, globs and redirects are not interpreted. The program must be listed in \
-         the policy's proc.allowed_commands. When it finishes or times out, its whole process group is killed."
+         involved, so pipes, globs and redirects are not interpreted. Programs outside the policy's \
+         proc.allowed_commands need the user's approval. When it finishes or times out, its whole process group is killed."
     }
 
     fn risk(&self) -> Risk {
@@ -176,13 +176,17 @@ impl Tool for ProcRun {
         })
     }
 
+    fn preapproval(&self, policy: &Policy, args: &Value) -> Preapproval {
+        let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
+        if policy.command_allowed(command) {
+            Preapproval::Granted
+        } else {
+            Preapproval::Refused(format!("{command:?} is not in proc.allowed_commands"))
+        }
+    }
+
     fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
         let a: RunArgs = parse_args(args)?;
-        ensure!(
-            policy.command_allowed(&a.command),
-            "{:?} is not in proc.allowed_commands",
-            a.command
-        );
         let mut cmd = Command::new(&a.command);
         cmd.args(&a.args)
             .stdin(if a.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -278,9 +282,10 @@ mod tests {
     }
 
     #[test]
-    fn runs_allowed_commands_only() {
+    fn captures_output() {
         let p = policy(r#"["sh"]"#);
-        assert!(ProcRun.call(&p, json!({ "command": "ls" })).is_err());
+        assert!(matches!(ProcRun.preapproval(&p, &json!({ "command": "ls" })), Preapproval::Refused(_)));
+        assert!(matches!(ProcRun.preapproval(&p, &json!({ "command": "sh" })), Preapproval::Granted));
 
         let r = ProcRun
             .call(&p, json!({ "command": "sh", "args": ["-c", "cat; echo err >&2; exit 3"], "stdin": "0123456789" }))
