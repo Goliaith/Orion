@@ -43,6 +43,19 @@ impl Transcriber {
         }
     }
 
+    /// Whether audio stays on this machine.
+    pub fn is_local(&self) -> bool {
+        match self {
+            Self::Http { http, .. } => {
+                let rest = http.base().split_once("://").map_or(http.base(), |(_, r)| r);
+                let host = rest.split('/').next().unwrap_or_default();
+                let host = host.strip_prefix('[').map_or_else(|| host.split(':').next().unwrap_or_default(), |h| h.split(']').next().unwrap_or_default());
+                host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            }
+            Self::Command(_) => true,
+        }
+    }
+
     /// The words in a WAV recording.
     pub fn transcribe(&self, wav: &[u8]) -> Result<String> {
         let raw = match self {

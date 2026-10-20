@@ -147,7 +147,7 @@ textarea::placeholder { color: var(--faint); }
 .spark polygon { fill: var(--accent-soft); }
 .kv { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; margin: 5px 0; }
 .kv span:first-child { color: var(--muted); } .kv span:last-child { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.kv.failed span { color: var(--bad) !important; } .kv .dot { color: var(--ok); font-weight: normal; }
+.kv.failed span { color: var(--bad) !important; } .kv .up { color: var(--ok); font-weight: normal; }
 .prov { display: flex; gap: 8px; align-items: baseline; font-size: 13px; margin: 6px 0; }
 .prov b { font-weight: 650; min-width: 52px; } .prov b.claude { color: var(--claude); } .prov b.local { color: var(--local); }
 .prov span { color: var(--muted); overflow-wrap: anywhere; } .prov span.bad { color: var(--bad); }
@@ -191,6 +191,7 @@ textarea::placeholder { color: var(--faint); }
       </div>
       <button class="icon" id="reasoning" title="Show reasoning (Alt+R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/></svg></button>
       <button class="icon" id="speak" title="Speak replies"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg></button>
+      <button class="icon" id="wake" title="Wake word (Alt+W)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8.5a6 6 0 1 1 11.2 3c-.9 1.5-2.2 2.3-2.7 3.6-.4 1.1-.3 2.4-1.3 3.4a3 3 0 0 1-4.7-.7"/><path d="M9.5 9a2.5 2.5 0 1 1 4.3 1.8c-.6.6-1.3 1-1.3 2"/></svg></button>
       <button class="icon" id="toggleRight" title="Machine panel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
     </header>
 
@@ -198,14 +199,14 @@ textarea::placeholder { color: var(--faint); }
 
     <div class="composer-wrap">
       <div class="composer">
-        <div class="listening hidden" id="listening"><span class="dot"></span><span id="voiceState">Listening</span><span class="meter" id="meter"></span><span id="secs"></span><span style="color:var(--faint)">pause to finish · Esc cancels</span></div>
+        <div class="listening hidden" id="listening"><span class="dot"></span><span id="voiceState">Listening</span><span class="meter" id="meter"></span><span id="secs"></span><span style="color:var(--faint)" id="voiceHint">pause to finish · Esc cancels</span></div>
         <div class="row">
           <textarea id="input" rows="1" placeholder="Ask Orion, or tell it what to do…" autofocus></textarea>
           <button class="icon mic" id="mic" title="Talk (Alt+T)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
           <button class="send" id="send" title="Send (Enter)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
         </div>
       </div>
-      <div class="hint">Enter sends · Shift+Enter new line · Esc stops · Alt+T talk · Alt+M routing · risky actions ask first</div>
+      <div class="hint">Enter sends · Shift+Enter new line · Esc stops · Alt+T talk · Alt+W wake word · Alt+M routing · risky actions ask first</div>
     </div>
   </main>
 
@@ -231,7 +232,7 @@ textarea::placeholder { color: var(--faint); }
 "use strict";
 const $ = (id) => document.getElementById(id);
 const col = $("col"), log = $("log"), input = $("input");
-const state = { busy: true, who: "claude", mode: "auto", cur: null, thinking: null, tool: null, cards: {}, cpu: [], id: null, mic: false, speech: false, speak: false, listening: false, empty: true };
+const state = { busy: true, who: "claude", mode: "auto", cur: null, thinking: null, tool: null, cards: {}, cpu: [], id: null, mic: false, speech: false, speak: false, listening: false, empty: true, wake: false, wakeState: "waiting", phrase: "orion" };
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 function inline(s) {
@@ -411,7 +412,7 @@ function machine(m) {
   }
   for (const v of m.other_gpus || []) html += `<div class="kv"><span>GPU</span><span>${esc(v)}</span></div>`;
   if (!html) html = `<div class="kv"><span>GPU</span><span>none found</span></div>`;
-  for (const [name, vram] of m.loaded || []) html += `<div class="kv"><span><b class="dot">●</b> ${esc(name)}</span><span>${(vram / 1024).toFixed(1)} GB</span></div>`;
+  for (const [name, vram] of m.loaded || []) html += `<div class="kv"><span><b class="up">●</b> ${esc(name)}</span><span>${(vram / 1024).toFixed(1)} GB</span></div>`;
   if (m.failed && m.failed.length) html += `<div class="kv failed"><span>Failed</span><span>${esc(m.failed.map(u => u.replace(/\.service$/, "")).join(", "))}</span></div>`;
   $("gpus").innerHTML = html;
 }
@@ -454,11 +455,40 @@ function voiceEv(ev) {
   box.classList.toggle("hidden", ev.state === "idle");
   mic.classList.toggle("live", state.listening);
   $("voiceState").textContent = ev.state === "transcribing" ? "Transcribing…" : "Listening";
+  $("voiceHint").textContent = "pause to finish · Esc cancels";
+  if (ev.state === "idle") state.wakeState = "waiting";
   if (ev.state === "listening") {
     const m = $("meter"); m._lv = (m._lv || []).concat(ev.level).slice(-16);
     m.innerHTML = m._lv.map(l => `<i style="height:${Math.max(2, l * 16)}px"></i>`).join("");
     $("secs").textContent = ev.secs + "s";
   } else { $("meter").innerHTML = ""; $("meter")._lv = []; $("secs").textContent = ""; }
+}
+// The wake listener: hearing a request shows in the same bar as talking.
+function wakeEv(ev) {
+  state.wake = ev.on; state.phrase = ev.phrase || state.phrase;
+  const b = $("wake");
+  b.classList.toggle("on", ev.on);
+  b.title = ev.on ? `Listening for "${state.phrase}" · click or Alt+W to stop` : "Wake word (Alt+W)";
+  if (state.listening) return;
+  const st = ev.on ? ev.state : "waiting";
+  if (st === state.wakeState && st === "waiting") return;
+  state.wakeState = st;
+  const box = $("listening");
+  box.classList.toggle("hidden", st === "waiting");
+  $("voiceState").textContent = st === "transcribing" ? "Transcribing…" : "Listening for your request";
+  $("voiceHint").textContent = st === "hearing" ? "pause to finish" : "";
+  $("secs").textContent = "";
+  if (st === "hearing" && ev.level != null) {
+    const m = $("meter"); m._lv = (m._lv || []).concat(ev.level).slice(-16);
+    m.innerHTML = m._lv.map(l => `<i style="height:${Math.max(2, l * 16)}px"></i>`).join("");
+  } else if (st !== "hearing") { $("meter").innerHTML = ""; $("meter")._lv = []; }
+}
+async function toggleWake() {
+  if (!state.mic) { toast("Voice input isn't set up: see /voice"); return; }
+  try {
+    await api("/api/voice", { action: state.wake ? "wake_off" : "wake_on" });
+    toast(state.wake ? "Wake word off" : `Say "${state.phrase}, …" to ask hands-free`);
+  } catch (e) { toast(e.message); }
 }
 async function talk() {
   if (!state.mic) { toast("Voice input isn't set up: see /voice"); return; }
@@ -472,7 +502,8 @@ function handle(ev) {
       document.body.classList.toggle("hide-reasoning", !ev.show_reasoning);
       $("reasoning").classList.toggle("on", ev.show_reasoning);
       $("speak").classList.toggle("on", ev.speak_replies);
-      $("mic").style.opacity = ev.mic ? 1 : .45;
+      $("mic").style.opacity = ev.mic ? 1 : .45; $("wake").style.opacity = ev.mic ? 1 : .45;
+      if (ev.wake_error) toast("Voice: can't listen for the wake phrase: " + ev.wake_error);
       welcome(); break;
     case "reset": welcome(); break;
     case "transcript": transcript(ev.turns); break;
@@ -494,6 +525,8 @@ function handle(ev) {
     case "voice": voiceEv(ev); break;
     case "heard": input.value = (input.value.trim() ? input.value.trim() + " " : "") + ev.text; autosize(); input.focus(); break;
     case "voice_error": toast("Voice: " + ev.text); break;
+    case "wake": wakeEv(ev); break;
+    case "wake_note": toast(ev.text); break;
     case "speaking": $("speak").title = ev.on ? "Speaking · click or Esc to stop" : "Speak replies"; break;
     case "speak_replies": state.speak = ev.on; $("speak").classList.toggle("on", ev.on); break;
   }
@@ -518,11 +551,13 @@ document.addEventListener("keydown", (e) => {
     else api("/api/stop").catch(() => {});
   }
   if (e.altKey && e.code === "KeyT") { e.preventDefault(); talk(); }
+  if (e.altKey && e.code === "KeyW") { e.preventDefault(); toggleWake(); }
   if (e.altKey && e.code === "KeyM") { e.preventDefault(); const order = ["auto", "claude", "local"]; setMode(order[(order.indexOf(state.mode) + 1) % 3]); }
   if (e.altKey && e.code === "KeyR") { e.preventDefault(); $("reasoning").click(); }
 });
 $("send").onclick = () => state.busy ? stop() : send();
 $("mic").onclick = talk;
+$("wake").onclick = toggleWake;
 $("new").onclick = () => { closeDrawers(); send("/new"); };
 $("mode").onclick = (e) => { const m = e.target.dataset && e.target.dataset.mode; if (m) setMode(m); };
 $("reasoning").onclick = () => { const on = document.body.classList.toggle("hide-reasoning"); $("reasoning").classList.toggle("on", !on); };

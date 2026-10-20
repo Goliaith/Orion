@@ -12,11 +12,12 @@ use anyhow::{bail, Context, Result};
 use super::{kill_group, shell, which, VoiceConfig};
 
 /// 100 ms of audio per measurement.
-const CHUNK_MS: u64 = 100;
+pub(crate) const CHUNK_MS: u64 = 100;
 /// Speech must last this long before a pause can end the recording, so a
 /// click or a cough does not.
-const MIN_SPEECH_MS: u64 = 300;
+pub(crate) const MIN_SPEECH_MS: u64 = 300;
 
+#[derive(Clone)]
 pub struct Recorder {
     command: String,
     rate: u32,
@@ -49,10 +50,28 @@ impl Recorder {
         self.command.split_whitespace().next().unwrap_or_default().to_string()
     }
 
-    pub fn start(&self) -> Result<Recording> {
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// The recorder process, writing raw PCM to its stdout.
+    pub fn spawn(&self) -> Result<Child> {
         let mut cmd = shell(&self.command);
         cmd.stdout(Stdio::piped());
-        let mut child = cmd.spawn().with_context(|| format!("starting {}", self.describe()))?;
+        cmd.spawn().with_context(|| format!("starting {}", self.describe()))
+    }
+
+    /// Like [`spawn`](Self::spawn), for a recorder that should never outlive
+    /// the calling thread (an always-open microphone).
+    pub(crate) fn spawn_tied(&self) -> Result<Child> {
+        let mut cmd = shell(&self.command);
+        cmd.stdout(Stdio::piped());
+        super::die_with_parent(&mut cmd);
+        cmd.spawn().with_context(|| format!("starting {}", self.describe()))
+    }
+
+    pub fn start(&self) -> Result<Recording> {
+        let mut child = self.spawn()?;
         let mut stdout = child.stdout.take().context("recorder has no stdout")?;
         let shared = Arc::new(Mutex::new(Capture::default()));
         let chunk_bytes = (self.rate as u64 * 2 * CHUNK_MS / 1000) as usize;
@@ -89,6 +108,22 @@ impl Recorder {
     }
 }
 
+/// Root-mean-square amplitude of a chunk.
+pub(crate) fn rms(chunk: &[i16]) -> f32 {
+    (chunk.iter().map(|&s| (s as f32).powi(2)).sum::<f32>() / chunk.len().max(1) as f32).sqrt()
+}
+
+/// A meter from 0 (-60 dBFS or quieter) to 1 (full scale).
+pub(crate) fn meter(rms: f32) -> f32 {
+    let db = 20.0 * (rms.max(1.0) / 32768.0).log10();
+    ((db + 60.0) / 60.0).clamp(0.0, 1.0)
+}
+
+/// Louder than this counts as speech: well above the room's noise.
+pub(crate) fn speech_threshold(noise_floor: Option<f32>) -> f32 {
+    (noise_floor.unwrap_or(0.0) * 3.0).max(300.0)
+}
+
 #[derive(Default)]
 struct Capture {
     samples: Vec<i16>,
@@ -113,17 +148,14 @@ impl Capture {
     }
 
     fn measure(&mut self, chunk: &[i16]) {
-        let rms = (chunk.iter().map(|&s| (s as f32).powi(2)).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
-        // A meter in dBFS from -60 (empty) to 0 (full).
-        let db = 20.0 * (rms.max(1.0) / 32768.0).log10();
-        self.level = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+        let rms = rms(chunk);
+        self.level = meter(rms);
         // The quietest of the first few chunks is the room's noise floor.
         self.chunks += 1;
         if self.chunks <= 3 {
             self.noise_floor = Some(self.noise_floor.map_or(rms, |f| f.min(rms)));
         }
-        let threshold = (self.noise_floor.unwrap_or(0.0) * 3.0).max(300.0);
-        if rms > threshold {
+        if rms > speech_threshold(self.noise_floor) {
             self.speech_ms += CHUNK_MS;
             self.silent_ms = 0;
         } else {

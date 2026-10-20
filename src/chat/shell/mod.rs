@@ -28,7 +28,7 @@ use super::machine::{watch_machine, Machine};
 use super::store::{self, Store};
 use super::terminal::{provider_label, Saver};
 use super::Session;
-use crate::voice::{Recording, VoiceIo};
+use crate::voice::{is_stop_request, spoken_answer, Recording, VoiceIo, WakeEvent, WakeState};
 use crate::{interrupt, Orion};
 
 const PAGE: &str = include_str!("shell.html");
@@ -72,6 +72,10 @@ struct Hub {
     voice: Mutex<VoiceIo>,
     listening: Mutex<Option<Recording>>,
     transcribing: AtomicBool,
+    /// A spoken request heard while the AI was busy, sent when it is done.
+    wake_queue: Mutex<Option<String>>,
+    /// Why wake listening didn't start, for pages that connect.
+    wake_error: Mutex<Option<String>>,
     show_reasoning: bool,
 }
 
@@ -102,6 +106,29 @@ impl Hub {
 
     fn voice<T>(&self, f: impl FnOnce(&mut VoiceIo) -> T) -> T {
         f(&mut self.voice.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Send a message as the user, as if typed.
+    fn start_turn(&self, text: String) {
+        self.voice(|v| v.hush());
+        self.set_busy(true);
+        self.broadcast(json!({ "type": "user", "text": text }), true);
+        self.send_agent(ToAgent::Turn(text));
+    }
+
+    fn wake_json(&self) -> Value {
+        self.voice(|v| {
+            json!({
+                "type": "wake",
+                "on": v.wake().is_some(),
+                "phrase": v.config.wake_phrase.trim(),
+                "state": match v.wake().map(|w| w.state()) {
+                    Some(WakeState::Hearing) => "hearing",
+                    Some(WakeState::Transcribing) => "transcribing",
+                    _ => "waiting",
+                },
+            })
+        })
     }
 }
 
@@ -175,6 +202,9 @@ fn relay(hub: &Hub, from_agent: Receiver<FromAgent>) {
                 // Prompts left unanswered when a turn ends are moot.
                 hub.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 hub.set_busy(false);
+                if let Some(text) = hub.wake_queue.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    hub.start_turn(text);
+                }
             }
             FromAgent::Quit => {}
         }
@@ -185,6 +215,7 @@ fn relay(hub: &Hub, from_agent: Receiver<FromAgent>) {
 /// transcript when done, and whether Orion is speaking.
 fn watch_voice(hub: &Hub, stop: &AtomicBool) {
     let mut was_speaking = false;
+    let mut wake_was = Value::Null;
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
         let finished = {
@@ -201,10 +232,92 @@ fn watch_voice(hub: &Hub, stop: &AtomicBool) {
         if finished {
             finish_listening(hub);
         }
+        watch_wake(hub, &mut wake_was);
         let speaking = hub.voice(|v| v.speaker.as_ref().is_ok_and(|s| s.is_speaking()));
         if speaking != was_speaking {
             was_speaking = speaking;
             hub.broadcast(json!({ "type": "speaking", "on": speaking }), false);
+        }
+    }
+}
+
+/// The wake listener: pause it while Ctrl-T style listening has the
+/// microphone, pass on its state, and act on what it heard.
+fn watch_wake(hub: &Hub, was: &mut Value) {
+    let recording = hub.listening.lock().unwrap_or_else(|e| e.into_inner()).is_some() || hub.transcribing.load(Ordering::SeqCst);
+    let (events, level) = hub.voice(|v| {
+        if let Some(w) = v.wake() {
+            w.set_paused(recording);
+        }
+        let level = v.wake().filter(|w| w.state() == WakeState::Hearing).map(|w| w.level());
+        (std::iter::from_fn(|| v.wake_event()).collect::<Vec<_>>(), level)
+    });
+    let now = hub.wake_json();
+    if now != *was || level.is_some() {
+        let mut ev = now.clone();
+        if let Some(l) = level {
+            ev["level"] = json!(l);
+        }
+        hub.broadcast(ev, false);
+        *was = now;
+    }
+    for ev in events {
+        on_wake(hub, ev);
+    }
+}
+
+fn on_wake(hub: &Hub, ev: WakeEvent) {
+    let note = |text: &str| hub.broadcast(json!({ "type": "wake_note", "text": text }), false);
+    match ev {
+        WakeEvent::Woke => {
+            hub.voice(|v| v.hush());
+        }
+        WakeEvent::NoRequest => note("Woke, but heard no request"),
+        WakeEvent::Failed(e) => {
+            hub.broadcast(json!({ "type": "voice_error", "text": format!("stopped listening for the wake phrase: {e}") }), false);
+            hub.broadcast(hub.wake_json(), false);
+        }
+        WakeEvent::Request(text) => {
+            hub.voice(|v| v.hush());
+            let approvals = hub.voice(|v| v.config.wake_approvals);
+            let pending = {
+                let mut p = hub.pending.lock().unwrap_or_else(|e| e.into_inner());
+                match spoken_answer(&text) {
+                    Some(yes) if !p.is_empty() && (approvals || !yes) => {
+                        let id = *p.keys().max().unwrap_or(&0);
+                        p.remove(&id).map(|prompt| (id, prompt, yes))
+                    }
+                    _ if !p.is_empty() => {
+                        drop(p);
+                        return note(&if spoken_answer(&text) == Some(true) {
+                            "Approve with the button: spoken approval is off (voice.wake_approvals)".to_string()
+                        } else {
+                            format!("Heard \"{text}\" · answer the prompt first")
+                        });
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((id, prompt, yes)) = pending {
+                match prompt {
+                    Pending::Approve(tx) => {
+                        let _ = tx.send(if yes { Answer::Yes } else { Answer::No });
+                    }
+                    Pending::Confirm(tx) => {
+                        let _ = tx.send(yes);
+                    }
+                }
+                hub.broadcast(json!({ "type": "answered", "id": id, "answer": if yes { "yes" } else { "no" } }), true);
+            } else if is_stop_request(&text) {
+                if hub.busy.load(Ordering::SeqCst) {
+                    interrupt::request();
+                }
+            } else if hub.busy.load(Ordering::SeqCst) {
+                *hub.wake_queue.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
+                note(&format!("Queued \"{text}\": it sends when the AI is done"));
+            } else {
+                hub.start_turn(text);
+            }
         }
     }
 }
@@ -264,6 +377,8 @@ pub(super) fn run(orion: &Orion, session: Session, saver: Saver, port: Option<u1
     let (agent_tx, from_agent) = mpsc::channel();
     let (machine_tx, machine_rx) = mpsc::channel::<Machine>();
     let stop = AtomicBool::new(false);
+    let mut voice = VoiceIo::new(&orion.policy().voice);
+    let wake_error = voice.support_wake().err();
     let hub = Arc::new(Hub {
         token,
         port,
@@ -275,8 +390,10 @@ pub(super) fn run(orion: &Orion, session: Session, saver: Saver, port: Option<u1
         busy: AtomicBool::new(true),
         pending: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
-        voice: Mutex::new(VoiceIo::new(&orion.policy().voice)),
+        voice: Mutex::new(voice),
         listening: Mutex::new(None),
+        wake_queue: Mutex::new(None),
+        wake_error: Mutex::new(wake_error),
         transcribing: AtomicBool::new(false),
         show_reasoning: orion.policy().chat.show_reasoning,
     });
@@ -374,6 +491,7 @@ fn post(hub: &Arc<Hub>, path: &str, body: &Value) -> (u16, Value) {
                 let out = hub.voice(|v| v.command(arg.trim()));
                 hub.broadcast(json!({ "type": "output", "text": format!("{text}\n{out}") }), true);
                 hub.broadcast(json!({ "type": "speak_replies", "on": hub.voice(|v| v.speak_replies) }), false);
+                hub.broadcast(hub.wake_json(), false);
                 return (200, ok);
             }
             if matches!(text.as_str(), "/exit" | "/quit" | "/q") {
@@ -446,6 +564,19 @@ fn post(hub: &Arc<Hub>, path: &str, body: &Value) -> (u16, Value) {
                 thread::spawn(move || finish_listening(&hub));
                 (200, ok)
             }
+            "wake_on" => match hub.voice(|v| v.wake_on()) {
+                Ok(_) => {
+                    hub.broadcast(hub.wake_json(), false);
+                    (200, ok)
+                }
+                Err(e) => (400, json!({ "error": e })),
+            },
+            "wake_off" => {
+                hub.voice(|v| v.wake_off());
+                *hub.wake_queue.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                hub.broadcast(hub.wake_json(), false);
+                (200, ok)
+            }
             "cancel" => {
                 if let Some(rec) = hub.listening.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     rec.cancel();
@@ -471,8 +602,11 @@ fn events(hub: &Hub, stream: &TcpStream) -> std::io::Result<()> {
     let speak_replies = hub.voice(|v| v.speak_replies);
     let mic = hub.voice(|v| v.recorder.is_ok() && v.transcriber.is_ok());
     let speech = hub.voice(|v| v.speaker.is_ok());
-    let hello = json!({ "type": "hello", "show_reasoning": hub.show_reasoning, "mic": mic, "speech": speech, "speak_replies": speak_replies });
+    let wake_error = hub.wake_error.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let hello = json!({ "type": "hello", "show_reasoning": hub.show_reasoning, "mic": mic, "speech": speech,
+                        "speak_replies": speak_replies, "wake_error": wake_error });
     http::event(stream, &hello.to_string())?;
+    http::event(stream, &hub.wake_json().to_string())?;
     for snapshot in [&hub.status, &hub.machine] {
         if let Some(s) = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             http::event(stream, &s)?;
@@ -516,6 +650,8 @@ mod tests {
             voice: Mutex::new(VoiceIo::new(&VoiceConfig { enabled: false, ..Default::default() })),
             listening: Mutex::new(None),
             transcribing: AtomicBool::new(false),
+            wake_queue: Mutex::new(None),
+            wake_error: Mutex::new(None),
             show_reasoning: true,
         };
         (Arc::new(hub), rx)

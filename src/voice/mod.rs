@@ -9,6 +9,7 @@
 pub mod record;
 pub mod speak;
 pub mod transcribe;
+pub mod wake;
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -18,6 +19,7 @@ use serde::Deserialize;
 pub use record::{Recorder, Recording};
 pub use speak::{Sentences, Speaker};
 pub use transcribe::Transcriber;
+pub use wake::{is_stop_request, spoken_answer, WakeEvent, WakeListener, WakeState};
 
 /// `[voice]` in orion.toml.
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +61,25 @@ pub struct VoiceConfig {
     pub play_command: String,
     /// Environment variable with a bearer token, for servers that want one.
     pub api_key_env: String,
+    /// Listen for the wake phrase from the start (`/voice wake on|off`,
+    /// Alt-W). Only in the full-screen chat and the shell.
+    pub wake: bool,
+    /// Said at the start of a request: "Orion, …", "hey Orion, …".
+    pub wake_phrase: String,
+    /// Other spellings the transcriber writes for the phrase.
+    pub wake_aliases: Vec<String>,
+    /// A wake-word detector to use instead of transcribing: a shell command
+    /// that prints a line each time it hears the word.
+    pub wake_command: String,
+    /// Play a chime when woken without a request.
+    pub wake_chime: bool,
+    /// How long to wait for the request after a bare wake phrase.
+    pub wake_timeout_secs: u64,
+    /// Allow wake listening with a transcriber on another machine, which
+    /// then hears everything said near the microphone.
+    pub wake_allow_remote: bool,
+    /// Let "Orion, yes" approve a tool call. "No" always declines.
+    pub wake_approvals: bool,
 }
 
 impl Default for VoiceConfig {
@@ -82,6 +103,14 @@ impl Default for VoiceConfig {
             speak_voice: "af_heart".into(),
             play_command: String::new(),
             api_key_env: String::new(),
+            wake: false,
+            wake_phrase: "orion".into(),
+            wake_aliases: Vec::new(),
+            wake_command: String::new(),
+            wake_chime: true,
+            wake_timeout_secs: 8,
+            wake_allow_remote: false,
+            wake_approvals: false,
         }
     }
 }
@@ -95,6 +124,11 @@ pub struct VoiceIo {
     pub speaker: Result<Speaker, String>,
     pub speak_replies: bool,
     sentences: Sentences,
+    /// Listening for the wake phrase, when on.
+    wake: Option<WakeListener>,
+    /// Whether this interface handles wake events (the line-by-line chat
+    /// can't take input while it waits at its prompt).
+    wake_supported: bool,
 }
 
 impl VoiceIo {
@@ -107,7 +141,53 @@ impl VoiceIo {
             speak_replies: config.speak_replies,
             config: config.clone(),
             sentences: Sentences::default(),
+            wake: None,
+            wake_supported: false,
         }
+    }
+
+    /// For interfaces that handle wake events: allow wake listening, and
+    /// start it if the policy says so. An error explains why it didn't start.
+    pub fn support_wake(&mut self) -> Result<(), String> {
+        self.wake_supported = true;
+        if self.config.enabled && self.config.wake {
+            self.wake_on().map(drop)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Start listening for the wake phrase; returns what to say.
+    pub fn wake_on(&mut self) -> Result<String, String> {
+        if !self.wake_supported {
+            return Err("wake listening works in the full-screen chat and in the shell".into());
+        }
+        if self.wake.as_ref().is_some_and(|w| w.state() != WakeState::Stopped) {
+            return Ok(self.wake.as_ref().map(|w| w.describe().to_string()).unwrap_or_default());
+        }
+        let recorder = self.recorder.clone()?;
+        let transcriber = self.transcriber.clone().map_err(|e| format!("can't transcribe: {e}"))?;
+        let w = WakeListener::start(&self.config, recorder, transcriber).map_err(|e| format!("{e:#}"))?;
+        let what = w.describe().to_string();
+        self.wake = Some(w);
+        Ok(what)
+    }
+
+    pub fn wake_off(&mut self) {
+        self.wake = None;
+    }
+
+    pub fn wake(&self) -> Option<&WakeListener> {
+        self.wake.as_ref()
+    }
+
+    /// The next wake event, if any. A listener that failed is turned off.
+    pub fn wake_event(&mut self) -> Option<WakeEvent> {
+        let ev = self.wake.as_ref()?.try_event();
+        if matches!(ev, Some(WakeEvent::Failed(_))) {
+            self.wake = None;
+        }
+        ev
     }
 
     /// Feed streamed reply text; complete sentences are spoken if replies
@@ -154,6 +234,14 @@ impl VoiceIo {
                 self.hush();
                 "  replies are silent".into()
             }
+            ["wake", "on"] => match self.wake_on() {
+                Ok(what) => format!("  listening for the wake phrase: {what}"),
+                Err(e) => format!("  can't listen for the wake phrase: {e}"),
+            },
+            ["wake", "off"] => {
+                self.wake_off();
+                "  stopped listening for the wake phrase".into()
+            }
             ["test"] => match &self.speaker {
                 Ok(s) => {
                     s.say("Orion's voice is working.");
@@ -174,12 +262,32 @@ impl VoiceIo {
                         "  replies      {}",
                         if self.speak_replies { "spoken (/voice speak off)" } else { "silent (/voice speak on)" }
                     ),
+                    format!(
+                        "  wake word    {}",
+                        match &self.wake {
+                            Some(w) => format!("{} (/voice wake off)", w.describe()),
+                            None if self.wake_supported => "off (/voice wake on, or Alt-W)".into(),
+                            None => "full-screen chat and shell only".into(),
+                        }
+                    ),
                     "  Ctrl-T starts listening; pause to finish (or Ctrl-T full screen, Enter line by line).".into(),
                 ]
                 .join("\n")
             }
         }
     }
+}
+
+/// The command that plays a WAV file (`{wav}`): `voice.play_command`, or
+/// the first of pw-play, paplay, aplay, ffplay that is installed.
+fn player(config: &VoiceConfig) -> Option<String> {
+    if !config.play_command.is_empty() {
+        return Some(config.play_command.clone());
+    }
+    [("pw-play", "pw-play {wav}"), ("paplay", "paplay {wav}"), ("aplay", "aplay -q {wav}"), ("ffplay", "ffplay -nodisp -autoexit -loglevel quiet {wav}")]
+        .into_iter()
+        .find(|(bin, _)| which(bin).is_some())
+        .map(|(_, c)| c.to_string())
 }
 
 /// The first of `names` on PATH.
@@ -198,6 +306,21 @@ fn shell(command: &str) -> Command {
     let mut c = Command::new("sh");
     c.arg("-c").arg(command).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
     c
+}
+
+/// Have the kernel kill the child when the thread that started it ends,
+/// even if Orion itself is killed and can't clean up.
+fn die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: prctl is async-signal-safe and touches no memory of ours.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 fn kill_group(pid: u32, signal: libc::c_int) {

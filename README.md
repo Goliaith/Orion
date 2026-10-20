@@ -198,6 +198,25 @@ It is local-first and uses what the machine already has:
 - **Nothing is sent off the machine** unless you point `transcribe_url` or `speak_url` at a remote server.
 - **Settings are under `[voice]`.** Set `send_after_transcribe = true` to send without the editing step.
 
+#### Wake word
+
+Turn on wake listening with **Alt-W** (or `/voice wake on`, or `wake = true` under `[voice]`), and talk to Orion hands-free in the full-screen chat or the shell:
+
+- **"Orion, what's using the GPU?"** is sent at once, as if you had typed it.
+- **A bare "Orion"** plays a short chime, and the next thing you say is the request: `● listening · say your request`.
+- **"Hey Orion", "OK Orion"** work too. The phrase only counts at the start of what you say, so "I read about Orion" doesn't wake it.
+- **Spoken requests act like typed ones.** While the AI is working, they wait their turn, and "Orion, stop" interrupts it.
+- **Spoken "no" declines an approval.** A spoken "yes" approves only with `wake_approvals = true`, because anything playing audio nearby could say it.
+
+How it works: the microphone stays open, and a pause detector (with a noise floor that follows the room) cuts the sound into utterances. The first 3 seconds of each utterance go to your transcriber and are checked for the wake phrase. The check allows for the ways a transcriber spells a name it doesn't know ("O'Ryan", "Orien", "Oreon"), and `wake_aliases` adds your own. Utterances are only held in memory until they are checked, and nothing is saved.
+
+- **It stays local.** Wake listening refuses to start if your transcriber is on another machine, since everything said near the microphone would go there. Set `wake_allow_remote = true` if that is really what you want.
+- **A dedicated detector:** set `wake_command` to a program that prints a line each time it hears the wake word, such as an [openWakeWord](https://github.com/dscripka/openWakeWord) or Porcupine script. It does the always-on listening, so nothing is transcribed until it fires, and Orion then records and transcribes the request.
+- **The cost:** transcribing every utterance is light with a GPU or a small Whisper model, but a dedicated detector uses far less power on a CPU.
+- **Your own phrase:** `wake_phrase` sets it, for example `"hey computer"`. A short, distinctive name works best.
+- **No leftover microphone:** the microphone is closed as soon as wake listening stops, and it can't outlive Orion even if Orion is killed.
+- **The line-by-line chat** can't take input while it waits at its prompt, so wake listening is only in the full-screen chat and the shell.
+
 ### Saved conversations
 
 Every conversation is saved after each message, so closing the terminal (or a crash) loses nothing:
@@ -238,6 +257,7 @@ How it works:
 | **Ctrl-C** | Stops the AI mid-turn: a streaming reply, a long think, a running program or an approval prompt. Any partial reply is kept and marked as interrupted, so the model knows where it stopped. At the prompt, press it twice to quit. |
 | **Shift-Tab** | Cycles routing between auto, claude and local, keeping what you've typed. Models that can't be reached are skipped. |
 | **Ctrl-T** | Talks: listens until you pause, then puts what you said in the message box. See [Voice](#voice). |
+| **Alt-W** | Turns [wake-word listening](#wake-word) on or off (full screen and the shell). |
 | **Ctrl-O** | Shows or hides reasoning and progress notes (default: `show_reasoning` under `[chat]`). |
 | **Alt-Enter** | Starts a new line, for multi-line messages. Pasting multi-line text also works. |
 | **Ctrl-R**, **↑ ↓** | Search and browse your earlier messages. |
@@ -486,7 +506,8 @@ src/
                 minimal HTTP (http.rs), the page (shell.html)
   interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
   voice/        listening and the pause detector (record.rs), speech to text
-                (transcribe.rs), text to speech and sentence splitting (speak.rs)
+                (transcribe.rs), text to speech and sentence splitting (speak.rs),
+                the wake word (wake.rs)
 contrib/        orion.socket and orion.service (the daemon), orion-kiosk (boot into
                 the shell), orion-shell.service
 tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
@@ -501,4 +522,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. Next: GPU placement (which card a model goes on), network changes (Wi-Fi, firewall), disks and mounts, and updates.
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~ and ~~a graphical shell~~ are done too. Still to come: wake-word listening.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. Still to come: speaker verification (only your voice wakes it), and a headless voice mode that runs as a service.

@@ -155,6 +155,17 @@ speak_model = "kokoro"
 speak_voice = "af_heart"
 play_command = ""               # plays {wav} from speak_url; empty: pw-play, paplay, aplay or ffplay
 # api_key_env = "VOICE_API_KEY" # bearer token for servers that want one
+# The wake word, in the full-screen chat and the shell: "Orion, …" hands-free.
+# Alt-W or `/voice wake on|off` toggles it.
+wake = false                    # listen from the start
+wake_phrase = "orion"           # "hey orion" and "ok orion" work too
+wake_aliases = []               # other spellings your transcriber writes, e.g. ["o'ryan"]
+wake_command = ""               # a wake-word detector printing a line per detection,
+                                # used instead of transcribing everything said
+wake_chime = true               # chime when woken without a request
+wake_timeout_secs = 8           # how long to wait for the request after "Orion"
+wake_approvals = false          # true: "Orion, yes" approves a tool call ("no" always declines)
+wake_allow_remote = false       # allow a transcriber on another machine to hear everything
 
 # The graphical shell: `orion shell`, then open the printed address.
 [shell]

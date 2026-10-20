@@ -46,15 +46,8 @@ impl Speaker {
                 let key = non_empty_env(&config.api_key_env).with_context(|| format!("{} is not set", config.api_key_env))?;
                 headers.push(("authorization".to_string(), format!("Bearer {key}")));
             }
-            let player = if config.play_command.is_empty() {
-                [("pw-play", "pw-play {wav}"), ("paplay", "paplay {wav}"), ("aplay", "aplay -q {wav}"), ("ffplay", "ffplay -nodisp -autoexit -loglevel quiet {wav}")]
-                    .into_iter()
-                    .find(|(bin, _)| which(bin).is_some())
-                    .map(|(_, c)| c.to_string())
-                    .context("no audio player found: install pipewire, pulseaudio-utils, alsa-utils or ffmpeg, or set voice.play_command")?
-            } else {
-                config.play_command.clone()
-            };
+            let player = super::player(config)
+                .context("no audio player found: install pipewire, pulseaudio-utils, alsa-utils or ffmpeg, or set voice.play_command")?;
             Backend::Http {
                 http: Http::new(&config.speak_url, headers),
                 model: config.speak_model.clone(),

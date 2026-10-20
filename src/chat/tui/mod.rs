@@ -28,7 +28,7 @@ use self::input::Input;
 use super::store::Turn;
 use super::terminal::{clip, provider_label, Saver};
 use super::{Mode, Session};
-use crate::voice::{Recording, VoiceConfig, VoiceIo};
+use crate::voice::{is_stop_request, spoken_answer, Recording, VoiceConfig, VoiceIo, WakeEvent, WakeState};
 use crate::{interrupt, Orion};
 
 const LABEL: usize = 8;
@@ -42,6 +42,7 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl-C", "stop the AI · clear the line · twice to quit"),
     ("Shift-Tab", "cycle routing: auto → claude → local"),
     ("Ctrl-T", "talk: listen until you pause (Ctrl-T again finishes, Esc cancels)"),
+    ("Alt-W", "wake word on/off: say \"Orion, …\" hands-free"),
     ("Ctrl-O", "show or hide reasoning"),
     ("Ctrl-B", "show or hide the machine panel"),
     ("PgUp / PgDn, wheel", "scroll (End follows the conversation again)"),
@@ -113,9 +114,9 @@ struct App {
 
 impl App {
     fn new(to_agent: Sender<ToAgent>, show_reasoning: bool, voice: &VoiceConfig) -> Self {
+        let mut entries = Vec::new();
         Self {
             to_agent,
-            entries: Vec::new(),
             input: Input::default(),
             prompt: None,
             busy: true, // until the agent reports in
@@ -126,7 +127,15 @@ impl App {
             who: "claude",
             show_reasoning,
             show_panel: true,
-            voice: VoiceIo::new(voice),
+            voice: {
+                let mut v = VoiceIo::new(voice);
+                if let Err(e) = v.support_wake() {
+                    entries.push(Entry::Notice(format!("voice: can't listen for the wake phrase: {e}")));
+                }
+                v
+            },
+            // After `voice`, which may have added a notice.
+            entries,
             listening: None,
             levels: Vec::new(),
             transcribing: None,
@@ -329,6 +338,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('t') if ctrl => self.start_listening(),
+            KeyCode::Char('w') if alt => self.toggle_wake(),
             KeyCode::Char('c') if ctrl => {
                 if self.voice.hush() {
                     self.flash("stopped speaking");
@@ -440,9 +450,70 @@ impl App {
         }
     }
 
+    fn toggle_wake(&mut self) {
+        if self.voice.wake().is_some() {
+            self.voice.wake_off();
+            self.flash("wake word off");
+        } else {
+            match self.voice.wake_on() {
+                Ok(what) => self.flash(&format!("wake word on: {what}")),
+                Err(e) => self.entries.push(Entry::Notice(format!("voice: can't listen for the wake phrase: {e}"))),
+            }
+        }
+    }
+
+    /// What the wake listener heard.
+    fn on_wake(&mut self, ev: WakeEvent) {
+        match ev {
+            WakeEvent::Woke => {
+                self.voice.hush();
+                self.levels.clear();
+            }
+            WakeEvent::NoRequest => self.flash("woke, but heard no request"),
+            WakeEvent::Failed(e) => self.entries.push(Entry::Notice(format!("voice: stopped listening for the wake phrase: {e}"))),
+            WakeEvent::Request(text) => {
+                self.voice.hush();
+                match (&self.prompt, spoken_answer(&text)) {
+                    (Some(_), Some(true)) if !self.voice.config.wake_approvals => {
+                        self.flash("answer with y: spoken approval is off (voice.wake_approvals)")
+                    }
+                    (Some(Prompt::Approve(_)), Some(yes)) => self.answer_approval(if yes { Answer::Yes } else { Answer::No }),
+                    (Some(Prompt::Confirm(_)), Some(yes)) => self.answer_confirm(yes),
+                    (Some(_), _) => self.flash(&format!("heard \"{text}\" · answer the prompt first")),
+                    (None, _) if is_stop_request(&text) => {
+                        if self.busy {
+                            self.stop();
+                        } else {
+                            self.flash("ok");
+                        }
+                    }
+                    (None, _) if self.busy => {
+                        self.queued = Some(text);
+                        self.flash("queued: sends when the AI is done");
+                    }
+                    (None, _) => self.submit(text),
+                }
+            }
+        }
+    }
+
     /// Called every frame: the meter, the pause detector, the transcript.
     fn tick_voice(&mut self) -> bool {
         let mut changed = false;
+        if let Some(w) = self.voice.wake() {
+            w.set_paused(self.listening.is_some() || self.transcribing.is_some());
+            if w.state() == WakeState::Hearing {
+                self.levels.push(w.level());
+                if self.levels.len() > 24 {
+                    self.levels.remove(0);
+                }
+                changed = true;
+            }
+        }
+        while let Some(ev) = self.voice.wake_event() {
+            self.on_wake(ev);
+            changed = true;
+        }
         if let Some(rec) = &self.listening {
             self.levels.push(rec.level());
             if self.levels.len() > 24 {
@@ -564,6 +635,12 @@ impl App {
                 (format!(" ● listening {meter} {secs}s · pause or Ctrl-T to finish · Esc cancels "), Color::Red)
             }
             None if self.transcribing.is_some() => (" transcribing… ".to_string(), Color::Red),
+            None if self.voice.wake().is_some_and(|w| w.state() == WakeState::Hearing) => {
+                (format!(" ● listening {meter} · say your request "), Color::Red)
+            }
+            None if self.voice.wake().is_some_and(|w| w.state() == WakeState::Transcribing) => {
+                (" transcribing… ".to_string(), Color::Red)
+            }
             Some(Prompt::Approve(_)) => (" Approve?  y yes · n no · a always this session ".to_string(), Color::Yellow),
             Some(Prompt::Confirm(_)) => (" y yes · n no ".to_string(), Color::Yellow),
             None if self.stopping => (" stopping… ".to_string(), Color::Yellow),
@@ -600,6 +677,13 @@ impl App {
         let mut spans = vec![Span::styled(label, Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD))];
         if self.voice.speaker.as_ref().is_ok_and(|s| s.is_speaking()) {
             spans.push(Span::styled(" ♪ speaking · Ctrl-C hushes ", Style::new().fg(Color::Cyan)));
+        }
+        if let Some(w) = self.voice.wake() {
+            if matches!(w.state(), WakeState::Waiting | WakeState::Paused) {
+                let phrase = self.voice.config.wake_phrase.trim();
+                let label = if self.voice.config.wake_command.is_empty() { format!(" ◉ say \"{phrase}\" ") } else { " ◉ wake word ".into() };
+                spans.push(Span::styled(label, Style::new().fg(Color::Cyan)));
+            }
         }
         if self.busy {
             let frame = SPINNER[(self.started.elapsed().as_millis() / 100) as usize % SPINNER.len()];
@@ -1022,6 +1106,31 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn spoken_requests_act_like_typed_ones() {
+        let (mut app, rx) = app();
+        app.on_wake(WakeEvent::Request("how full is my disk?".into()));
+        assert!(matches!(rx.try_recv().unwrap(), ToAgent::Turn(t) if t == "how full is my disk?"));
+        // While the AI works: queued, and "stop" stops it.
+        app.on_wake(WakeEvent::Request("then restart ollama".into()));
+        assert_eq!(app.queued.as_deref(), Some("then restart ollama"));
+        app.on_wake(WakeEvent::Request("Stop!".into()));
+        assert!(app.stopping);
+
+        // A spoken "no" declines; a spoken "yes" approves only if allowed.
+        let (reply, answers) = mpsc::channel();
+        app.apply(FromAgent::Approve { tool: "proc_run".into(), preview: "{}".into(), reply });
+        app.on_wake(WakeEvent::Request("Yes.".into()));
+        assert!(app.prompt.is_some(), "spoken approval is off by default");
+        app.on_wake(WakeEvent::Request("No.".into()));
+        assert!(matches!(answers.try_recv(), Ok(Answer::No)));
+        app.voice.config.wake_approvals = true;
+        let (reply, answers) = mpsc::channel();
+        app.apply(FromAgent::Approve { tool: "proc_run".into(), preview: "{}".into(), reply });
+        app.on_wake(WakeEvent::Request("yes please".into()));
+        assert!(matches!(answers.try_recv(), Ok(Answer::Yes)));
     }
 
     #[test]
