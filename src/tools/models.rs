@@ -14,6 +14,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::gpu::{self, Gpu, Placement};
 use crate::chat::http::Http;
 use crate::policy::Policy;
 use crate::tool::{parse_args, Risk, Tool};
@@ -193,37 +194,36 @@ fn same_model(a: &str, b: &str) -> bool {
     tag(a) == tag(b)
 }
 
-/// One GPU's memory, in MiB.
-struct Card {
-    index: u64,
-    name: String,
-    total: u64,
-    used: u64,
-    processes: Value,
+/// The GPUs a local server may use: from the visible-devices variables in
+/// its environment (a `gpu_assign` pin), else all of them.
+fn server_gpus(server_url: &str, gpus: &[Gpu]) -> Option<Vec<usize>> {
+    if !is_local(server_url) {
+        return None;
+    }
+    let port = host_port(server_url)?.port();
+    let pid = super::network::listening().into_iter().find(|l| l.port == port && l.proto == "tcp")?.pid?;
+    gpu::visible_to(&gpu::process_env(pid)?, gpus)
 }
 
-fn cards() -> Vec<Card> {
-    let g = super::gpu_status();
-    g["nvidia"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|c| {
-            Some(Card {
-                index: c["index"].as_u64()?,
-                name: c["name"].as_str().unwrap_or("GPU").into(),
-                total: c["memory_total_mib"].as_u64()?,
-                used: c["memory_used_mib"].as_u64()?,
-                processes: c["processes"].clone(),
-            })
-        })
-        .collect()
+/// Each loaded model's GPUs, as observed: the GPUs its runner process has
+/// memory on.
+fn placed(procs: &[gpu::GpuProcess], model: &str) -> Vec<usize> {
+    let mut on: Vec<usize> = procs.iter().filter(|p| p.model.as_deref().is_some_and(|m| same_model(m, model))).map(|p| p.gpu).collect();
+    on.sort();
+    on.dedup();
+    on
 }
 
-/// MiB a model may still take: over all GPUs, total less the reserve less
-/// what is in use. `None` when there are no GPU readings to go by.
-fn free_mib(cards: &[Card], reserve: u64) -> Option<u64> {
-    (!cards.is_empty()).then(|| cards.iter().map(|c| c.total.saturating_sub(reserve).saturating_sub(c.used)).sum())
+fn describe_placement(p: &Placement, gpus: &[Gpu]) -> String {
+    let name = |i: &usize| gpus.get(*i).map_or_else(|| format!("GPU {i}"), |g| format!("GPU {i} ({})", g.name));
+    match p {
+        Placement::Single { gpu } => format!("whole on {}", name(gpu)),
+        Placement::Split { gpus: on } => format!("split across {}", on.iter().map(name).collect::<Vec<_>>().join(" and ")),
+        Placement::Partial { gpus: on, on_gpu_pct } => {
+            format!("{on_gpu_pct}% on {}, the rest on the CPU (slow)", on.iter().map(name).collect::<Vec<_>>().join(" and "))
+        }
+        Placement::Cpu => "on the CPU (no GPU memory free)".into(),
+    }
 }
 
 /// What loading needs, roughly: the weights plus room for the KV cache and
@@ -269,15 +269,16 @@ fn plan_load(need: u64, free: Option<u64>, loaded: &[Loaded], target: &str, evic
     Ok(out)
 }
 
-/// Models loaded on the Ollama servers Orion knows: (name, VRAM MiB), for
-/// status displays.
-pub fn loaded_models(policy: &Policy) -> Vec<(String, u64)> {
-    servers(policy)
-        .0
-        .iter()
-        .flat_map(|s| s.loaded().unwrap_or_default())
-        .map(|l| (l.name, l.vram / MIB))
-        .collect()
+/// Models loaded on the Ollama servers Orion knows, for status displays:
+/// name, VRAM MiB, and the GPUs it is on (by Orion's index).
+pub fn loaded_models(policy: &Policy) -> Vec<(String, u64, Vec<usize>)> {
+    let loaded: Vec<Loaded> = servers(policy).0.iter().flat_map(|s| s.loaded().unwrap_or_default()).collect();
+    if loaded.is_empty() {
+        return Vec::new();
+    }
+    let gpus = gpu::inventory();
+    let procs = gpu::processes(&gpus);
+    loaded.into_iter().map(|l| (l.name.clone(), l.vram / MIB, placed(&procs, &l.name))).collect()
 }
 
 fn server_schema() -> Value {
@@ -311,7 +312,8 @@ impl Tool for ModelStatus {
         struct NoArgs {}
         let NoArgs {} = parse_args(args)?;
         let reserve = policy.models.vram_reserve_mb;
-        let cards = cards();
+        let gpus = gpu::inventory();
+        let procs = gpu::processes(&gpus);
         let listeners = super::network::listening();
         let (up, down) = servers(policy);
         let servers: Vec<Value> = up
@@ -326,6 +328,12 @@ impl Tool for ModelStatus {
                     if let Some(l) = listeners.iter().find(|l| Some(l.port) == port && l.proto == "tcp") {
                         v["pid"] = json!(l.pid);
                         v["process"] = json!(l.process);
+                    }
+                    if !gpus.is_empty() {
+                        v["gpus"] = match server_gpus(&s.url, &gpus) {
+                            Some(on) => json!(on),
+                            None => json!("all"),
+                        };
                     }
                 }
                 match s.available() {
@@ -354,6 +362,7 @@ impl Tool for ModelStatus {
                                 "name": l.name,
                                 "vram_mib": l.vram / MIB,
                                 "on_gpu_pct": (l.size > 0).then(|| (l.vram * 100 / l.size).min(100)),
+                                "on_gpus": placed(&procs, &l.name),
                                 "expires_at": l.expires_at,
                             })
                         })
@@ -365,20 +374,22 @@ impl Tool for ModelStatus {
                 v
             })
             .collect();
-        let gpus: Vec<Value> = cards
+        let budgets = gpu::budgets(&gpus, reserve, None);
+        let gpu_list: Vec<Value> = gpus
             .iter()
-            .map(|c| {
+            .map(|g| {
                 json!({
-                    "index": c.index, "name": c.name, "total_mib": c.total, "used_mib": c.used, "reserve_mib": reserve,
-                    "free_for_models_mib": c.total.saturating_sub(reserve).saturating_sub(c.used),
-                    "processes": c.processes,
+                    "index": g.index, "name": g.name, "vendor": g.vendor, "kind": g.kind,
+                    "total_mib": g.vram_total_mib, "used_mib": g.vram_used_mib, "reserve_mib": reserve,
+                    "free_for_models_mib": budgets.iter().find(|b| b.gpu == g.index).map(|b| b.free_mib),
+                    "processes": procs.iter().filter(|p| p.gpu == g.index).collect::<Vec<_>>(),
                 })
             })
             .collect();
         Ok(json!({
-            "gpus": gpus,
-            "vram_free_for_models_mib": free_mib(&cards, reserve),
-            "vram_note": if cards.is_empty() { Some("no NVIDIA readings (nvidia-smi); loads are not budgeted") } else { None },
+            "gpus": gpu_list,
+            "vram_free_for_models_mib": (!budgets.is_empty()).then(|| budgets.iter().map(|b| b.free_mib).sum::<u64>()),
+            "vram_note": if budgets.is_empty() { Some("no GPU memory readings; loads are not budgeted") } else { None },
             "servers": servers,
             "unreachable": down,
         }))
@@ -425,6 +436,9 @@ struct LoadPlan {
     evict: Vec<String>,
     need: u64,
     free: Option<u64>,
+    /// Where it should land, and the GPUs (for naming them).
+    expected: Option<Placement>,
+    gpus: Vec<Gpu>,
 }
 
 fn plan(policy: &Policy, a: &LoadArgs) -> Result<LoadPlan> {
@@ -437,13 +451,21 @@ fn plan(policy: &Policy, a: &LoadArgs) -> Result<LoadPlan> {
         .ok_or_else(|| anyhow!("{} doesn't have {}; model_pull fetches it", server.url, a.model))?;
     let loaded = server.loaded()?;
     let need = need_mib(model.size);
-    let (evict, free) = if loaded.iter().any(|l| same_model(&l.name, &model.name)) || !is_local(&server.url) {
-        (Vec::new(), None)
+    let gpus = if is_local(&server.url) { gpu::inventory() } else { Vec::new() };
+    // Only the GPUs this server may use count (a gpu_assign pin).
+    let allowed = server_gpus(&server.url, &gpus);
+    let budgets = gpu::budgets(&gpus, policy.models.vram_reserve_mb, allowed.as_deref());
+    let (evict, free, expected) = if loaded.iter().any(|l| same_model(&l.name, &model.name)) || budgets.is_empty() {
+        (Vec::new(), None, None)
     } else {
-        let free = free_mib(&cards(), policy.models.vram_reserve_mb);
-        (plan_load(need, free, &loaded, &model.name, a.evict)?, free)
+        let free = Some(budgets.iter().map(|b| b.free_mib).sum::<u64>());
+        let evict = plan_load(need, free, &loaded, &model.name, a.evict)?;
+        // Unloading frees memory on the GPUs those models are on; without
+        // knowing which, predict on what is free now unless that's nothing.
+        let expected = if evict.is_empty() { Some(gpu::predict(need, &budgets)) } else { None };
+        (evict, free, expected)
     };
-    Ok(LoadPlan { server, model, evict, need, free })
+    Ok(LoadPlan { server, model, evict, need, free, expected, gpus })
 }
 
 pub struct ModelLoad;
@@ -456,7 +478,9 @@ impl Tool for ModelLoad {
     fn description(&self) -> &'static str {
         "Load a model into GPU memory on an Ollama server, so it answers without a cold start, and keep it \
          there for keep_alive (such as \"30m\", \"2h\", or \"-1\" for good). It is refused if it doesn't fit in \
-         the VRAM budget, unless evict is set: then the models expiring soonest are unloaded first."
+         the VRAM budget, unless evict is set: then the models expiring soonest are unloaded first. Says which \
+         GPU it is expected on and where it landed; Ollama picks the GPU, so to choose one, pin the server with \
+         gpu_assign."
     }
 
     fn risk(&self) -> Risk {
@@ -495,6 +519,8 @@ impl Tool for ModelLoad {
         let ka: Value = keep_alive.parse::<i64>().map_or(json!(keep_alive), |n| json!(n));
         p.server.keep_alive(&p.model.name, ka, Duration::from_secs(900))?;
         let now = p.server.loaded()?.into_iter().find(|l| same_model(&l.name, &p.model.name));
+        let on = if p.gpus.is_empty() { Vec::new() } else { placed(&gpu::processes(&p.gpus), &p.model.name) };
+        let names = |on: &[usize]| on.iter().map(|i| p.gpus.get(*i).map_or_else(|| format!("GPU {i}"), |g| format!("GPU {i} ({})", g.name))).collect::<Vec<_>>();
         Ok(json!({
             "model": p.model.name,
             "server": p.server.url,
@@ -505,6 +531,8 @@ impl Tool for ModelLoad {
             "estimated_need_mib": p.need,
             "free_before_mib": p.free,
             "unloaded": p.evict,
+            "expected_placement": p.expected.as_ref().map(|e| describe_placement(e, &p.gpus)),
+            "placed_on": names(&on),
         }))
     }
 }
@@ -623,6 +651,25 @@ mod tests {
 
     fn loaded(name: &str, vram_mib: u64, expires: &str) -> Loaded {
         Loaded { name: name.into(), size: vram_mib * MIB, vram: vram_mib * MIB, expires_at: expires.into() }
+    }
+
+    #[test]
+    fn says_where_a_model_will_go() {
+        let gpus = super::super::gpu::tests::fake_gpus();
+        let all = gpu::budgets(&gpus, 1024, None);
+        // An 18 GiB model (about 21 GiB with its cache) fits only the
+        // Radeon; 22 GiB (about 26) needs both cards; 24 GiB (about 28) is
+        // more than both have free.
+        let p = gpu::predict(need_mib(18 << 30), &all);
+        assert_eq!(describe_placement(&p, &gpus), "whole on GPU 2 (Radeon RX 7900 XT/7900 XTX/7900M)");
+        let p = gpu::predict(need_mib(22 << 30), &all);
+        assert_eq!(describe_placement(&p, &gpus), "split across GPU 1 (NVIDIA GeForce RTX 4090) and GPU 2 (Radeon RX 7900 XT/7900 XTX/7900M)");
+        let p = gpu::predict(need_mib(24 << 30), &all);
+        assert!(describe_placement(&p, &gpus).starts_with("96% on GPU 1"));
+        // A server pinned to the 4090 only has its 5 GiB.
+        let pinned = gpu::budgets(&gpus, 1024, Some(&[1]));
+        let p = gpu::predict(need_mib(8 << 30), &pinned);
+        assert!(describe_placement(&p, &gpus).ends_with("on GPU 1 (NVIDIA GeForce RTX 4090), the rest on the CPU (slow)"));
     }
 
     #[test]

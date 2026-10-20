@@ -965,7 +965,8 @@ fn panel_lines(m: &Machine, s: &Status, width: usize) -> Vec<Line<'static>> {
         let gb = |kb: u64| kb as f64 / 1_048_576.0;
         l.push(gauge("RAM", used as f64 / total.max(1) as f64, format!("{:.1}/{:.0}G", gb(used), gb(total))));
     }
-    for (i, g) in m.gpus.iter().enumerate() {
+    for g in &m.gpus {
+        let i = g.index;
         l.push(Line::styled(format!(" GPU{i} {}", clip(&g.name.replace("NVIDIA ", "").replace("GeForce ", ""), width.saturating_sub(5))), Style::new()));
         if let Some(u) = g.util {
             l.push(gauge(" use", u as f64 / 100.0, format!("{u:>3}%{}", g.temp.map(|t| format!(" {t}°C")).unwrap_or_default())));
@@ -980,8 +981,9 @@ fn panel_lines(m: &Machine, s: &Status, width: usize) -> Vec<Line<'static>> {
     if m.gpus.is_empty() && m.other_gpus.is_empty() {
         l.push(Line::styled(" GPU  none found", dim));
     }
-    for (name, vram) in &m.loaded {
-        let size = format!("{:.1}G", *vram as f64 / 1024.0);
+    for (name, vram, on) in &m.loaded {
+        let gpus = on.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("+");
+        let size = format!("{:.1}G{}", *vram as f64 / 1024.0, if gpus.is_empty() { String::new() } else { format!(" ·{gpus}") });
         let name = clip(name, width.saturating_sub(size.len() + 4));
         l.push(Line::from(vec![
             Span::styled(" ● ", Style::new().fg(Color::Green)),
@@ -1283,8 +1285,8 @@ mod tests {
             cpu: Some(0.31),
             mem_total_kb: Some(16 * 1_048_576),
             mem_avail_kb: Some(7 * 1_048_576),
-            gpus: vec![Gpu { name: "NVIDIA GeForce RTX 4070".into(), util: Some(42), mem_used: Some(3174), mem_total: Some(12282), temp: Some(61) }],
-            loaded: vec![("qwen3:8b".into(), 5427)],
+            gpus: vec![Gpu { index: 0, name: "NVIDIA GeForce RTX 4070".into(), util: Some(42), mem_used: Some(3174), mem_total: Some(12282), temp: Some(61) }],
+            loaded: vec![("qwen3:8b".into(), 5427, vec![1])],
             failed: Some(vec!["nginx.service".into()]),
             ..Default::default()
         };
@@ -1294,7 +1296,7 @@ mod tests {
             ..Default::default()
         };
         let text: String = panel_lines(&m, &s, 32).iter().map(|l| l.to_string() + "\n").collect();
-        for want in ["box", "31%", "9.0/16G", "GPU0 RTX 4070", "42% 61°C", "3.1/12G", "qwen3:8b", "5.3G", "1 service failed: nginx", "judges the rest", "unavailable"] {
+        for want in ["box", "31%", "9.0/16G", "GPU0 RTX 4070", "42% 61°C", "3.1/12G", "qwen3:8b", "5.3G ·1", "1 service failed: nginx", "judges the rest", "unavailable"] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }
     }

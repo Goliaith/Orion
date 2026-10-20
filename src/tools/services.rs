@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -347,7 +347,16 @@ struct ControlArgs {
 }
 
 fn check_control(policy: &Policy, a: &ControlArgs) -> Result<String> {
-    let unit = unit_name(&a.unit)?;
+    check_scoped(policy, &a.unit, a.scope)
+}
+
+/// A unit Orion may change, for other tools (`gpu_assign`).
+pub(super) fn check_unit(policy: &Policy, unit: &str, user: bool) -> Result<String> {
+    check_scoped(policy, unit, if user { Scope::User } else { Scope::System })
+}
+
+fn check_scoped(policy: &Policy, unit: &str, scope: Scope) -> Result<String> {
+    let unit = unit_name(unit)?;
     ensure!(
         CONTROLLABLE.iter().any(|s| unit.ends_with(s)),
         "only services, sockets, timers and paths can be controlled, not {unit}"
@@ -355,8 +364,75 @@ fn check_control(policy: &Policy, a: &ControlArgs) -> Result<String> {
     if let Some(p) = policy.services.protected.iter().find(|p| glob_match(p, &unit)) {
         bail!("{unit} is protected by the Orion policy (services.protected: {p:?}); no approval can change it");
     }
-    systemd_running(a.scope)?;
+    systemd_running(scope)?;
     Ok(unit)
+}
+
+/// `services.allowed` pre-approves changes to a unit.
+pub(super) fn preapproval(policy: &Policy, args: &Value) -> Preapproval {
+    let unit = args.get("unit").and_then(Value::as_str).and_then(|u| unit_name(u).ok()).unwrap_or_default();
+    if policy.services.allowed.iter().any(|p| glob_match(p, &unit)) {
+        Preapproval::Granted
+    } else {
+        Preapproval::Refused(format!("{unit:?} is not in services.allowed"))
+    }
+}
+
+/// Write (or with `None`, remove) a unit's drop-in file; as root for the
+/// machine's units.
+pub(super) fn write_drop_in(policy: &Policy, path: &Path, content: Option<&str>, user: bool) -> Result<()> {
+    if user {
+        match content {
+            Some(c) => {
+                std::fs::create_dir_all(path.parent().context("no directory")?)?;
+                std::fs::write(path, c)?;
+            }
+            None => match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            },
+        }
+        return Ok(());
+    }
+    let prefix = exec::elevation(&policy.admin.elevate)?;
+    let p = path.display().to_string();
+    let dir = path.parent().context("no directory")?.display().to_string();
+    let steps: Vec<(Vec<String>, Option<String>)> = match content {
+        Some(c) => vec![
+            (vec!["mkdir".into(), "-p".into(), "--".into(), dir], None),
+            (vec!["tee".into(), "--".into(), p], Some(c.to_string())),
+        ],
+        None => vec![(vec!["rm".into(), "-f".into(), "--".into(), p], None)],
+    };
+    for (mut argv, stdin) in steps {
+        let program = argv.remove(0);
+        let mut cmd = exec::command_as(prefix.as_deref(), &program, &argv);
+        cmd.stdout(std::process::Stdio::null());
+        let done = exec::run(cmd, stdin, Duration::from_secs(30), 16 << 10)?;
+        ensure!(done.success(), "{program}: {}", done.complaint());
+    }
+    Ok(())
+}
+
+/// After a drop-in changed: reload systemd, and restart the unit if it is
+/// running. Whether it was restarted.
+pub(super) fn reload_and_restart(policy: &Policy, unit: &str, user: bool) -> Result<bool> {
+    let scope = if user { Scope::User } else { Scope::System };
+    let prefix = if user { None } else { exec::elevation(&policy.admin.elevate)? };
+    let run = |args: &[&str]| -> Result<exec::Finished> {
+        let mut argv: Vec<String> = scope.flag().map(String::from).into_iter().collect();
+        argv.push("--no-ask-password".into());
+        argv.extend(args.iter().map(|a| a.to_string()));
+        exec::run(exec::command_as(prefix.as_deref(), "systemctl", &argv), None, Duration::from_secs(120), 16 << 10)
+    };
+    let reload = run(&["daemon-reload"])?;
+    ensure!(reload.success(), "systemctl daemon-reload: {}", reload.complaint());
+    let active = status(scope, unit).is_ok_and(|s| s["active"] == "active");
+    if active {
+        let r = run(&["restart", "--", unit])?;
+        ensure!(r.success(), "restarting {unit}: {}", r.complaint());
+    }
+    Ok(active)
 }
 
 impl Tool for SvcControl {
@@ -388,12 +464,7 @@ impl Tool for SvcControl {
     }
 
     fn preapproval(&self, policy: &Policy, args: &Value) -> Preapproval {
-        let unit = args.get("unit").and_then(Value::as_str).and_then(|u| unit_name(u).ok()).unwrap_or_default();
-        if policy.services.allowed.iter().any(|p| glob_match(p, &unit)) {
-            Preapproval::Granted
-        } else {
-            Preapproval::Refused(format!("{unit:?} is not in services.allowed"))
-        }
+        preapproval(policy, args)
     }
 
     fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
@@ -436,6 +507,18 @@ impl Tool for SvcControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_and_removes_user_drop_ins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ollama.service.d/50-orion-gpu.conf");
+        let p = Policy::default();
+        write_drop_in(&p, &path, Some("[Service]\nEnvironment=\"CUDA_VISIBLE_DEVICES=GPU-1\"\n"), true).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("CUDA_VISIBLE_DEVICES=GPU-1"));
+        write_drop_in(&p, &path, None, true).unwrap();
+        assert!(!path.exists());
+        write_drop_in(&p, &path, None, true).unwrap();
+    }
 
     #[test]
     fn unit_names() {

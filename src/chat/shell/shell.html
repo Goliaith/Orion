@@ -406,14 +406,14 @@ function machine(m) {
     $("memv").textContent = `${g(used)} / ${g(m.mem_total_kb)} GB`; const b = $("memb"); b.style.width = (f * 100).toFixed(0) + "%"; b.className = gauge(f);
   }
   let html = "";
-  for (const [i, gpu] of (m.gpus || []).entries()) {
+  for (const gpu of m.gpus || []) { const i = gpu.index;
     const name = esc(gpu.name.replace("NVIDIA ", "").replace("GeForce ", ""));
     if (gpu.util != null) html += `<div class="gauge"><div class="top"><span>GPU ${i} · ${name}</span><span>${gpu.util}%${gpu.temp != null ? " · " + gpu.temp + "°C" : ""}</span></div><div class="bar"><i class="${gauge(gpu.util / 100)}" style="width:${gpu.util}%"></i></div></div>`;
     if (gpu.mem_total) { const f = gpu.mem_used / gpu.mem_total; html += `<div class="gauge"><div class="top"><span>VRAM</span><span>${(gpu.mem_used / 1024).toFixed(1)} / ${(gpu.mem_total / 1024).toFixed(0)} GB</span></div><div class="bar"><i class="${gauge(f)}" style="width:${(f * 100).toFixed(0)}%"></i></div></div>`; }
   }
   for (const v of m.other_gpus || []) html += `<div class="kv"><span>GPU</span><span>${esc(v)}</span></div>`;
   if (!html) html = `<div class="kv"><span>GPU</span><span>none found</span></div>`;
-  for (const [name, vram] of m.loaded || []) html += `<div class="kv"><span><b class="up">●</b> ${esc(name)}</span><span>${(vram / 1024).toFixed(1)} GB</span></div>`;
+  for (const [name, vram, on] of m.loaded || []) html += `<div class="kv"><span><b class="up">●</b> ${esc(name)}</span><span>${(vram / 1024).toFixed(1)} GB${on && on.length ? " · GPU " + on.join("+") : ""}</span></div>`;
   if (m.failed && m.failed.length) html += `<div class="kv failed"><span>Failed</span><span>${esc(m.failed.map(u => u.replace(/\.service$/, "")).join(", "))}</span></div>`;
   $("gpus").innerHTML = html;
 }

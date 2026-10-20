@@ -13,6 +13,8 @@ use crate::policy::Policy;
 
 #[derive(Default, Clone, Serialize)]
 pub struct Gpu {
+    /// Orion's number for it (gpu_info's).
+    pub index: usize,
     pub name: String,
     pub util: Option<u64>,
     pub mem_used: Option<u64>,
@@ -31,8 +33,8 @@ pub struct Machine {
     pub gpus: Vec<Gpu>,
     /// Display/compute devices without nvidia-smi readings.
     pub other_gpus: Vec<String>,
-    /// Models loaded on local Ollama servers: (name, VRAM MiB).
-    pub loaded: Vec<(String, u64)>,
+    /// Models loaded on local Ollama servers: (name, VRAM MiB, GPUs).
+    pub loaded: Vec<(String, u64, Vec<usize>)>,
     /// Failed system services; `None` when there is no systemd.
     pub failed: Option<Vec<String>>,
 }
@@ -66,29 +68,24 @@ fn read_machine(prev_cpu: &mut Option<(u64, u64)>, with_gpu: bool, last: &Machin
         failed: last.failed.clone(),
     };
     if with_gpu {
-        let g = crate::tools::gpu_status();
-        m.gpus = g["nvidia"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|x| Gpu {
-                        name: x["name"].as_str().unwrap_or("GPU").to_string(),
-                        util: x["utilization_pct"].as_u64(),
-                        mem_used: x["memory_used_mib"].as_u64(),
-                        mem_total: x["memory_total_mib"].as_u64(),
-                        temp: x["temperature_c"].as_u64(),
-                    })
-                    .collect()
+        let all = crate::tools::gpu::inventory();
+        // Cards with readings get gauges; the rest are listed by name.
+        let (read, other): (Vec<_>, Vec<_>) = all.into_iter().partition(|g| g.vram_total_mib.is_some() || g.utilization_pct.is_some());
+        m.gpus = read
+            .into_iter()
+            .map(|g| Gpu {
+                index: g.index,
+                name: g.name,
+                util: g.utilization_pct,
+                mem_used: g.vram_used_mib,
+                mem_total: g.vram_total_mib,
+                temp: g.temperature_c,
             })
-            .unwrap_or_default();
-        m.other_gpus = if m.gpus.is_empty() {
-            g["devices"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|d| d["vendor"].as_str()).filter(|v| *v != "unknown").map(str::to_string).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+            .collect();
+        m.other_gpus = other
+            .into_iter()
+            .map(|g| format!("{}{}", g.name, if g.kind == crate::tools::gpu::Kind::Integrated { " (integrated)" } else { "" }))
+            .collect();
     }
     m
 }

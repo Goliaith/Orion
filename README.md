@@ -29,7 +29,7 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | Tool           | Risk    | Default | What it does |
 |----------------|---------|---------|--------------|
 | `system_info`  | read    | allow   | Hostname, OS, kernel, CPU, memory, load, uptime |
-| `gpu_info`     | read    | allow   | GPUs by vendor; for NVIDIA, memory, utilization, temperature and the processes using each card (`nvidia-smi`) |
+| `gpu_info`     | read    | allow   | Every GPU (NVIDIA, AMD, Intel) by name: memory, load, temperature, power, compute stacks, and what runs on each, down to the model |
 | `net_info`     | read    | allow   | Interfaces and addresses, default routes, DNS, and listening ports with the process behind each |
 | `fs_list`      | read    | allow   | Directory listing inside the readable roots |
 | `fs_read`      | read    | allow   | Read a file, or a byte range of one, inside the readable roots |
@@ -48,6 +48,7 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `model_load`   | write   | ask     | Load a model on Ollama, within the VRAM budget (optionally unloading others) |
 | `model_unload` | write   | ask     | Unload a model, freeing its VRAM |
 | `model_pull`   | write   | ask     | Download a model onto Ollama |
+| `gpu_assign`   | write   | ask     | Pin an inference server (a systemd service) to chosen GPUs |
 
 Out of the box the AI can look at the machine freely. Changing it (writing files, running programs, managing services, packages and models) needs your approval each time. With no human present (`orion serve`), "ask" means no.
 
@@ -510,16 +511,42 @@ Beyond files and processes, the AI sees and manages the parts of the machine an 
 
 `net_info` reports each interface (kind, state, MAC, addresses, traffic), the default IPv4 and IPv6 routes, the DNS servers (including systemd-resolved's real upstream servers), and every listening TCP and UDP port with the process behind it. As a normal user, owners show only for your own processes.
 
+### GPUs
+
+`gpu_info` recognizes every GPU in the machine, not just NVIDIA's. It reads the kernel's view of each display and compute device, plus `nvidia-smi` when it is there. The 4090 rendering your desktop, the Radeon beside it and the Intel graphics on the CPU all show up:
+
+| | NVIDIA | AMD | Intel |
+|---|---|---|---|
+| Name | from `nvidia-smi` | from the driver, else the PCI ID database | the PCI ID database ("Arc A770", "UHD Graphics 770") |
+| Memory, load, temperature, power | `nvidia-smi` | amdgpu's sysfs files and hwmon | integrated: shares system memory |
+| Identity | GPU UUID | `unique_id`, as ROCm writes it | PCI address |
+| Compute | CUDA | ROCm (with `/dev/kfd` and ROCm installed) | oneAPI Level Zero |
+
+- **Each GPU gets a number by PCI address,** so it stays put across boots and drivers. CUDA's own numbering puts the fastest card first, which is why pins use UUIDs.
+- **Vulkan** shows where its driver is installed. Each GPU also lists its driver and render node, and whether it drives the boot display.
+- **What runs on each GPU, per process:** from `nvidia-smi` for NVIDIA, and from the kernel's DRM fdinfo for amdgpu, i915 and xe. Inference runners are traced to the model they serve: Ollama's runners through Ollama's own manifests ("qwen3:32b"), llama.cpp's server by its model file, vLLM by its model name.
+
+**Placement: which GPU a model goes on.**
+
+- **`model_load` says where a model will land and where it did.** It uses Ollama's scheduler's rule: the GPU with the most free memory that holds the model whole, else split across GPUs, else partly on the CPU. For example "expected: whole on GPU 2 (Radeon RX 7900 XTX)", then "placed_on: GPU 2". `model_status` and the machine panel show each loaded model's GPUs.
+- **The budget is per GPU** (each card's memory, less `vram_reserve_mb`, less what is in use), and it counts only the GPUs the server may use.
+- **To choose a GPU, pin the server:** `gpu_assign {"unit": "ollama", "gpus": [1]}`. Ollama decides placement itself, so the way to put models on a card is to give the server only that card. This writes a systemd drop-in (`50-orion-gpu.conf`) and restarts the service:
+  - NVIDIA cards are pinned by UUID through `CUDA_VISIBLE_DEVICES`; NVIDIA cards not chosen are hidden.
+  - AMD cards through `ROCR_VISIBLE_DEVICES`; Intel through `ONEAPI_DEVICE_SELECTOR`.
+
+  An empty list removes the pin. Protected units and `services.allowed` apply as for `svc_control`. Typical uses: keep the big model on the big card, or run two servers (Ollama and a llama.cpp server) with a GPU each.
+- Orion reads the pin back from the server's environment, so budgets and predictions follow it, whoever set it.
+
 ### Local models and VRAM
 
 `model_status` finds the inference servers on this machine: `chat.local.base_url`, anything in `[models] servers`, and whatever answers on the usual ports (Ollama 11434, llama.cpp 8080, vLLM 8000, LM Studio 1234). For each it shows the kind, the process serving it, the models it offers (with their size and estimated VRAM need), and on Ollama what is loaded, how much of it is on the GPU, and when it expires. Next to that is the GPU ledger: each card's memory, the processes using it, and what is free for models.
 
-- **The VRAM budget** is each GPU's memory less `[models] vram_reserve_mb` (1 GiB by default, for the desktop and other programs), less what is already in use. `model_load` checks a model fits before you are asked: about 1.15 × its size plus 512 MiB, for the KV cache and buffers.
+- **The VRAM budget** is each GPU's memory less `[models] vram_reserve_mb` (1 GiB by default, for the desktop and other programs), less what is already in use, over the GPUs the server may use (see [GPUs](#gpus)). `model_load` checks a model fits before you are asked: about 1.15 × its size plus 512 MiB, for the KV cache and buffers.
 - **If it doesn't fit,** the load is refused with what is in the way. With `evict: true` Orion first unloads the models due to expire soonest (the least recently used), only as many as needed.
 - **`keep_alive`** sets how long a model stays loaded after its last use (`[models] keep_alive`, default `30m`; `-1` keeps it loaded).
 - **Loading and pulling work on Ollama.** llama.cpp, vLLM and LM Studio serve one fixed model each; manage those as services with `svc_control`.
 - The machine panel in the full-screen chat and the shell lists the loaded models with their VRAM, and any failed services.
-- Without NVIDIA readings (no `nvidia-smi`), loads aren't budgeted and `model_status` says so.
+- Without memory readings (an Intel GPU, or no `nvidia-smi`), loads aren't budgeted and `model_status` says so.
 
 ## System service
 
@@ -602,8 +629,9 @@ src/
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
   daemon.rs     the system service: socket, peer checks, live reload, the stdio bridge
   sandbox.rs    sandboxing for proc_run: bubblewrap, Landlock, resource limits
-  tools/        built-in tools: system (and GPUs), fs, process, network, services
-                (systemd), packages, models (inference servers, VRAM budget);
+  tools/        built-in tools: system, fs, process, network, services
+                (systemd), packages, models (inference servers, VRAM budget), gpu
+                (recognition, per-process use, placement, gpu_assign);
                 exec.rs runs programs for them
   chat/
     mod.rs      config, the Backend and Ui traits
@@ -642,5 +670,5 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
-4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. Next: GPU placement (which card a model goes on), network changes (Wi-Fi, firewall), disks and mounts, and updates.
+4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~ are done too. Next: network changes (Wi-Fi, firewall), disks and mounts, and updates.
 5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

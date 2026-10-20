@@ -2,6 +2,7 @@
 
 mod exec;
 mod fs;
+pub mod gpu;
 mod models;
 mod network;
 mod packages;
@@ -15,12 +16,12 @@ use crate::tool::Tool;
 /// bypass the policy and audit log, so a UI can poll them.
 pub use models::loaded_models;
 pub use services::failed_units;
-pub use system::{gpus as gpu_status, info as machine_info};
+pub use system::info as machine_info;
 
 pub fn builtin() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(system::SystemInfo),
-        Box::new(system::GpuInfo),
+        Box::new(gpu::GpuInfo),
         Box::new(network::NetInfo),
         Box::new(fs::FsList),
         Box::new(fs::FsRead),
@@ -39,5 +40,6 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(models::ModelLoad),
         Box::new(models::ModelUnload),
         Box::new(models::ModelPull),
+        Box::new(gpu::GpuAssign),
     ]
 }
