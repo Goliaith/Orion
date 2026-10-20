@@ -217,6 +217,26 @@ How it works: the microphone stays open, and a pause detector (with a noise floo
 - **No leftover microphone:** the microphone is closed as soon as wake listening stops, and it can't outlive Orion even if Orion is killed.
 - **The line-by-line chat** can't take input while it waits at its prompt, so wake listening is only in the full-screen chat, the shell and [headless voice](#headless-voice).
 
+#### Speaker verification
+
+Enroll your voice and only you can wake Orion. Other people, and the television, are ignored.
+
+```sh
+orion voice enroll     # say six short phrases; about a minute
+orion voice test       # say anything: "That's you: 0.94" or "doesn't sound like the enrolled voice: 1.91"
+orion voice status
+orion voice forget     # anyone can wake Orion again
+```
+
+- **It applies wherever Orion listens for its wake word:** the full-screen chat, the shell and `orion listen`. It covers spoken approvals too, so "Orion, yes" from someone else approves nothing. Ctrl-T recordings aren't checked, since you're at the keyboard.
+- **Other voices are never transcribed.** Each utterance is checked before anything transcribes it, and one in another voice is dropped. Their words never reach the transcriber, and `/voice` shows how many were ignored.
+- **A bare "Orion" is often too short to judge** (under 0.4 s of speech), so it may wake Orion, but the request that follows is judged together with it and must match. If it doesn't, the chat and the shell show "that didn't sound like your voice", and `orion listen` says "Sorry, I didn't recognize your voice."
+- **How it works:** no model to download, and it runs on this machine in milliseconds. Each 10 ms of speech becomes 19 mel-cepstral coefficients and their deltas. Enrollment summarizes your phrases as a codebook of 32 typical frames, and a new utterance is scored by how far its frames lie from that codebook, relative to how far your own phrases lie from a codebook built without them. That ratio is about 1 for you, whatever you say; the default limit is 1.2 (`verify_threshold`, lower is stricter).
+- **How well it works:** on 8 synthesized voices (espeak-ng) with six enrollment phrases each, it rejected none of 48 new phrases from the enrolled voice and accepted 4 of 648 phrases from other voices (0.6%). Two voices with the same vocal tract and a different pitch accepted each other: it tells vocal tracts apart, not pitch. A noisy room makes false accepts more likely. Enroll where you usually talk to Orion, with the same microphone, and enroll again if the room or microphone changes.
+- **It keeps other voices out; it isn't proof of identity.** A recording of you gets through, and so may a very similar voice, which is why spoken approval stays off unless you turn on `wake_approvals`.
+- **The voiceprint** is `~/.local/state/orion/voiceprint.json`, readable only by you. It holds averaged sound features that can't be turned back into speech. Programs the AI runs can't see it; the sandbox hides Orion's whole state directory.
+- **Settings:** `verify_speaker = "auto"` (on once a voice is enrolled; `"on"` refuses to listen without one, `"off"` never checks) and `verify_threshold` under `[voice]`.
+
 #### Headless voice
 
 `orion listen` is Orion with no screen at all: it listens for the wake phrase, works on what you ask, and speaks the answer. That makes it a voice assistant for the machine, made to run as a service.
@@ -377,6 +397,7 @@ orion audit -n 20                             # recent calls, as JSON lines
 orion conversations                           # saved chats (see "Saved conversations")
 orion shell                                   # the graphical shell (see "Graphical shell")
 orion listen                                  # headless voice: "Orion, …" (see "Headless voice")
+orion voice enroll                            # only your voice wakes Orion (see "Speaker verification")
 orion serve                                   # MCP server on stdin/stdout (through the daemon when it runs)
 orion daemon                                  # the system service (see "System service")
 orion status                                  # whether the daemon runs, and how
@@ -482,7 +503,7 @@ Every program the AI starts with `proc_run` runs in a sandbox, whatever the poli
 | Memory, CPU time, file size, no core dumps, no privilege gain | ✓ | ✓ | ✓ |
 
 - **`mode = "auto"`** uses bubblewrap if it is installed and works (`apt install bubblewrap`), else Landlock (Linux 5.13+, no install needed), else only the limits. `require = true` refuses to run programs rather than fall back to limits only.
-- **Hidden paths** are `[sandbox] hide` (your keys, password store, cloud credentials and Orion's own config, so a program can't loosen its policy) plus `chat.router.private_paths`.
+- **Hidden paths** are `[sandbox] hide` (your keys, password store, cloud credentials and Orion's own config, so a program can't loosen its policy) plus `chat.router.private_paths`, and always Orion's state directory (conversations, the audit log, the shell's token, the voiceprint).
 - **`network = true`** and **`gpu = true`** open those up, for example for package installs or CUDA work. Landlock can only restrict TCP, so for a full network block install bubblewrap.
 - **Limits** are per program: `memory_mb` (default 8192), `cpu_secs` (300) and `max_file_mb` (4096); `0` turns one off. Programs also can't gain privileges through setuid binaries.
 - Each result says which sandbox ran it (`"sandbox": "bubblewrap"`), and `orion tools` prints the current one.
@@ -537,7 +558,8 @@ src/
   interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
   voice/        listening and the pause detector (record.rs), speech to text
                 (transcribe.rs), text to speech and sentence splitting (speak.rs),
-                the wake word (wake.rs)
+                the wake word (wake.rs), speaker verification (speaker.rs) and
+                enrolling a voice (enroll.rs)
 contrib/        orion.socket and orion.service (the daemon), orion-voice.service
                 (headless voice), orion-kiosk (boot into the shell), orion-shell.service
 tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
@@ -552,4 +574,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. Next: GPU placement (which card a model goes on), network changes (Wi-Fi, firewall), disks and mounts, and updates.
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`) is done too. Still to come: speaker verification, so only your voice wakes it.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`) and ~~speaker verification~~ are done too. Next for voice: a neural speaker model as an option (stronger against similar voices), and several enrolled people.

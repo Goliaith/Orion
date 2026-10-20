@@ -32,6 +32,18 @@ enum ConversationCmd {
 }
 
 #[derive(Subcommand)]
+enum VoiceCmd {
+    /// Teach Orion your voice, so only you can wake it.
+    Enroll,
+    /// Say something and see whether Orion takes it for your voice.
+    Test,
+    /// Whether a voice is enrolled.
+    Status,
+    /// Delete the voiceprint: anyone can wake Orion again.
+    Forget,
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Talk to an AI in the terminal; it works on the machine through Orion's tools.
     Chat {
@@ -99,6 +111,11 @@ enum Cmd {
         /// Don't say "Listening." at the start.
         #[arg(long)]
         quiet: bool,
+    },
+    /// Speaker verification: enroll your voice, test it, or forget it.
+    Voice {
+        #[command(subcommand)]
+        action: VoiceCmd,
     },
     /// List, show or delete saved chat conversations.
     Conversations {
@@ -178,6 +195,15 @@ fn main() -> Result<()> {
                 _ => None,
             };
             orion::chat::listen::run(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), quiet)
+        }
+        Cmd::Voice { action } => {
+            let v = &policy.voice;
+            match action {
+                VoiceCmd::Enroll => orion::voice::enroll::enroll(v),
+                VoiceCmd::Test => orion::voice::enroll::test(v),
+                VoiceCmd::Status => orion::voice::enroll::status(v),
+                VoiceCmd::Forget => orion::voice::enroll::forget(),
+            }
         }
         Cmd::Daemon { socket } => daemon::run(policy, source, socket),
         Cmd::Status => {

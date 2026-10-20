@@ -118,6 +118,10 @@ impl<L: Log> Headless<L> {
                 self.log.line("(woke: listening for the request)");
             }
             WakeEvent::NoRequest => self.log.line("(woke, but heard no request)"),
+            WakeEvent::NotYou => {
+                self.log.line("(a voice other than the enrolled one: ignored)");
+                self.say("Sorry, I didn't recognize your voice.");
+            }
             WakeEvent::Failed(e) => {
                 self.log.line(&format!("the microphone stopped: {e} (trying again in {}s)", RETRY.as_secs()));
                 self.failed_at = Some(Instant::now());

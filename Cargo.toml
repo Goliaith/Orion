@@ -21,3 +21,8 @@ ureq = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# The speaker-verification tests do real signal processing; unoptimized
+# they take several times longer.
+[profile.test]
+opt-level = 1

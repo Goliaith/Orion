@@ -273,6 +273,7 @@ fn on_wake(hub: &Hub, ev: WakeEvent) {
             hub.voice(|v| v.hush());
         }
         WakeEvent::NoRequest => note("Woke, but heard no request"),
+        WakeEvent::NotYou => note("That didn't sound like your voice"),
         WakeEvent::Failed(e) => {
             hub.broadcast(json!({ "type": "voice_error", "text": format!("stopped listening for the wake phrase: {e}") }), false);
             hub.broadcast(hub.wake_json(), false);

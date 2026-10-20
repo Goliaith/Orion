@@ -6,8 +6,10 @@
 //! text-to-speech command or server. Nothing leaves the machine unless a
 //! URL here points elsewhere.
 
+pub mod enroll;
 pub mod record;
 pub mod speak;
+pub mod speaker;
 pub mod transcribe;
 pub mod wake;
 
@@ -80,6 +82,13 @@ pub struct VoiceConfig {
     pub wake_allow_remote: bool,
     /// Let "Orion, yes" approve a tool call. "No" always declines.
     pub wake_approvals: bool,
+    /// Only the enrolled voice can wake Orion: `auto` once a voice is
+    /// enrolled (`orion voice enroll`), `on` (refuse to listen without
+    /// one), or `off`.
+    pub verify_speaker: Verify,
+    /// How close to the enrolled voice: the distortion ratio allowed, where
+    /// 1.0 is typical for the enrolled speaker. Lower is stricter.
+    pub verify_threshold: f32,
     /// `orion listen`: start a new conversation when the last request is
     /// this many minutes old (0: one conversation for good).
     pub listen_new_after_mins: u64,
@@ -115,7 +124,35 @@ impl Default for VoiceConfig {
             wake_allow_remote: false,
             wake_approvals: false,
             listen_new_after_mins: 10,
+            verify_speaker: Verify::Auto,
+            verify_threshold: 1.2,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verify {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl VoiceConfig {
+    /// The voiceprint wake listening should hold to, if any.
+    pub fn voiceprint(&self) -> Result<Option<speaker::Voiceprint>, String> {
+        if self.verify_speaker == Verify::Off {
+            return Ok(None);
+        }
+        let path = speaker::Voiceprint::default_path().ok_or("no state directory for the voiceprint (is HOME set?)")?;
+        if !path.exists() {
+            return match self.verify_speaker {
+                Verify::On => Err("speaker verification is on, but no voice is enrolled: run `orion voice enroll`".into()),
+                _ => Ok(None),
+            };
+        }
+        speaker::Voiceprint::load(&path).map(Some).map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -171,7 +208,8 @@ impl VoiceIo {
         }
         let recorder = self.recorder.clone()?;
         let transcriber = self.transcriber.clone().map_err(|e| format!("can't transcribe: {e}"))?;
-        let w = WakeListener::start(&self.config, recorder, transcriber).map_err(|e| format!("{e:#}"))?;
+        let voiceprint = self.config.voiceprint()?;
+        let w = WakeListener::start(&self.config, recorder, transcriber, voiceprint).map_err(|e| format!("{e:#}"))?;
         let what = w.describe().to_string();
         self.wake = Some(w);
         Ok(what)
@@ -265,6 +303,15 @@ impl VoiceIo {
                     format!(
                         "  replies      {}",
                         if self.speak_replies { "spoken (/voice speak off)" } else { "silent (/voice speak on)" }
+                    ),
+                    format!(
+                        "  speaker      {}",
+                        match (self.config.voiceprint(), &self.wake) {
+                            (Err(e), _) => format!("unavailable: {e}"),
+                            (Ok(None), _) => "anyone (orion voice enroll: only you)".into(),
+                            (Ok(Some(v)), Some(w)) => format!("only your voice ({} phrases enrolled); {} others ignored", v.phrases, w.ignored()),
+                            (Ok(Some(v)), None) => format!("only your voice ({} phrases enrolled)", v.phrases),
+                        }
                     ),
                     format!(
                         "  wake word    {}",

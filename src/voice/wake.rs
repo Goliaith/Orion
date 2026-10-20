@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use super::record::{meter, rms, speech_threshold, CHUNK_MS, MIN_SPEECH_MS};
+use super::speaker::{Verdict, Voiceprint};
 use super::{kill_group, shell, Recorder, Transcriber, VoiceConfig};
 
 /// The part of an utterance checked for the wake phrase.
@@ -45,6 +46,9 @@ pub enum WakeEvent {
     Request(String),
     /// Woke, but no request followed.
     NoRequest,
+    /// Woke by a bare wake phrase, but the request was in another voice
+    /// than the enrolled one.
+    NotYou,
     /// Listening stopped (the microphone failed, say).
     Failed(String),
 }
@@ -68,6 +72,8 @@ struct Shared {
     level: Mutex<f32>,
     /// The process group holding the microphone, to stop it.
     child: Mutex<Option<u32>>,
+    /// Utterances dropped, unheard, for being in another voice.
+    ignored: std::sync::atomic::AtomicUsize,
 }
 
 impl Shared {
@@ -89,6 +95,8 @@ struct Setup {
     recorder: Recorder,
     transcriber: Transcriber,
     command: String,
+    /// Only this voice, at this threshold.
+    voice: Option<(Voiceprint, f32)>,
     chime: Option<String>,
     silence_ms: u64,
     max_ms: u64,
@@ -96,7 +104,8 @@ struct Setup {
 }
 
 impl WakeListener {
-    pub fn start(config: &VoiceConfig, recorder: Recorder, transcriber: Transcriber) -> Result<Self> {
+    /// Listen for the wake phrase; with a voiceprint, only in that voice.
+    pub fn start(config: &VoiceConfig, recorder: Recorder, transcriber: Transcriber, voice: Option<Voiceprint>) -> Result<Self> {
         let phrase = config.wake_phrase.trim().to_lowercase();
         if words(&phrase).is_empty() {
             bail!("voice.wake_phrase is empty");
@@ -113,12 +122,14 @@ impl WakeListener {
         } else {
             format!("say the wake word (detected by {})", config.wake_command.split_whitespace().next().unwrap_or_default())
         };
+        let description = if voice.is_some() { format!("{description}, only your voice") } else { description };
         let setup = Setup {
             phrase,
             aliases: config.wake_aliases.iter().map(|a| a.to_lowercase()).collect(),
             recorder,
             transcriber,
             command: config.wake_command.clone(),
+            voice: voice.map(|v| (v, config.verify_threshold)),
             chime: config.wake_chime.then(|| super::player(config)).flatten(),
             silence_ms: config.silence_ms.max(300),
             max_ms: config.max_seconds.max(1) * 1000,
@@ -130,6 +141,7 @@ impl WakeListener {
             state: Mutex::new(WakeState::Waiting),
             level: Mutex::new(0.0),
             child: Mutex::new(None),
+            ignored: Default::default(),
         });
         let (tx, events) = mpsc::channel();
         let sh = shared.clone();
@@ -166,6 +178,11 @@ impl WakeListener {
     /// Input level from 0 to 1, for a meter while hearing a request.
     pub fn level(&self) -> f32 {
         *self.shared.level.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many utterances were dropped for being in another voice.
+    pub fn ignored(&self) -> usize {
+        self.shared.ignored.load(Ordering::SeqCst)
     }
 
     pub fn try_event(&self) -> Option<WakeEvent> {
@@ -207,6 +224,8 @@ fn listen(setup: &Setup, shared: &Shared, tx: &Sender<WakeEvent>) -> Result<()> 
     let mut seg = Segmenter::new(rate, GAP_MS, MAX_UTTERANCE_MS);
     // When woke by a bare wake phrase: since when we wait for the request.
     let mut hearing: Option<Instant> = None;
+    // That wake phrase's audio, to judge the voice together with the request.
+    let mut wake_audio: Vec<i16> = Vec::new();
     loop {
         if shared.stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -241,6 +260,12 @@ fn listen(setup: &Setup, shared: &Shared, tx: &Sender<WakeEvent>) -> Result<()> 
             if hearing.take().is_some() {
                 // The request that follows a bare wake phrase.
                 seg.set_limits(GAP_MS, MAX_UTTERANCE_MS);
+                let both: Vec<i16> = std::mem::take(&mut wake_audio).into_iter().chain(utterance.iter().copied()).collect();
+                if !verify(setup, shared, &both, rate, true) {
+                    shared.set(WakeState::Waiting);
+                    let _ = tx.send(WakeEvent::NotYou);
+                    continue;
+                }
                 shared.set(WakeState::Transcribing);
                 let heard = transcribe(setup, &utterance, rate);
                 shared.set(WakeState::Waiting);
@@ -254,6 +279,18 @@ fn listen(setup: &Setup, shared: &Shared, tx: &Sender<WakeEvent>) -> Result<()> 
                 }
                 continue;
             }
+            // Another voice is dropped before anything transcribes it. Too
+            // short to tell (a bare "Orion") may wake, and is judged again
+            // together with the request.
+            let unsure = match setup.voice.as_ref().map(|(v, t)| v.verify(&utterance, rate, *t)) {
+                Some(Verdict::Other(score)) => {
+                    tracing::debug!("wake: another voice ({score:.2})");
+                    shared.ignored.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                Some(Verdict::TooShort) => true,
+                _ => false,
+            };
             let check = &utterance[..utterance.len().min((rate as u64 * CHECK_MS / 1000) as usize)];
             let Some(start) = transcribe(setup, check, rate) else { continue };
             let Some(rest) = match_wake(&start, &setup.phrase, &setup.aliases) else { continue };
@@ -265,9 +302,13 @@ fn listen(setup: &Setup, shared: &Shared, tx: &Sender<WakeEvent>) -> Result<()> 
             } else {
                 rest
             };
-            if has_words(&rest) {
+            if has_words(&rest) && !unsure {
                 let _ = tx.send(WakeEvent::Request(rest));
+            } else if has_words(&rest) {
+                // A request too short to tell the voice: not taken.
+                shared.ignored.fetch_add(1, Ordering::SeqCst);
             } else {
+                wake_audio = utterance;
                 chime(setup);
                 let _ = tx.send(WakeEvent::Woke);
                 shared.set(WakeState::Hearing);
@@ -340,11 +381,34 @@ fn record_request(setup: &Setup, shared: &Shared) -> WakeEvent {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    let Ok(wav) = rec.finish() else { return WakeEvent::NoRequest };
+    let samples: Vec<i16> = wav[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    if !verify(setup, shared, &samples, setup.recorder.rate(), true) {
+        return WakeEvent::NotYou;
+    }
     shared.set(WakeState::Transcribing);
-    match rec.finish().and_then(|wav| setup.transcriber.transcribe(&wav)) {
+    match setup.transcriber.transcribe(&wav) {
         Ok(text) if has_words(&text) => WakeEvent::Request(text),
         _ => WakeEvent::NoRequest,
     }
+}
+
+/// Whether the audio is in the enrolled voice (always, without one). With
+/// `strict`, too short to tell counts as no.
+fn verify(setup: &Setup, shared: &Shared, samples: &[i16], rate: u32, strict: bool) -> bool {
+    let Some((voice, threshold)) = &setup.voice else { return true };
+    let ok = match voice.verify(samples, rate, *threshold) {
+        Verdict::Match(_) => true,
+        Verdict::TooShort => !strict,
+        Verdict::Other(score) => {
+            tracing::debug!("wake: another voice ({score:.2})");
+            false
+        }
+    };
+    if !ok {
+        shared.ignored.fetch_add(1, Ordering::SeqCst);
+    }
+    ok
 }
 
 fn transcribe(setup: &Setup, samples: &[i16], rate: u32) -> Option<String> {
@@ -724,7 +788,7 @@ mod tests {
         let (transcriber, _dir) = scripted(&["Nice weather today.", "Orion, what's using the GPU?", "Orion.", "Restart Ollama."]);
         let (recorder, _f) = super::super::record::tests::recorder_for(&audio, 1200);
         let config = VoiceConfig { wake_chime: false, silence_ms: 700, ..Default::default() };
-        let l = WakeListener::start(&config, recorder, transcriber).unwrap();
+        let l = WakeListener::start(&config, recorder, transcriber, None).unwrap();
         assert_eq!(wait(&l), WakeEvent::Request("what's using the GPU?".into()));
         assert_eq!(wait(&l), WakeEvent::Woke);
         assert_eq!(wait(&l), WakeEvent::Request("Restart Ollama.".into()));
@@ -744,9 +808,32 @@ mod tests {
             silence_ms: 700,
             ..Default::default()
         };
-        let l = WakeListener::start(&config, recorder, transcriber).unwrap();
+        let l = WakeListener::start(&config, recorder, transcriber, None).unwrap();
         assert_eq!(wait(&l), WakeEvent::Woke);
         assert_eq!(wait(&l), WakeEvent::Request("Restart Ollama.".into()));
+    }
+
+    #[test]
+    fn only_the_enrolled_voice_gets_in() {
+        use super::super::speaker::tests::voice;
+        let me = |text, secs| voice(120.0, 1.0, text, secs);
+        let enroll: Vec<Vec<i16>> = (1..=6).map(|t| me(t, 3.0)).collect();
+        let vp = Voiceprint::enroll(&enroll, 16_000).unwrap();
+        let quiet = |ms: usize| vec![0i16; 16 * ms];
+        // You ask; someone else talks; you say "Orion" and they make the request.
+        let audio: Vec<i16> = [quiet(500), me(21, 2.0), quiet(900), voice(210.0, 1.18, 22, 2.0), quiet(900), me(23, 0.6), quiet(900), voice(210.0, 1.18, 24, 1.5), quiet(2500)].concat();
+        let pcm: Vec<u8> = audio.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let (transcriber, dir) = scripted(&["Orion, what's using the GPU?", "Orion.", "Install everything."]);
+        let (recorder, _f) = super::super::record::tests::recorder_for(&pcm, 700);
+        let config = VoiceConfig { wake_chime: false, silence_ms: 700, ..Default::default() };
+        let l = WakeListener::start(&config, recorder, transcriber, Some(vp)).unwrap();
+        assert!(l.describe().ends_with("only your voice"));
+        assert_eq!(wait(&l), WakeEvent::Request("what's using the GPU?".into()));
+        assert_eq!(wait(&l), WakeEvent::Woke);
+        assert_eq!(wait(&l), WakeEvent::NotYou);
+        // The other voice was never transcribed: two calls, both for you.
+        assert_eq!(std::fs::read_to_string(dir.path().join("n")).unwrap().trim(), "2");
+        assert_eq!(l.ignored(), 2);
     }
 
     #[test]
@@ -754,7 +841,7 @@ mod tests {
         let remote = VoiceConfig { transcribe_url: "https://api.example.com/v1".into(), ..Default::default() };
         let t = Transcriber::from_config(&remote).unwrap();
         let (recorder, _f) = super::super::record::tests::recorder_for(&[], 700);
-        let err = WakeListener::start(&remote, recorder, t).err().unwrap();
+        let err = WakeListener::start(&remote, recorder, t, None).err().unwrap();
         assert!(err.to_string().contains("api.example.com"), "{err}");
     }
 }

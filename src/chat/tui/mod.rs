@@ -470,6 +470,7 @@ impl App {
                 self.levels.clear();
             }
             WakeEvent::NoRequest => self.flash("woke, but heard no request"),
+            WakeEvent::NotYou => self.flash("that didn't sound like your voice"),
             WakeEvent::Failed(e) => self.entries.push(Entry::Notice(format!("voice: stopped listening for the wake phrase: {e}"))),
             WakeEvent::Request(text) => {
                 self.voice.hush();
