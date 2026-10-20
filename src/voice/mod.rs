@@ -7,9 +7,11 @@
 //! URL here points elsewhere.
 
 pub mod enroll;
+pub mod neural;
 pub mod record;
 pub mod speak;
 pub mod speaker;
+mod torch;
 pub mod transcribe;
 pub mod wake;
 
@@ -86,8 +88,15 @@ pub struct VoiceConfig {
     /// enrolled (`orion voice enroll`), `on` (refuse to listen without
     /// one), or `off`.
     pub verify_speaker: Verify,
-    /// How close to the enrolled voice: the distortion ratio allowed, where
-    /// 1.0 is typical for the enrolled speaker. Lower is stricter.
+    /// `auto`: the neural speaker model when it is installed and the voice
+    /// was enrolled with it, else the built-in method. `neural` requires
+    /// the model; `builtin` never uses it.
+    pub verify_method: VerifyMethod,
+    /// Neural method: how similar to the enrolled voice an utterance must
+    /// be (cosine, 0 to 1). Higher is stricter.
+    pub verify_similarity: f32,
+    /// Built-in method: the distortion ratio allowed, where 1.0 is typical
+    /// for the enrolled speaker. Lower is stricter.
     pub verify_threshold: f32,
     /// `orion listen`: start a new conversation when the last request is
     /// this many minutes old (0: one conversation for good).
@@ -125,6 +134,8 @@ impl Default for VoiceConfig {
             wake_approvals: false,
             listen_new_after_mins: 10,
             verify_speaker: Verify::Auto,
+            verify_method: VerifyMethod::Auto,
+            verify_similarity: 0.8,
             verify_threshold: 1.2,
         }
     }
@@ -139,9 +150,32 @@ pub enum Verify {
     Off,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyMethod {
+    #[default]
+    Auto,
+    Neural,
+    Builtin,
+}
+
 impl VoiceConfig {
-    /// The voiceprint wake listening should hold to, if any.
-    pub fn voiceprint(&self) -> Result<Option<speaker::Voiceprint>, String> {
+    /// The neural speaker model, if installed and wanted.
+    pub fn speaker_model(&self) -> Result<Option<neural::Ge2e>, String> {
+        if self.verify_method == VerifyMethod::Builtin {
+            return Ok(None);
+        }
+        let path = neural::Ge2e::default_path().ok_or("no data directory for the speaker model (is HOME set?)")?;
+        match neural::Ge2e::load(&path) {
+            Ok(m) => Ok(Some(m)),
+            Err(_) if !path.exists() && self.verify_method == VerifyMethod::Auto => Ok(None),
+            Err(_) if !path.exists() => Err("voice.verify_method is \"neural\", but the model isn't installed: run `orion voice model install`".into()),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
+
+    /// What wake listening should hold voices to, if anything.
+    pub fn judge(&self) -> Result<Option<speaker::Judge>, String> {
         if self.verify_speaker == Verify::Off {
             return Ok(None);
         }
@@ -152,7 +186,12 @@ impl VoiceConfig {
                 _ => Ok(None),
             };
         }
-        speaker::Voiceprint::load(&path).map(Some).map_err(|e| format!("{e:#}"))
+        let print = speaker::Voiceprint::load(&path).map_err(|e| format!("{e:#}"))?;
+        let model = self.speaker_model()?;
+        if self.verify_method == VerifyMethod::Neural && print.neural.is_none() {
+            return Err("your voice was enrolled without the neural model: run `orion voice enroll` again".into());
+        }
+        Ok(Some(speaker::Judge::new(print, model, self.verify_threshold, self.verify_similarity)))
     }
 }
 
@@ -208,8 +247,8 @@ impl VoiceIo {
         }
         let recorder = self.recorder.clone()?;
         let transcriber = self.transcriber.clone().map_err(|e| format!("can't transcribe: {e}"))?;
-        let voiceprint = self.config.voiceprint()?;
-        let w = WakeListener::start(&self.config, recorder, transcriber, voiceprint).map_err(|e| format!("{e:#}"))?;
+        let judge = self.config.judge()?;
+        let w = WakeListener::start(&self.config, recorder, transcriber, judge).map_err(|e| format!("{e:#}"))?;
         let what = w.describe().to_string();
         self.wake = Some(w);
         Ok(what)
@@ -306,11 +345,17 @@ impl VoiceIo {
                     ),
                     format!(
                         "  speaker      {}",
-                        match (self.config.voiceprint(), &self.wake) {
+                        match (self.config.judge(), &self.wake) {
                             (Err(e), _) => format!("unavailable: {e}"),
                             (Ok(None), _) => "anyone (orion voice enroll: only you)".into(),
-                            (Ok(Some(v)), Some(w)) => format!("only your voice ({} phrases enrolled); {} others ignored", v.phrases, w.ignored()),
-                            (Ok(Some(v)), None) => format!("only your voice ({} phrases enrolled)", v.phrases),
+                            (Ok(Some(j)), w) => {
+                                let how = match j.method() {
+                                    speaker::Method::Neural => "neural model",
+                                    speaker::Method::Codebook => "built-in method",
+                                };
+                                let ignored = w.as_ref().map(|w| format!("; {} others ignored", w.ignored())).unwrap_or_default();
+                                format!("only your voice ({how}, {} phrases enrolled){ignored}", j.print.phrases)
+                            }
                         }
                     ),
                     format!(

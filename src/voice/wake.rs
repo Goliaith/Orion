@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use super::record::{meter, rms, speech_threshold, CHUNK_MS, MIN_SPEECH_MS};
-use super::speaker::{Verdict, Voiceprint};
+use super::speaker::{Judge, Verdict};
 use super::{kill_group, shell, Recorder, Transcriber, VoiceConfig};
 
 /// The part of an utterance checked for the wake phrase.
@@ -96,7 +96,7 @@ struct Setup {
     transcriber: Transcriber,
     command: String,
     /// Only this voice, at this threshold.
-    voice: Option<(Voiceprint, f32)>,
+    voice: Option<Judge>,
     chime: Option<String>,
     silence_ms: u64,
     max_ms: u64,
@@ -105,7 +105,7 @@ struct Setup {
 
 impl WakeListener {
     /// Listen for the wake phrase; with a voiceprint, only in that voice.
-    pub fn start(config: &VoiceConfig, recorder: Recorder, transcriber: Transcriber, voice: Option<Voiceprint>) -> Result<Self> {
+    pub fn start(config: &VoiceConfig, recorder: Recorder, transcriber: Transcriber, voice: Option<Judge>) -> Result<Self> {
         let phrase = config.wake_phrase.trim().to_lowercase();
         if words(&phrase).is_empty() {
             bail!("voice.wake_phrase is empty");
@@ -129,7 +129,7 @@ impl WakeListener {
             recorder,
             transcriber,
             command: config.wake_command.clone(),
-            voice: voice.map(|v| (v, config.verify_threshold)),
+            voice,
             chime: config.wake_chime.then(|| super::player(config)).flatten(),
             silence_ms: config.silence_ms.max(300),
             max_ms: config.max_seconds.max(1) * 1000,
@@ -282,9 +282,9 @@ fn listen(setup: &Setup, shared: &Shared, tx: &Sender<WakeEvent>) -> Result<()> 
             // Another voice is dropped before anything transcribes it. Too
             // short to tell (a bare "Orion") may wake, and is judged again
             // together with the request.
-            let unsure = match setup.voice.as_ref().map(|(v, t)| v.verify(&utterance, rate, *t)) {
+            let unsure = match setup.voice.as_ref().map(|j| j.verify(&utterance, rate)) {
                 Some(Verdict::Other(score)) => {
-                    tracing::debug!("wake: another voice ({score:.2})");
+                    tracing::debug!("wake: another voice ({score})");
                     shared.ignored.fetch_add(1, Ordering::SeqCst);
                     continue;
                 }
@@ -396,12 +396,12 @@ fn record_request(setup: &Setup, shared: &Shared) -> WakeEvent {
 /// Whether the audio is in the enrolled voice (always, without one). With
 /// `strict`, too short to tell counts as no.
 fn verify(setup: &Setup, shared: &Shared, samples: &[i16], rate: u32, strict: bool) -> bool {
-    let Some((voice, threshold)) = &setup.voice else { return true };
-    let ok = match voice.verify(samples, rate, *threshold) {
+    let Some(judge) = &setup.voice else { return true };
+    let ok = match judge.verify(samples, rate) {
         Verdict::Match(_) => true,
         Verdict::TooShort => !strict,
         Verdict::Other(score) => {
-            tracing::debug!("wake: another voice ({score:.2})");
+            tracing::debug!("wake: another voice ({score})");
             false
         }
     };
@@ -818,7 +818,7 @@ mod tests {
         use super::super::speaker::tests::voice;
         let me = |text, secs| voice(120.0, 1.0, text, secs);
         let enroll: Vec<Vec<i16>> = (1..=6).map(|t| me(t, 3.0)).collect();
-        let vp = Voiceprint::enroll(&enroll, 16_000).unwrap();
+        let vp = super::super::speaker::Voiceprint::enroll(&enroll, 16_000, None).unwrap();
         let quiet = |ms: usize| vec![0i16; 16 * ms];
         // You ask; someone else talks; you say "Orion" and they make the request.
         let audio: Vec<i16> = [quiet(500), me(21, 2.0), quiet(900), voice(210.0, 1.18, 22, 2.0), quiet(900), me(23, 0.6), quiet(900), voice(210.0, 1.18, 24, 1.5), quiet(2500)].concat();
@@ -826,7 +826,7 @@ mod tests {
         let (transcriber, dir) = scripted(&["Orion, what's using the GPU?", "Orion.", "Install everything."]);
         let (recorder, _f) = super::super::record::tests::recorder_for(&pcm, 700);
         let config = VoiceConfig { wake_chime: false, silence_ms: 700, ..Default::default() };
-        let l = WakeListener::start(&config, recorder, transcriber, Some(vp)).unwrap();
+        let l = WakeListener::start(&config, recorder, transcriber, Some(Judge::new(vp, None, 1.2, 0.8))).unwrap();
         assert!(l.describe().ends_with("only your voice"));
         assert_eq!(wait(&l), WakeEvent::Request("what's using the GPU?".into()));
         assert_eq!(wait(&l), WakeEvent::Woke);

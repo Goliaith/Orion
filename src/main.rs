@@ -41,6 +41,25 @@ enum VoiceCmd {
     Status,
     /// Delete the voiceprint: anyone can wake Orion again.
     Forget,
+    /// The neural speaker model: install, check or remove it.
+    Model {
+        #[command(subcommand)]
+        action: ModelCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// Download the speaker encoder (about 16 MB, from PyPI, checksum pinned) and convert it.
+    Install {
+        /// Use this Resemblyzer 0.1.4 wheel, or its pretrained.pt, instead of downloading.
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// Whether the model is installed.
+    Status,
+    /// Delete the model: verification falls back to the built-in method.
+    Remove,
 }
 
 #[derive(Subcommand)]
@@ -203,6 +222,11 @@ fn main() -> Result<()> {
                 VoiceCmd::Test => orion::voice::enroll::test(v),
                 VoiceCmd::Status => orion::voice::enroll::status(v),
                 VoiceCmd::Forget => orion::voice::enroll::forget(),
+                VoiceCmd::Model { action } => match action {
+                    ModelCmd::Install { from } => orion::voice::enroll::model_install(from.as_deref()),
+                    ModelCmd::Status => orion::voice::enroll::model_status(),
+                    ModelCmd::Remove => orion::voice::enroll::model_remove(),
+                },
             }
         }
         Cmd::Daemon { socket } => daemon::run(policy, source, socket),

@@ -222,20 +222,38 @@ How it works: the microphone stays open, and a pause detector (with a noise floo
 Enroll your voice and only you can wake Orion. Other people, and the television, are ignored.
 
 ```sh
-orion voice enroll     # say six short phrases; about a minute
-orion voice test       # say anything: "That's you: 0.94" or "doesn't sound like the enrolled voice: 1.91"
+orion voice model install   # the neural speaker model: about 16 MB from PyPI, once
+orion voice enroll          # say six short phrases; about a minute
+orion voice test            # say anything: "That's you: similarity 0.86 (needs at least 0.80)"
 orion voice status
-orion voice forget     # anyone can wake Orion again
+orion voice forget          # anyone can wake Orion again
 ```
 
 - **It applies wherever Orion listens for its wake word:** the full-screen chat, the shell and `orion listen`. It covers spoken approvals too, so "Orion, yes" from someone else approves nothing. Ctrl-T recordings aren't checked, since you're at the keyboard.
 - **Other voices are never transcribed.** Each utterance is checked before anything transcribes it, and one in another voice is dropped. Their words never reach the transcriber, and `/voice` shows how many were ignored.
-- **A bare "Orion" is often too short to judge** (under 0.4 s of speech), so it may wake Orion, but the request that follows is judged together with it and must match. If it doesn't, the chat and the shell show "that didn't sound like your voice", and `orion listen` says "Sorry, I didn't recognize your voice."
-- **How it works:** no model to download, and it runs on this machine in milliseconds. Each 10 ms of speech becomes 19 mel-cepstral coefficients and their deltas. Enrollment summarizes your phrases as a codebook of 32 typical frames, and a new utterance is scored by how far its frames lie from that codebook, relative to how far your own phrases lie from a codebook built without them. That ratio is about 1 for you, whatever you say; the default limit is 1.2 (`verify_threshold`, lower is stricter).
-- **How well it works:** on 8 synthesized voices (espeak-ng) with six enrollment phrases each, it rejected none of 48 new phrases from the enrolled voice and accepted 4 of 648 phrases from other voices (0.6%). Two voices with the same vocal tract and a different pitch accepted each other: it tells vocal tracts apart, not pitch. A noisy room makes false accepts more likely. Enroll where you usually talk to Orion, with the same microphone, and enroll again if the room or microphone changes.
-- **It keeps other voices out; it isn't proof of identity.** A recording of you gets through, and so may a very similar voice, which is why spoken approval stays off unless you turn on `wake_approvals`.
-- **The voiceprint** is `~/.local/state/orion/voiceprint.json`, readable only by you. It holds averaged sound features that can't be turned back into speech. Programs the AI runs can't see it; the sandbox hides Orion's whole state directory.
-- **Settings:** `verify_speaker = "auto"` (on once a voice is enrolled; `"on"` refuses to listen without one, `"off"` never checks) and `verify_threshold` under `[voice]`.
+- **A bare "Orion" is often too short to judge**, so it may wake Orion, but the request that follows is judged together with it and must match. If it doesn't, the chat and the shell show "that didn't sound like your voice", and `orion listen` says "Sorry, I didn't recognize your voice."
+
+There are two methods, and Orion uses the better one it has (`verify_method = "auto"`).
+
+**The neural speaker model (recommended).** This is the GE2E speaker encoder (Wan et al., 2018) with the pretrained weights published as [Resemblyzer](https://github.com/resemble-ai/Resemblyzer) (Apache-2.0), trained on thousands of real speakers. Each utterance becomes a 256-number voice embedding, and it is compared with the average of your enrollment phrases by cosine similarity. It passes at 0.80 or more (`verify_similarity`, higher is stricter).
+
+- **It runs here, in plain Rust:** a mel spectrogram exactly as librosa computes it, three LSTM layers and a linear layer, about 0.1 s for a 3-second utterance. Tests hold it to the Python reference implementation: the same features, and the same embedding to a cosine similarity above 0.999.
+- **Installing:** `orion voice model install` downloads the Resemblyzer 0.1.4 wheel from PyPI and checks it against a pinned SHA-256. It reads the PyTorch weights with a small reader of its own that refuses anything but tensors, so unpickling can't run code. It saves a 5.7 MB model to `~/.local/share/orion/models/`. Use `--from <wheel or pretrained.pt>` on a machine without internet. Enroll again after installing it, since a voiceprint made without the model has no embedding.
+- **How well it works:** on a real two-person conversation (pyannote's sample recording), enrolled on one speaker, their own held-out speech scored 0.84 and 0.90. The other speaker's turns scored 0.55 to 0.84, and one of eight passed the 0.80 limit. That's a small, noisy test (turns from a meeting, with crosstalk), not a benchmark. It does not like synthesized voices: espeak-ng's robotic voices all sound alike to it.
+
+**The built-in method (no download).** Each 10 ms of speech becomes 19 mel-cepstral coefficients and their deltas. Enrollment summarizes them as a codebook of 32 typical frames, and an utterance is scored by how far its frames lie from it, relative to your own phrases (about 1 for you; the limit is 1.2, `verify_threshold`, lower is stricter).
+
+- **It tells microphones and rooms apart better than people.** On 8 espeak-ng voices it rejected 0 of 48 of the enrolled voice's phrases and accepted 4 of 648 from others. But on the real conversation it let the other speaker in, while it rejected a recording from elsewhere. It keeps out the television and other devices, not someone talking in the same room. Install the neural model for that.
+
+For both:
+
+- **It keeps other voices out; it isn't proof of identity.** A recording of you gets through, and so may a similar voice, which is why spoken approval stays off unless you turn on `wake_approvals`.
+- **Enroll where you usually talk to Orion,** with the same microphone, and enroll again if that changes. Enrollment warns about a phrase that doesn't match the rest.
+- **The voiceprint** is `~/.local/state/orion/voiceprint.json`, readable only by you. It holds averaged features that can't be turned back into speech. Programs the AI runs can't see it; the sandbox hides Orion's whole state directory.
+- **Settings** under `[voice]`:
+  - `verify_speaker = "auto"`: on once a voice is enrolled. `"on"` refuses to listen without one, and `"off"` never checks.
+  - `verify_method = "auto"`, `"neural"` or `"builtin"`.
+  - `verify_similarity` and `verify_threshold`.
 
 #### Headless voice
 
@@ -397,7 +415,8 @@ orion audit -n 20                             # recent calls, as JSON lines
 orion conversations                           # saved chats (see "Saved conversations")
 orion shell                                   # the graphical shell (see "Graphical shell")
 orion listen                                  # headless voice: "Orion, …" (see "Headless voice")
-orion voice enroll                            # only your voice wakes Orion (see "Speaker verification")
+orion voice model install                     # the neural speaker model (see "Speaker verification")
+orion voice enroll                            # only your voice wakes Orion
 orion serve                                   # MCP server on stdin/stdout (through the daemon when it runs)
 orion daemon                                  # the system service (see "System service")
 orion status                                  # whether the daemon runs, and how
@@ -558,8 +577,9 @@ src/
   interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
   voice/        listening and the pause detector (record.rs), speech to text
                 (transcribe.rs), text to speech and sentence splitting (speak.rs),
-                the wake word (wake.rs), speaker verification (speaker.rs) and
-                enrolling a voice (enroll.rs)
+                the wake word (wake.rs), speaker verification (speaker.rs), the
+                neural speaker encoder (neural.rs), reading PyTorch weights
+                (torch.rs) and enrolling a voice (enroll.rs)
 contrib/        orion.socket and orion.service (the daemon), orion-voice.service
                 (headless voice), orion-kiosk (boot into the shell), orion-shell.service
 tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
@@ -574,4 +594,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. Next: GPU placement (which card a model goes on), network changes (Wi-Fi, firewall), disks and mounts, and updates.
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`) and ~~speaker verification~~ are done too. Next for voice: a neural speaker model as an option (stronger against similar voices), and several enrolled people.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~ and ~~a neural speaker model~~ are done too. Next for voice: several enrolled people, and a benchmark on real recordings.

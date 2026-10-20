@@ -1,6 +1,11 @@
 //! Speaker verification: only the enrolled voice can wake Orion.
 //!
-//! The method is a classic one that needs no trained model. Each 10 ms frame of speech
+//! Two methods. With the neural speaker model installed (`orion voice model
+//! install`, see `neural.rs`), each utterance becomes a voice embedding,
+//! compared with the average of the enrollment phrases' embeddings. That
+//! tells people apart, even on the same microphone.
+//!
+//! Without it, a built-in method that needs no model. Each 10 ms frame of speech
 //! becomes 19 mel-cepstral coefficients plus how they change. The frames of
 //! a few enrollment phrases are summarized as a codebook of 32 typical
 //! frames (k-means). A new utterance is scored by how far its frames lie
@@ -9,14 +14,18 @@
 //! sits around 1 for the enrolled speaker and well above it for other
 //! voices, whatever was said, and it needs no recordings of anyone else.
 //!
-//! It keeps other people and the television from talking to Orion. It is
-//! not proof of identity: a recording of the speaker gets through, and a
-//! very similar voice may.
+//! It mostly tells microphones and rooms apart: it keeps the television
+//! and other devices out, but people in the same room can sound alike to
+//! it. Neither method is proof of identity: a recording of the speaker
+//! gets through.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+use super::neural::{cosine, Ge2e};
 
 const RATE: u32 = 16_000;
 const WIN: usize = 400; // 25 ms
@@ -41,14 +50,51 @@ pub struct Voiceprint {
     pub phrases: usize,
     /// When, in milliseconds since the epoch.
     pub enrolled_ms: u64,
+    /// The voice embedding, when the neural model was installed at
+    /// enrollment.
+    #[serde(default)]
+    pub neural: Option<NeuralPrint>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct NeuralPrint {
+    /// Which model made it: embeddings from different models don't compare.
+    pub model: String,
+    /// The normalized average of the phrases' embeddings.
+    pub embedding: Vec<f32>,
+    /// Each phrase's similarity to the average of the others, for display.
+    pub consistency: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Method {
+    Neural,
+    Codebook,
+}
+
+/// A score, with what it is measured against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Score {
+    pub method: Method,
+    pub value: f32,
+    pub limit: f32,
+}
+
+impl std::fmt::Display for Score {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.method {
+            Method::Neural => write!(f, "similarity {:.2} (needs at least {:.2})", self.value, self.limit),
+            Method::Codebook => write!(f, "distortion {:.2} (needs at most {:.2})", self.value, self.limit),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Verdict {
-    /// The enrolled voice; the score is the distortion ratio.
-    Match(f32),
+    /// The enrolled voice.
+    Match(Score),
     /// Someone else.
-    Other(f32),
+    Other(Score),
     /// Too little speech to tell.
     TooShort,
 }
@@ -60,8 +106,9 @@ impl Verdict {
 }
 
 impl Voiceprint {
-    /// Learn a voice from enrollment phrases (16-bit mono at `rate`).
-    pub fn enroll(clips: &[Vec<i16>], rate: u32) -> Result<Self> {
+    /// Learn a voice from enrollment phrases (16-bit mono at `rate`), with
+    /// the neural model too if there is one.
+    pub fn enroll(clips: &[Vec<i16>], rate: u32, model: Option<&Ge2e>) -> Result<Self> {
         if clips.len() < 3 {
             bail!("enrollment needs at least three phrases");
         }
@@ -79,6 +126,10 @@ impl Voiceprint {
             })
             .collect();
         let baseline = loo.iter().sum::<f32>() / loo.len() as f32;
+        let neural = match model {
+            Some(m) => Some(NeuralPrint::enroll(m, clips, rate)?),
+            None => None,
+        };
         Ok(Self {
             version: 1,
             codebook: codebook.iter().map(|c| c.to_vec()).collect(),
@@ -86,6 +137,7 @@ impl Voiceprint {
             consistency: loo.iter().map(|d| d / baseline).collect(),
             phrases: clips.len(),
             enrolled_ms: crate::chat::store::now_ms(),
+            neural,
         })
     }
 
@@ -107,11 +159,14 @@ impl Voiceprint {
         Some(distortion(&book, &f) / self.baseline.max(1e-6))
     }
 
+    /// The built-in method's verdict.
     pub fn verify(&self, samples: &[i16], rate: u32, threshold: f32) -> Verdict {
         match self.score(samples, rate) {
             None => Verdict::TooShort,
-            Some(s) if s <= threshold => Verdict::Match(s),
-            Some(s) => Verdict::Other(s),
+            Some(value) => {
+                let score = Score { method: Method::Codebook, value, limit: threshold };
+                if value <= threshold { Verdict::Match(score) } else { Verdict::Other(score) }
+            }
         }
     }
 
@@ -141,6 +196,62 @@ impl Voiceprint {
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+}
+
+impl NeuralPrint {
+    fn enroll(model: &Ge2e, clips: &[Vec<i16>], rate: u32) -> Result<Self> {
+        let embeds: Vec<Vec<f32>> = clips
+            .iter()
+            .enumerate()
+            .map(|(i, c)| model.embed(c, rate).with_context(|| format!("phrase {} has too little speech to learn from", i + 1)))
+            .collect::<Result<_>>()?;
+        let mean = |items: &mut dyn Iterator<Item = &Vec<f32>>| {
+            let mut m = vec![0.0f32; embeds[0].len()];
+            for e in items {
+                m.iter_mut().zip(e).for_each(|(a, b)| *a += b);
+            }
+            m
+        };
+        let consistency = (0..embeds.len())
+            .map(|i| cosine(&embeds[i], &mean(&mut embeds.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, e)| e))))
+            .collect();
+        let mut embedding = mean(&mut embeds.iter());
+        let n = embedding.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+        embedding.iter_mut().for_each(|v| *v /= n);
+        Ok(Self { model: super::neural::MODEL_NAME.into(), embedding, consistency })
+    }
+}
+
+/// Decides whether an utterance is the enrolled voice, by the best method
+/// available.
+#[derive(Clone)]
+pub struct Judge {
+    pub print: Voiceprint,
+    model: Option<Arc<Ge2e>>,
+    ratio_limit: f32,
+    similarity_limit: f32,
+}
+
+impl Judge {
+    /// The neural method when the voiceprint has an embedding from this
+    /// model and the model is given; the built-in one otherwise.
+    pub fn new(print: Voiceprint, model: Option<Ge2e>, ratio_limit: f32, similarity_limit: f32) -> Self {
+        let usable = print.neural.as_ref().is_some_and(|n| n.model == super::neural::MODEL_NAME);
+        Self { print, model: model.filter(|_| usable).map(Arc::new), ratio_limit, similarity_limit }
+    }
+
+    pub fn method(&self) -> Method {
+        if self.model.is_some() { Method::Neural } else { Method::Codebook }
+    }
+
+    pub fn verify(&self, samples: &[i16], rate: u32) -> Verdict {
+        let (Some(model), Some(print)) = (&self.model, &self.print.neural) else {
+            return self.print.verify(samples, rate, self.ratio_limit);
+        };
+        let Some(e) = model.embed(samples, rate) else { return Verdict::TooShort };
+        let score = Score { method: Method::Neural, value: cosine(&e, &print.embedding), limit: self.similarity_limit };
+        if score.value >= score.limit { Verdict::Match(score) } else { Verdict::Other(score) }
     }
 }
 
@@ -205,7 +316,7 @@ pub(crate) fn features(samples: &[i16], rate: u32) -> Vec<[f32; DIMS]> {
 }
 
 /// To 16 kHz floats, linearly.
-fn resample(samples: &[i16], rate: u32) -> Vec<f32> {
+pub(crate) fn resample(samples: &[i16], rate: u32) -> Vec<f32> {
     if rate == RATE || samples.is_empty() {
         return samples.iter().map(|&s| s as f32).collect();
     }
@@ -421,7 +532,7 @@ pub(crate) mod tests {
         let me = |text, secs| voice(120.0, 1.0, text, secs);
         // Six phrases of about three seconds, as `orion voice enroll` asks for.
         let enroll: Vec<Vec<i16>> = (1..=6).map(|t| me(t, 3.0)).collect();
-        let vp = Voiceprint::enroll(&enroll, RATE).unwrap();
+        let vp = Voiceprint::enroll(&enroll, RATE, None).unwrap();
         assert_eq!(vp.consistency.len(), 6);
         // New phrases from the same voice pass, short ones included.
         for text in 20..26 {
@@ -454,12 +565,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state/voiceprint.json");
         let enroll: Vec<Vec<i16>> = (1..=3).map(|t| voice(120.0, 1.0, t, 1.5)).collect();
-        let vp = Voiceprint::enroll(&enroll, RATE).unwrap();
+        let vp = Voiceprint::enroll(&enroll, RATE, None).unwrap();
         vp.save(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let back = Voiceprint::load(&path).unwrap();
         assert_eq!(back.codebook, vp.codebook);
-        assert!(Voiceprint::enroll(&enroll[..2], RATE).is_err());
+        assert!(Voiceprint::enroll(&enroll[..2], RATE, None).is_err());
     }
 
     /// Real (synthesized) voices, when espeak-ng is installed: enroll one,
@@ -491,7 +602,7 @@ pub(crate) mod tests {
             "Orion, what time is it in Tokyo?",
         ];
         let enroll: Vec<Vec<i16>> = phrases.iter().map(|p| say("en-us+m3", 45, p)).collect();
-        let vp = Voiceprint::enroll(&enroll, 22_050).unwrap();
+        let vp = Voiceprint::enroll(&enroll, 22_050, None).unwrap();
         for p in ["Orion, install htop for me.", "Orion, stop.", "Orion, which services failed today?"] {
             assert!(vp.verify(&say("en-us+m3", 45, p), 22_050, 1.2).accepted(), "{p}");
         }
@@ -499,5 +610,17 @@ pub(crate) mod tests {
             let verdict = vp.verify(&say(v, pitch, "Orion, which services failed today?"), 22_050, 1.2);
             assert!(!verdict.accepted(), "{v}: {verdict:?}");
         }
+
+        // With the neural model installed, the judge uses it. (Synthesized
+        // voices are hard for it, so only clearly different ones here.)
+        let Some(model) = Ge2e::default_path().filter(|p| p.exists()).and_then(|p| Ge2e::load(&p).ok()) else { return };
+        let vp = Voiceprint::enroll(&enroll, 22_050, Some(&model)).unwrap();
+        assert_eq!(vp.neural.as_ref().unwrap().consistency.len(), 5);
+        let judge = Judge::new(vp, Some(model), 1.2, 0.8);
+        assert_eq!(judge.method(), Method::Neural);
+        let mine = judge.verify(&say("en-us+m3", 45, "Orion, install htop for me."), 22_050);
+        assert!(matches!(mine, Verdict::Match(Score { method: Method::Neural, .. })), "{mine:?}");
+        let other = judge.verify(&say("en-us+f2", 60, "Orion, install htop for me."), 22_050);
+        assert!(matches!(other, Verdict::Other(_)), "{other:?}");
     }
 }

@@ -168,7 +168,10 @@ wake_approvals = false          # true: "Orion, yes" approves a tool call ("no" 
 wake_allow_remote = false       # allow a transcriber on another machine to hear everything
 # Speaker verification: only the voice enrolled with `orion voice enroll` wakes Orion.
 verify_speaker = "auto"         # auto: once a voice is enrolled; "on" (required), "off"
-verify_threshold = 1.2          # about 1.0 is typical for you; lower is stricter
+verify_method = "auto"          # the neural model when installed (`orion voice model install`),
+                                # else built-in; or "neural", "builtin"
+verify_similarity = 0.8         # neural: cosine similarity needed; higher is stricter
+verify_threshold = 1.2          # built-in: about 1.0 is typical for you; lower is stricter
 # Headless voice (`orion listen`) always listens and speaks.
 listen_new_after_mins = 10      # a new conversation after this long a quiet spell (0: never)
 

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use super::speaker::{Verdict, Voiceprint};
+use super::speaker::{Method, Verdict, Voiceprint};
 use super::{Recorder, Verify, VoiceConfig};
 
 /// About three seconds each, the way people talk to Orion.
@@ -49,6 +49,11 @@ fn wait_for_enter() -> Result<()> {
 
 pub fn enroll(config: &VoiceConfig) -> Result<()> {
     let recorder = Recorder::detect(config)?;
+    let model = config.speaker_model().map_err(anyhow::Error::msg)?;
+    if model.is_none() && config.verify_method != super::VerifyMethod::Builtin {
+        println!("(The neural speaker model isn't installed, so this enrolls with the built-in method, which tells");
+        println!(" microphones apart better than people. `orion voice model install` first is better.)\n");
+    }
     println!("Orion will learn your voice from {} short phrases, so that only you can wake it.", PHRASES.len());
     println!("Speak as you normally would to Orion, from where you usually sit. Each recording ends when you pause.\n");
     let mut clips = Vec::new();
@@ -68,12 +73,25 @@ pub fn enroll(config: &VoiceConfig) -> Result<()> {
             }
         }
     }
-    let vp = Voiceprint::enroll(&clips, recorder.rate())?;
-    let worst = vp.consistency.iter().copied().fold(0.0f32, f32::max);
-    println!("\nChecked each phrase against the others: worst {worst:.2} (a phrase in your voice scores about 1; the limit is {:.2}).", config.verify_threshold);
-    for (i, c) in vp.consistency.iter().enumerate() {
-        if *c > config.verify_threshold {
-            println!("  Phrase {} sounded different from the rest ({c:.2}): noise, or a different distance from the microphone?", i + 1);
+    println!("\nLearning your voice…");
+    let vp = Voiceprint::enroll(&clips, recorder.rate(), model.as_ref())?;
+    let odd = |i: usize, how: String| {
+        println!("  Phrase {} sounded different from the rest ({how}): noise, or a different distance from the microphone?", i + 1)
+    };
+    match &vp.neural {
+        Some(n) => {
+            let worst = n.consistency.iter().copied().fold(1.0f32, f32::min);
+            println!("Checked each phrase against the others (neural model): lowest similarity {worst:.2}; the limit is {:.2}.", config.verify_similarity);
+            for (i, c) in n.consistency.iter().enumerate().filter(|(_, c)| **c < config.verify_similarity) {
+                odd(i, format!("{c:.2}"));
+            }
+        }
+        None => {
+            let worst = vp.consistency.iter().copied().fold(0.0f32, f32::max);
+            println!("Checked each phrase against the others: worst {worst:.2} (a phrase in your voice scores about 1; the limit is {:.2}).", config.verify_threshold);
+            for (i, c) in vp.consistency.iter().enumerate().filter(|(_, c)| **c > config.verify_threshold) {
+                odd(i, format!("{c:.2}"));
+            }
         }
     }
     let path = path()?;
@@ -87,17 +105,20 @@ pub fn enroll(config: &VoiceConfig) -> Result<()> {
 }
 
 pub fn test(config: &VoiceConfig) -> Result<()> {
-    let vp = Voiceprint::load(&path()?).context("no voice enrolled yet: run `orion voice enroll`")?;
+    let judge = config.judge().map_err(anyhow::Error::msg)?.context("no voice enrolled yet: run `orion voice enroll`")?;
     let recorder = Recorder::detect(config)?;
     print!("Press Enter, then say anything to Orion. ");
     std::io::stdout().flush()?;
     wait_for_enter()?;
     let clip = record(&recorder)?;
-    match vp.verify(&clip, recorder.rate(), config.verify_threshold) {
-        Verdict::Match(s) => println!("That's you: {s:.2} (the limit is {:.2}; about 1 is typical for you).", config.verify_threshold),
+    let setting = match judge.method() {
+        Method::Neural => "lower voice.verify_similarity",
+        Method::Codebook => "raise voice.verify_threshold",
+    };
+    match judge.verify(&clip, recorder.rate()) {
+        Verdict::Match(s) => println!("That's you: {s}."),
         Verdict::Other(s) => println!(
-            "That doesn't sound like the enrolled voice: {s:.2} (the limit is {:.2}). If it was you, enroll again where you usually talk to Orion, or raise voice.verify_threshold.",
-            config.verify_threshold
+            "That doesn't sound like the enrolled voice: {s}. If it was you, enroll again where you usually talk to Orion, or {setting}."
         ),
         Verdict::TooShort => println!("Too little speech to tell; say a little more."),
     }
@@ -113,7 +134,12 @@ pub fn status(config: &VoiceConfig) -> Result<()> {
                 _ => "only your voice wakes Orion",
             };
             println!("enrolled: {} phrases, {} ({mode})", vp.phrases, path.display());
-            println!("threshold: {:.2}", config.verify_threshold);
+            let judge = config.judge().ok().flatten().map(|j| j.method());
+            match (judge, &vp.neural) {
+                (Some(Method::Neural), _) => println!("method: neural model, similarity at least {:.2}", config.verify_similarity),
+                (_, Some(_)) => println!("method: built-in (the voice has a neural embedding, but the model isn't installed or is turned off)"),
+                _ => println!("method: built-in, distortion at most {:.2} (`orion voice model install`, then enroll again, for the neural model)", config.verify_threshold),
+            }
         }
         Err(_) if !path.exists() => println!("no voice enrolled: anyone can wake Orion (`orion voice enroll`)"),
         Err(e) => println!("the voiceprint can't be read: {e:#}"),
@@ -126,6 +152,44 @@ pub fn forget() -> Result<()> {
     match std::fs::remove_file(&path) {
         Ok(()) => println!("Forgot your voice: anyone can wake Orion again."),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("No voice was enrolled."),
+        Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+    Ok(())
+}
+
+pub fn model_install(from: Option<&std::path::Path>) -> Result<()> {
+    match from {
+        Some(p) => println!("Converting the speaker model from {}…", p.display()),
+        None => println!("Downloading the speaker model ({}) from PyPI…", super::neural::MODEL_NAME),
+    }
+    let path = super::neural::install(from)?;
+    println!("Installed: {}.", path.display());
+    let enrolled = Voiceprint::default_path().and_then(|p| Voiceprint::load(&p).ok());
+    match enrolled {
+        Some(vp) if vp.neural.is_none() => {
+            println!("Your voice was enrolled before the model was installed; run `orion voice enroll` again to use it.")
+        }
+        Some(_) => println!("Speaker verification now uses it."),
+        None => println!("Enroll your voice with `orion voice enroll` to use it."),
+    }
+    Ok(())
+}
+
+pub fn model_status() -> Result<()> {
+    let path = super::neural::Ge2e::default_path().context("no data directory (is HOME set?)")?;
+    match super::neural::Ge2e::load(&path) {
+        Ok(_) => println!("installed: {} ({})", super::neural::MODEL_NAME, path.display()),
+        Err(_) if !path.exists() => println!("not installed: verification uses the built-in method (`orion voice model install`)"),
+        Err(e) => println!("can't be loaded: {e:#}"),
+    }
+    Ok(())
+}
+
+pub fn model_remove() -> Result<()> {
+    let path = super::neural::Ge2e::default_path().context("no data directory (is HOME set?)")?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => println!("Removed the speaker model; verification falls back to the built-in method."),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("The speaker model isn't installed."),
         Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
     }
     Ok(())
