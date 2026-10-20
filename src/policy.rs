@@ -132,7 +132,9 @@ pub struct PackagesPolicy {
     /// essential are protected as well.
     pub protected: Vec<String>,
     /// Which `update_apply` runs need no approval: `ask` (none), `security`
-    /// (security-only updates) or `all`. Never one that removes packages.
+    /// (security-only updates), `all` (any that removes nothing) or `full`
+    /// (any, removals included). With `update_apply` on `allow`, the rest
+    /// are refused.
     pub updates: String,
     pub timeout_secs: u64,
 }

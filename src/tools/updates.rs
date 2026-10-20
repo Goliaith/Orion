@@ -979,9 +979,10 @@ impl Tool for UpdateApply {
         // "allow", where nobody is asked, anything else is refused.
         let ask = "set [tools] update_apply = \"ask\" to be asked";
         match policy.packages.updates.as_str() {
-            "all" | "security" | "ask" if a.full => {
-                Preapproval::Refused(format!("an update with full may remove packages, so a person must approve it ({ask})"))
-            }
+            "full" => Preapproval::Granted,
+            "all" | "security" | "ask" if a.full => Preapproval::Refused(format!(
+                "an update with full may remove packages, so a person must approve it unless packages.updates = \"full\" ({ask})"
+            )),
             "all" => Preapproval::Granted,
             "security" if a.security_only => Preapproval::Granted,
             "security" => Preapproval::Refused(format!(
@@ -990,7 +991,7 @@ impl Tool for UpdateApply {
             "ask" => Preapproval::Refused(format!(
                 "packages.updates = \"ask\": updates need approval (allow some with \"security\" or \"all\", or {ask})"
             )),
-            other => Preapproval::Refused(format!("packages.updates must be ask, security or all, not {other:?}")),
+            other => Preapproval::Refused(format!("packages.updates must be ask, security, all or full, not {other:?}")),
         }
     }
 
@@ -1213,6 +1214,7 @@ mod tests {
         assert!(!granted(&p("security"), json!({})));
         assert!(granted(&p("all"), json!({ "packages": ["curl"] })));
         assert!(!granted(&p("all"), json!({ "full": true })));
+        assert!(granted(&p("full"), json!({ "full": true })));
         assert!(matches!(UpdateApply.preapproval(&p("sometimes"), &json!({})), Preapproval::Refused(_)));
 
         // On "allow", nobody is asked: packages.updates is a hard limit.

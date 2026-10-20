@@ -228,7 +228,7 @@ pub fn load(bytes: &[u8], section: &str) -> Result<BTreeMap<String, Tensor>> {
         pos += 8;
         let raw = bytes.get(pos..pos + n * 4).context("the file ends early")?;
         pos += n * 4;
-        storages.insert(key, raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect());
+        storages.insert(key, raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect());
     }
     let Value::Dict(top) = object else { bail!("the file holds no dictionary") };
     let state = top

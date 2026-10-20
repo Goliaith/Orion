@@ -274,9 +274,8 @@ fn normalize(v: &mut [f32]) {
 fn matvec_add(m: &[f32], x: &[f32], out: &mut [f32], cols: usize) {
     for (o, row) in out.iter_mut().zip(m.chunks_exact(cols)) {
         let mut acc = [0.0f32; 8];
-        let (rc, xc) = (row.chunks_exact(8), x.chunks_exact(8));
-        let (rr, xr) = (rc.remainder(), xc.remainder());
-        for (r, v) in rc.zip(xc) {
+        let ((rc, rr), (xc, xr)) = (row.as_chunks::<8>(), x.as_chunks::<8>());
+        for (r, v) in rc.iter().zip(xc) {
             for k in 0..8 {
                 acc[k] += r[k] * v[k];
             }
@@ -355,7 +354,7 @@ pub fn read_weights(bytes: &[u8]) -> Result<Weights> {
         let ndim = take(1)?[0] as usize;
         let shape: Vec<usize> = (0..ndim).map(|_| take(4).map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()) as usize)).collect::<Result<_>>()?;
         let n: usize = shape.iter().product();
-        let data: Vec<f32> = take(n * 4)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let data: Vec<f32> = take(n * 4)?.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
         w.insert(name, (shape, data));
     }
     Ok(w)

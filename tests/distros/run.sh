@@ -49,6 +49,8 @@ run() { # run DISTRO IMAGE
     expect again "$out" '"message": "nothing to update"'
     expect unknown "$(sed -n '/^### pkg_install/{n;p}' <<<"$out")" 'Error:'
     expect remove "$(sed -n '/^### pkg_remove/{n;p}' <<<"$out")" '"removed": [ { "name": "orion-new"'
+    # On a failure, what Orion actually said.
+    [ $failed = 0 ] || sed 's/^/    | /' <<<"$out"
     docker rm -f $c >/dev/null
 }
 

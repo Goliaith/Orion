@@ -33,7 +33,7 @@ fn record(recorder: &Recorder) -> Result<Vec<i16>> {
     }
     let _ = write!(out, "\r{:40}\r", "");
     let wav = rec.finish()?;
-    Ok(wav[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
+    Ok(wav[44..].as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect())
 }
 
 fn wait_for_enter() -> Result<()> {

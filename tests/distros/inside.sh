@@ -6,6 +6,8 @@ cat > /tmp/allow.toml <<'T'
 pkg_install = "allow"
 pkg_remove = "allow"
 update_apply = "allow"
+[packages]
+updates = "full"
 T
 for c in "$@"; do
   tool=${c%% *}; args=${c#* }; [ "$args" = "$tool" ] && args='{}'

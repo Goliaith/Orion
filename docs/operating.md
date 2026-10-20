@@ -161,7 +161,7 @@ allowed_commands = ["git", "make", "cargo"]
 updates = "security"        # security fixes only
 ```
 
-On `allow`, nobody is asked, so each tool's pre-approval setting becomes a hard limit: `proc_run` runs only `allowed_commands`, `pkg_install` installs only `[packages] allowed`, and `update_apply` runs only what `[packages] updates` covers (`"security"`: security-only updates; `"all"`: any update). Anything else is refused, and the agent is told why. An update with `full: true`, which may remove packages, always needs a person, so on `allow` it is refused too.
+On `allow`, nobody is asked, so each tool's pre-approval setting becomes a hard limit: `proc_run` runs only `allowed_commands`, `pkg_install` installs only `[packages] allowed`, and `update_apply` runs only what `[packages] updates` covers (`"security"`: security-only updates; `"all"`: any update that removes nothing; `"full"`: any update, also ones that remove or replace packages, never protected ones). Anything else is refused, and the agent is told why.
 
 **Strict sandbox.** Programs get no network and no GPU (the default), and nothing runs without bubblewrap or Landlock:
 
@@ -437,7 +437,7 @@ orion audit -n 20      # what was called, and how it went
 
 **`"X" is not in packages.allowed`, or `packages.updates = "security" lets only security_only updates run without approval`.** With a tool on `allow`, its pre-approval setting is a hard limit. Widen the setting (`[packages] allowed`, `[packages] updates`), or set the tool back to `ask` to be asked instead.
 
-**`an update with full may remove packages, so a person must approve it`.** `update_apply` is on `allow`, where nobody is asked. Run that update from the chat with the tool on `ask`.
+**`an update with full may remove packages, so a person must approve it …`.** `update_apply` is on `allow`, where nobody is asked. Run that update from the chat with the tool on `ask`, or set `[packages] updates = "full"` if unattended updates may remove packages.
 
 **`orion call` printed a result, then `… failed: …`, and exited 1.** The tool ran, but what it drove failed partway, typically the package manager. The `error` in the result has its last lines; fix the cause (a broken package, a full disk, another package manager holding the lock) and run it again.
 

@@ -384,7 +384,7 @@ fn record_request(setup: &Setup, shared: &Shared) -> WakeEvent {
         thread::sleep(Duration::from_millis(50));
     }
     let Ok(wav) = rec.finish() else { return WakeEvent::NoRequest };
-    let samples: Vec<i16> = wav[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let samples: Vec<i16> = wav[44..].as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
     let Some(speaker) = identify(setup, shared, &samples, setup.recorder.rate()) else {
         return WakeEvent::NotYou;
     };
@@ -460,7 +460,7 @@ fn pcm_chunks(mut stdout: impl Read + Send + 'static, chunk: usize) -> Receiver<
             if bytes.len() % 2 == 1 {
                 carry = bytes.pop();
             }
-            let samples = bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+            let samples = bytes.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
             if tx.send(samples).is_err() {
                 break;
             }
@@ -725,7 +725,7 @@ mod tests {
     }
 
     fn samples(parts: &[(bool, u64)]) -> Vec<i16> {
-        pcm(parts, 16_000).chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()
+        pcm(parts, 16_000).as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect()
     }
 
     #[test]
