@@ -224,6 +224,11 @@ hide = ["~/.ssh", "~/.gnupg", "~/.password-store", "~/.aws", "~/.netrc", "~/.con
 # serve` connects to it when it is running.
 [daemon]
 socket = ""                     # empty: $XDG_RUNTIME_DIR/orion/orion.sock
+approvals = true                # offer agents the "ask" tools; a person approves each call
+                                # (orion approvals, a notification, or the shell)
+approval_timeout_secs = 120     # no answer by then counts as no
+chat = "auto"                   # the chat, shell and orion listen call tools through the
+                                # daemon when it runs with this policy; or "never"
 
 # The privileged helper (`orion helper`, contrib/orion-helper.socket): a root
 # service that does Orion's root work, and only that. It reads these settings

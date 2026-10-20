@@ -1,8 +1,10 @@
 //! Model Context Protocol server: newline-delimited JSON-RPC 2.0 over stdio.
 //!
-//! Only the tools capability is implemented. There is no human to answer
-//! approval prompts here, so only `allow` tools are listed; `ask` and `deny`
-//! tools are left out, and calling one anyway returns an error result.
+//! Only the tools capability is implemented. Served on its own (`orion
+//! serve --direct`) there is no human to answer approval prompts, so only
+//! `allow` tools are listed. Through the daemon, a person can approve from
+//! `orion approvals`, a notification or the shell, so `ask` tools are
+//! listed too (see [`crate::approvals`]).
 
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::policy::Decision;
 use crate::tool::Risk;
-use crate::{CallError, Orion};
+use crate::{Approver, CallError, Orion};
 
 /// Newest first; the first entry is offered when the client asks for an
 /// unknown version.
@@ -21,7 +23,8 @@ pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05
 const INSTRUCTIONS: &str = "Orion exposes this Linux machine as tools. A local policy governs every call \
 and every call is audited. File paths must be absolute or start with ~/. proc_run runs a single program \
 without a shell. If a tool is missing from the list, the policy has disabled it or requires interactive \
-approval, which is only available in `orion chat`.";
+approval and nobody can approve here. Tools that say they ask for approval wait until a person answers; \
+if the answer is no, don't retry the same call.";
 
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -42,6 +45,8 @@ pub struct Server {
     peer: String,
     client: Mutex<Option<String>>,
     extension: Option<Extension>,
+    /// List `ask` tools too: a person can approve them.
+    offer_ask: bool,
 }
 
 impl Server {
@@ -50,14 +55,20 @@ impl Server {
     }
 
     pub fn shared(orion: Shared, peer: String, extension: Option<Extension>) -> Self {
-        Self { orion, peer, client: Mutex::new(None), extension }
+        Self { orion, peer, client: Mutex::new(None), extension, offer_ask: false }
+    }
+
+    /// Also list the tools that need approval (someone can give it).
+    pub fn offering_ask(mut self, yes: bool) -> Self {
+        self.offer_ask = yes;
+        self
     }
 
     fn orion(&self) -> Arc<Orion> {
         self.orion.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn caller(&self) -> Option<String> {
+    pub fn caller(&self) -> Option<String> {
         let client = self.client.lock().unwrap_or_else(|e| e.into_inner()).clone();
         match (client, self.peer.as_str()) {
             (Some(c), "") => Some(c),
@@ -106,7 +117,7 @@ impl Server {
             "initialize" => Ok(self.initialize(&params)),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(self.list_tools()),
-            "tools/call" => self.call_tool(&params),
+            "tools/call" => self.call_tool(&params, None),
             other => match self.extension.as_ref().and_then(|x| x(other, &params)) {
                 Some(v) => Ok(v),
                 None => Err((METHOD_NOT_FOUND, format!("method not found: {method}"))),
@@ -139,11 +150,16 @@ impl Server {
         let orion = self.orion();
         let tools: Vec<Value> = orion
             .tools()
-            .filter(|(_, d)| *d == Decision::Allow)
-            .map(|(t, _)| {
+            .filter(|(_, d)| *d == Decision::Allow || (self.offer_ask && *d == Decision::Ask))
+            .map(|(t, d)| {
+                let description = if d == Decision::Ask {
+                    format!("{} (Each call waits for a person to approve it.)", t.description())
+                } else {
+                    t.description().to_string()
+                };
                 json!({
                     "name": t.name(),
-                    "description": t.description(),
+                    "description": description,
                     "inputSchema": t.input_schema(),
                     "annotations": {
                         "readOnlyHint": t.risk() == Risk::Read,
@@ -156,18 +172,37 @@ impl Server {
         json!({ "tools": tools })
     }
 
-    fn call_tool(&self, params: &Value) -> Result<Value, (i64, String)> {
+    /// Who a call is from, for the audit log: `_meta["orion/caller"]` (a
+    /// chat names the person, say) via the connection's own name.
+    pub fn call_caller(&self, params: &Value) -> Option<String> {
+        let named = params.pointer("/_meta/orion~1caller").and_then(Value::as_str);
+        let named = named.map(|n| n.chars().filter(|c| !c.is_control()).take(80).collect::<String>());
+        match (named, self.caller()) {
+            (Some(n), Some(c)) => Some(format!("{n} via {c}")),
+            (n, c) => n.or(c),
+        }
+    }
+
+    /// `tools/call`, with `approver` answering `ask` decisions. The result
+    /// says in `_meta["orion/error"]` whether a failed call was refused or
+    /// went wrong, for clients that care (a chat through the daemon).
+    pub fn call_tool(&self, params: &Value, approver: Option<&dyn Approver>) -> Result<Value, (i64, String)> {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return Err((INVALID_PARAMS, "missing tool name".into()));
         };
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-        match self.orion().call_as(name, args, None, self.caller().as_deref()) {
+        let failed = |kind: &str, text: String| {
+            json!({ "content": [{ "type": "text", "text": text }], "isError": true, "_meta": { "orion/error": kind } })
+        };
+        match self.orion().call_as(name, args, approver, self.call_caller(params).as_deref()) {
             Ok(value) => {
                 let text = serde_json::to_string_pretty(&value).unwrap_or_default();
                 Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": false }))
             }
             Err(e @ CallError::Unknown(_)) => Err((INVALID_PARAMS, e.to_string())),
-            Err(e) => Ok(json!({ "content": [{ "type": "text", "text": e.to_string() }], "isError": true })),
+            Err(e @ CallError::Denied(_)) => Ok(failed("denied", e.to_string())),
+            Err(CallError::Failed(e)) if crate::interrupt::is_interrupt(&e) => Ok(failed("interrupted", format!("{e:#}"))),
+            Err(e) => Ok(failed("failed", e.to_string())),
         }
     }
 }

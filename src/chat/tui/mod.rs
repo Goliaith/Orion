@@ -1032,6 +1032,9 @@ fn panel_lines(m: &Machine, s: &Status, width: usize) -> Vec<Line<'static>> {
         l.push(Line::styled(fit(&t, width + 1), dim));
     }
     l.push(Line::styled(format!(" tools  {} automatic · {} ask", s.tools_auto, s.tools_ask), dim));
+    if s.tools_run != "in this process" {
+        l.push(Line::styled(format!("        {}", s.tools_run), dim));
+    }
     l
 }
 

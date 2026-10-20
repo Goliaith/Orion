@@ -58,12 +58,12 @@ pub fn request() {
 }
 
 pub fn requested() -> bool {
-    SIGNALLED.load(Ordering::SeqCst) || test_flag::get()
+    SIGNALLED.load(Ordering::SeqCst) || thread_flag::get()
 }
 
 pub fn clear() {
     SIGNALLED.store(false, Ordering::SeqCst);
-    test_flag::clear();
+    thread_flag::clear();
 }
 
 pub fn check() -> anyhow::Result<()> {
@@ -171,10 +171,10 @@ pub fn read_answer() -> Option<String> {
     }
 }
 
-/// In tests, a flag per test thread stands in for the process-wide one, so
-/// parallel tests cannot interrupt each other.
-#[cfg(test)]
-pub mod test_flag {
+/// A flag per thread, on top of the process-wide one: the daemon stops one
+/// tool call (its client pressed Ctrl-C, or hung up) without stopping the
+/// others, and parallel tests can't interrupt each other.
+pub mod thread_flag {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -204,13 +204,8 @@ pub mod test_flag {
     }
 }
 
-#[cfg(not(test))]
-mod test_flag {
-    pub(super) fn get() -> bool {
-        false
-    }
-    pub(super) fn clear() {}
-}
+#[cfg(test)]
+pub use thread_flag as test_flag;
 
 #[cfg(test)]
 mod tests {

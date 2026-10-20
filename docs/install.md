@@ -348,6 +348,14 @@ systemctl --user enable --now orion-shell.service
 cat ~/.local/state/orion/shell-url
 ```
 
+**Approvals for AI agents by notification** (`orion approvals --notify`): when an agent connected through the daemon calls a tool that needs approval, a notification with Approve and Decline appears. Needs `notify-send` (libnotify).
+
+```sh
+cp contrib/orion-approvals.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now orion-approvals.service
+```
+
 User services stop when you log out. To keep them running without a login session (on a server, or for headless voice):
 
 ```sh

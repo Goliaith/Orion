@@ -717,6 +717,10 @@ fn banner(s: &Style, orion: &Orion, session: &Session) {
             count(Decision::Ask),
         ))
     );
+    let runs = orion.runs_tools();
+    if runs != "in this process" {
+        println!("{}", s.dim(&format!("tools run {runs}")));
+    }
     println!();
 }
 

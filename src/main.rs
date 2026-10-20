@@ -189,6 +189,17 @@ enum Cmd {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Answer AI agents' approval requests: the tools the policy sets to
+    /// "ask", called through the daemon. Prompts in this terminal, or with
+    /// --notify as desktop notifications (see contrib/orion-approvals.service).
+    Approvals {
+        /// Desktop notifications with Approve and Decline, instead of prompts.
+        #[arg(long)]
+        notify: bool,
+        /// Show what waits for an answer, and exit.
+        #[arg(long)]
+        list: bool,
+    },
     /// Show whether the daemon is running, and what it is doing.
     Status,
     /// Show every tool, its risk level, and what the policy decides for it.
@@ -236,7 +247,7 @@ fn main() -> Result<()> {
                 (_, _, true) => Some(Mode::Auto),
                 _ => None,
             };
-            terminal::run(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), plain)
+            terminal::run(&Orion::new(policy).through_daemon(source.as_deref(), "orion chat"), mode, model.as_deref(), resume.as_deref(), plain)
         }
         Cmd::Shell { local, claude, auto, model, resume, port, open } => {
             let mode = match (local, claude, auto) {
@@ -245,7 +256,7 @@ fn main() -> Result<()> {
                 (_, _, true) => Some(Mode::Auto),
                 _ => None,
             };
-            terminal::run_shell(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), port, open)
+            terminal::run_shell(&Orion::new(policy).through_daemon(source.as_deref(), "orion shell"), mode, model.as_deref(), resume.as_deref(), port, open)
         }
         Cmd::Listen { local, claude, auto, model, resume, quiet } => {
             let mode = match (local, claude, auto) {
@@ -254,7 +265,7 @@ fn main() -> Result<()> {
                 (_, _, true) => Some(Mode::Auto),
                 _ => None,
             };
-            orion::chat::listen::run(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), quiet)
+            orion::chat::listen::run(&Orion::new(policy).through_daemon(source.as_deref(), "orion listen"), mode, model.as_deref(), resume.as_deref(), quiet)
         }
         Cmd::Memory { person, action } => terminal::memory(
             person.as_deref(),
@@ -280,6 +291,14 @@ fn main() -> Result<()> {
         }
         Cmd::Daemon { socket } => daemon::run(policy, source, socket),
         Cmd::Helper { .. } => unreachable!("handled before loading the policy"),
+        Cmd::Approvals { notify, list } => {
+            let mode = match (list, notify) {
+                (true, _) => orion::approvals::Mode::List,
+                (_, true) => orion::approvals::Mode::Notify,
+                _ => orion::approvals::Mode::Terminal,
+            };
+            orion::approvals::watch(&policy.daemon, mode)
+        }
         Cmd::Status => {
             let path = daemon::socket_path(&policy.daemon);
             let st = match daemon::status(&policy.daemon) {
@@ -309,6 +328,14 @@ fn main() -> Result<()> {
             let total = st["connections"]["total"].as_u64().unwrap_or(1).saturating_sub(1);
             println!("agents:       {active} connected, {total} since start");
             println!("tool calls:   {}", st["tool_calls"]);
+            let ap = &st["approvals"];
+            if ap["offered"] == true {
+                let approvers = ap["approvers"].as_u64().unwrap_or(0);
+                let who = if approvers == 0 { "nobody is watching (orion approvals)".to_string() } else { format!("{approvers} watching") };
+                println!("approvals:    agents may ask; {who}; {} waiting", ap["waiting"]);
+            } else if ap.is_object() {
+                println!("approvals:    off: agents get only allowed tools");
+            }
             if let Some(log) = st["audit_log"].as_str() {
                 println!("audit log:    {log}");
             }

@@ -7,6 +7,7 @@
 //! MCP-capable agent, whether hosted or local, can drive the machine through the
 //! same contract. [`chat`] is the human-facing front-end on top of it.
 
+pub mod approvals;
 pub mod audit;
 pub mod chat;
 pub mod daemon;
@@ -14,6 +15,7 @@ pub mod helper;
 pub mod interrupt;
 pub mod mcp;
 pub mod policy;
+pub mod remote;
 pub mod sandbox;
 pub mod tool;
 pub mod tools;
@@ -63,6 +65,12 @@ impl std::error::Error for CallError {}
 /// Answers `ask` decisions. Implemented by whatever has a human attached.
 pub trait Approver {
     fn approve(&self, tool: &dyn Tool, args: &Value) -> bool;
+
+    /// Why the last call wasn't approved, when it wasn't a person saying
+    /// no (nobody was there to ask, say).
+    fn why_not(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The tool registry with its policy and audit log attached.
@@ -70,12 +78,37 @@ pub struct Orion {
     policy: Policy,
     tools: Vec<Box<dyn Tool>>,
     audit: Audit,
+    /// The daemon, when calls go through it.
+    remote: Option<remote::Remote>,
+    /// Why they don't, when they could have.
+    remote_note: Option<String>,
 }
 
 impl Orion {
     pub fn new(policy: Policy) -> Self {
         let audit = Audit::new(policy.audit_path());
-        Self { tools: tools::builtin(), policy, audit }
+        Self { tools: tools::builtin(), policy, audit, remote: None, remote_note: None }
+    }
+
+    /// Call tools through the daemon from now on, if it runs with this
+    /// policy (`source`) and version; otherwise keep calling them here.
+    pub fn through_daemon(mut self, source: Option<&std::path::Path>, client: &str) -> Self {
+        match remote::Remote::connect(&self.policy, source, client) {
+            Ok(r) => self.remote = Some(r),
+            Err(why) => self.remote_note = Some(why),
+        }
+        self
+    }
+
+    /// Where tool calls run: "through the daemon (pid N)", or "in this
+    /// process" with why, for status displays.
+    pub fn runs_tools(&self) -> String {
+        match (&self.remote, &self.remote_note) {
+            (Some(r), _) if r.alive() => format!("through the daemon (pid {})", r.pid()),
+            (Some(_), _) => "in this process (the daemon went away)".into(),
+            (None, Some(why)) if why != "no daemon is running" && !why.contains("\"never\"") => format!("in this process ({why})"),
+            _ => "in this process".into(),
+        }
     }
 
     pub fn policy(&self) -> &Policy {
@@ -103,6 +136,9 @@ impl Orion {
         approver: Option<&dyn Approver>,
         caller: Option<&str>,
     ) -> Result<Value, CallError> {
+        if let Some(r) = self.remote.as_ref().filter(|r| r.alive()) {
+            return r.call(self, name, args, approver, caller);
+        }
         let tool = self
             .tools
             .iter()
@@ -121,7 +157,11 @@ impl Orion {
                 Some(approver) => {
                     let yes = approver.approve(tool.as_ref(), &args);
                     approved = Some(yes);
-                    if yes { Ok(()) } else { Err(format!("the user declined this {name} call")) }
+                    if yes {
+                        Ok(())
+                    } else {
+                        Err(approver.why_not().unwrap_or_else(|| format!("the user declined this {name} call")))
+                    }
                 }
                 None => Err(format!("tool {name} needs interactive approval, which is not available here")),
             },

@@ -109,6 +109,7 @@ details.thinking div { white-space: pre-wrap; font-style: italic; margin-top: 4p
 .btn.go { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.go:hover { filter: brightness(1.08); }
 .card .done { color: var(--muted); font-size: 13.5px; }
+.card .from { color: var(--muted); font-size: 13px; margin: -4px 0 8px; }
 .card.resolved { border-color: var(--line); background: var(--panel); }
 .notice { color: var(--warn); font-size: 13.5px; margin: 8px 0; }
 .error { color: var(--bad); font-size: 13.5px; margin: 8px 0; }
@@ -330,7 +331,10 @@ function approveCard(ev) {
   endBlocks();
   const c = el("div", "card");
   c.innerHTML = `<h3><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--warn)" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg><span>Approve <code>${esc(ev.tool)}</code>?</span></h3>`
-    + `<pre class="mono">${esc(ev.preview)}</pre><div class="acts"><button class="btn go" data-a="yes">Approve</button><button class="btn" data-a="always">Always allow this session</button><button class="btn" data-a="no">Decline</button></div>`;
+    + (ev.from ? `<div class="from">${esc(ev.from)} asks, through the Orion daemon</div>` : "")
+    + `<pre class="mono">${esc(ev.preview)}</pre><div class="acts"><button class="btn go" data-a="yes">Approve</button>`
+    + (ev.from ? "" : `<button class="btn" data-a="always">Always allow this session</button>`)
+    + `<button class="btn" data-a="no">Decline</button></div>`;
   c.querySelectorAll("button").forEach(b => b.onclick = () => answer(ev.id, b.dataset.a));
   state.cards[ev.id] = c; add(c);
 }
@@ -345,7 +349,7 @@ function answered(ev) {
   const c = state.cards[ev.id]; if (!c) return;
   c.classList.add("resolved");
   const acts = c.querySelector(".acts");
-  if (acts) acts.outerHTML = `<div class="done">${ev.answer === "yes" ? "✓ Approved" : ev.answer === "always" ? "✓ Approved for the rest of this session" : "Declined"}</div>`;
+  if (acts) acts.outerHTML = `<div class="done">${ev.answer === "yes" ? "✓ Approved" : ev.answer === "always" ? "✓ Approved for the rest of this session" : ev.answer === "expired" ? "No answer in time · declined" : "Declined"}</div>`;
 }
 function system(cls, text) { endBlocks(); const e = el("div", cls); e.textContent = text; add(e); }
 function transcript(turns) {
@@ -387,7 +391,8 @@ function status(s) {
     + `<div class="kv"><span>Messages</span><span>${s.turns}</span></div>`
     + s.usage.map(u => `<div class="kv"><span>${u.label === "claude" ? "Claude" : "Local"}</span><span title="${u.cached ? k(u.cached) + " input tokens read from cache" : ""}">${k(u.input)} in · ${k(u.output)} out</span></div>`
       + (u.cached ? `<div class="kv"><span></span><span style="color:var(--faint)">${k(u.cached)} from cache</span></div>` : "")).join("")
-    + `<div class="kv"><span>Tools</span><span>${s.tools_auto} automatic · ${s.tools_ask} ask first</span></div>`;
+    + `<div class="kv"><span>Tools</span><span>${s.tools_auto} automatic · ${s.tools_ask} ask first</span></div>`
+    + (s.tools_run && s.tools_run !== "in this process" ? `<div class="kv"><span>Run</span><span>${esc(s.tools_run)}</span></div>` : "");
   refreshConvs();
 }
 function gauge(frac) { return frac > 0.9 ? "high" : frac > 0.7 ? "mid" : ""; }

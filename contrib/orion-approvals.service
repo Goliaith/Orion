@@ -1,0 +1,21 @@
+# Approvals by desktop notification (`orion approvals --notify`): when an AI
+# agent connected through the Orion daemon calls a tool the policy sets to
+# "ask", a notification with Approve and Decline appears. A user service, so
+# it can reach your desktop's notification server.
+#
+#   cp contrib/orion-approvals.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now orion-approvals.service
+[Unit]
+Description=Orion approvals: answer AI agents' requests by notification
+After=orion.socket graphical-session.target
+Wants=orion.socket
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.cargo/bin/orion approvals --notify
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

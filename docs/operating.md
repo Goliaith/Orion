@@ -33,7 +33,7 @@ Out of the box the AI can look at anything readable and change nothing without a
 | `orion chat` | The chat, full screen in a terminal (`--plain` for line by line) | asked in the conversation |
 | `orion shell` | The same chat as a local web page, for a browser or a kiosk | approval cards |
 | `orion listen` | Voice only: "Orion, …", answered aloud | spoken, if `wake_approvals = true`; otherwise declined |
-| `orion serve` | The tools over MCP, for other AI agents | none: `ask` acts as `deny` |
+| `orion serve` | The tools over MCP, for other AI agents | through the daemon: [`orion approvals`](#approvals-for-ai-agents), a notification or the shell; without it, `ask` acts as `deny` |
 | `orion call <tool> '<json>'` | One tool call by hand, as the AI would make it | asked in the terminal |
 
 `orion chat`, `orion shell` and `orion listen` all take `--auto` (the default), `--claude` or `--local`, `--model <id>` and `--resume [id]`.
@@ -145,7 +145,7 @@ read_roots = ["~/projects/website"]
 write_roots = ["~/projects/website"]
 ```
 
-**An unattended agent over MCP.** With no human present, `ask` means no, and an MCP client is offered only the tools set to `allow`. Allow exactly what it should do:
+**An unattended agent over MCP.** When nobody will be there to [approve](#approvals-for-ai-agents), `ask` means no, so allow exactly what it should do:
 
 ```toml
 [tools]
@@ -434,6 +434,30 @@ systemctl --user restart orion      # after upgrading Orion
 
 `orion serve` connects to the daemon when it runs. `orion serve --direct` serves in-process anyway.
 
+The chat, the shell and `orion listen` call tools through the daemon too, when it runs this version of Orion with the same policy file: their header or machine panel says `tools run through the daemon (pid …)`. If it says why not ("the daemon uses another policy", "the daemon is version …: restart it"), they call tools in-process as before. `[daemon] chat = "never"` always keeps them in-process.
+
+### Approvals for AI agents
+
+Through the daemon, AI agents (Claude Code, or any MCP client launching `orion serve`) are offered the `ask` tools too. Each call waits for a person:
+
+```sh
+orion approvals              # answer in this terminal
+orion approvals --notify     # answer from desktop notifications
+orion approvals --list       # what waits now
+```
+
+To always answer by notification:
+
+```sh
+cp contrib/orion-approvals.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now orion-approvals.service
+```
+
+The graphical shell shows the same requests as cards, naming the agent. Answer wherever is handy; the first answer counts. With nobody watching, the call is refused at once and the agent is told why. With nobody answering for `[daemon] approval_timeout_secs` (120), it counts as no. `orion status` shows how many are watching and how many requests wait.
+
+`[daemon] approvals = false` goes back to offering agents only the `allow` tools.
+
 ## Files and settings
 
 | Path | What |
@@ -481,7 +505,9 @@ orion audit -n 20      # what was called, and how it went
 
 **The local model doesn't use tools, or forgets what it did.** Use a tool-calling model (Qwen3, Llama 3.1+, Mistral Small 3, gpt-oss) of at least about 7B, and raise the context length (`OLLAMA_CONTEXT_LENGTH=32768`).
 
-**`tool X needs interactive approval, which is not available here`.** The tool is `ask` and nobody can be asked (`orion call` without a terminal, `orion serve`, a script). Run it from `orion chat`, or set it to `allow` under `[tools]`.
+**`tool X needs interactive approval, which is not available here`.** The tool is `ask` and nobody can be asked (`orion call` without a terminal, `orion serve --direct`, a script). Run it from `orion chat`, or set it to `allow` under `[tools]`.
+
+**An agent says "nobody is approving right now".** Its call went through the daemon, and nobody was watching for approval requests. Run `orion approvals`, open the shell, or enable `orion-approvals.service`, and let the agent try again.
 
 **`"X" is not in packages.allowed`, or `packages.updates = "security" lets only security_only updates run without approval`.** With a tool on `allow`, its pre-approval setting is a hard limit. Widen the setting (`[packages] allowed`, `[packages] updates`), or set the tool back to `ask` to be asked instead.
 

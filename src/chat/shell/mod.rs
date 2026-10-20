@@ -53,6 +53,8 @@ impl Default for ShellConfig {
 enum Pending {
     Approve(Sender<Answer>),
     Confirm(Sender<bool>),
+    /// An AI agent's call, waiting in the daemon under this id.
+    Agent(u64),
 }
 
 /// Shared state between the conversation, the pages and voice.
@@ -77,9 +79,38 @@ struct Hub {
     /// Why wake listening didn't start, for pages that connect.
     wake_error: Mutex<Option<String>>,
     show_reasoning: bool,
+    /// The connection to the daemon that brings agents' approval requests.
+    agents: Mutex<Option<crate::approvals::Writer>>,
+    /// The daemon's request id → the card's id.
+    agent_cards: Mutex<HashMap<u64, u64>>,
 }
 
 impl Hub {
+    /// Answer a card: the conversation's own prompts, or an agent's call.
+    fn resolve(&self, prompt: Pending, answer: &str) {
+        let yes = matches!(answer, "yes" | "always");
+        match prompt {
+            Pending::Approve(tx) => {
+                let a = match answer {
+                    "yes" => Answer::Yes,
+                    "always" => Answer::Always,
+                    _ => Answer::No,
+                };
+                let _ = tx.send(a);
+            }
+            Pending::Confirm(tx) => {
+                let _ = tx.send(yes);
+            }
+            Pending::Agent(rid) => {
+                self.agent_cards.lock().unwrap_or_else(|e| e.into_inner()).remove(&rid);
+                if let Some(w) = self.agents.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    let msg = json!({ "jsonrpc": "2.0", "id": 1_000_000 + rid, "method": "orion/approvals/answer", "params": { "id": rid, "approve": yes } });
+                    let _ = crate::approvals::send(w, &msg);
+                }
+            }
+        }
+    }
+
     /// Send an event to every page; `keep` adds it to the replay log.
     fn broadcast(&self, ev: Value, keep: bool) {
         let text = ev.to_string();
@@ -161,6 +192,7 @@ fn status_json(s: &Status) -> Value {
         "notes": s.notes,
         "tools_auto": s.tools_auto,
         "tools_ask": s.tools_ask,
+        "tools_run": s.tools_run,
     })
 }
 
@@ -318,14 +350,7 @@ fn on_wake(hub: &Hub, ev: WakeEvent) {
                 }
             };
             if let Some((id, prompt, yes)) = pending {
-                match prompt {
-                    Pending::Approve(tx) => {
-                        let _ = tx.send(if yes { Answer::Yes } else { Answer::No });
-                    }
-                    Pending::Confirm(tx) => {
-                        let _ = tx.send(yes);
-                    }
-                }
+                hub.resolve(prompt, if yes { "yes" } else { "no" });
                 hub.broadcast(json!({ "type": "answered", "id": id, "answer": if yes { "yes" } else { "no" } }), true);
             } else if is_stop_request(&text) {
                 if hub.busy.load(Ordering::SeqCst) {
@@ -415,6 +440,8 @@ pub(super) fn run(orion: &Orion, session: Session, saver: Saver, port: Option<u1
         wake_error: Mutex::new(wake_error),
         transcribing: AtomicBool::new(false),
         show_reasoning: orion.policy().chat.show_reasoning,
+        agents: Mutex::new(None),
+        agent_cards: Mutex::new(HashMap::new()),
     });
 
     thread::scope(|scope| {
@@ -429,6 +456,10 @@ pub(super) fn run(orion: &Orion, session: Session, saver: Saver, port: Option<u1
             }
         });
         scope.spawn(|| watch_voice(&hub, &stop));
+        {
+            let (hub, config) = (hub.clone(), orion.policy().daemon.clone());
+            thread::spawn(move || watch_agents(&hub, &config));
+        }
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let hub = hub.clone();
@@ -493,6 +524,53 @@ fn handle(hub: &Arc<Hub>, stream: &TcpStream, req: Request) -> std::io::Result<(
     }
 }
 
+/// AI agents' approval requests from the daemon, as cards: the shell is
+/// one of the places a person can answer them (see `crate::approvals`).
+/// Without a daemon there are none, and this returns.
+fn watch_agents(hub: &Arc<Hub>, config: &crate::daemon::DaemonConfig) {
+    use std::io::BufRead;
+    let Some(stream) = crate::daemon::connect(config) else { return };
+    let Ok(writer) = stream.try_clone() else { return };
+    let w: crate::approvals::Writer = Arc::new(Mutex::new(writer));
+    let hello = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": crate::mcp::PROTOCOL_VERSIONS[0], "clientInfo": { "name": "orion shell", "version": env!("CARGO_PKG_VERSION") } } });
+    if crate::approvals::send(&w, &hello).is_err() || crate::approvals::send(&w, &json!({ "jsonrpc": "2.0", "id": 2, "method": "orion/approvals/watch" })).is_err() {
+        return;
+    }
+    *hub.agents.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
+    let show = |r: &Value| {
+        let Some(rid) = r["id"].as_u64() else { return };
+        let id = hub.next_id.fetch_add(1, Ordering::SeqCst);
+        hub.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Pending::Agent(rid));
+        hub.agent_cards.lock().unwrap_or_else(|e| e.into_inner()).insert(rid, id);
+        let preview = serde_json::to_string_pretty(&r["args"]).unwrap_or_default();
+        let from = r["caller"].as_str().unwrap_or("An AI agent");
+        hub.broadcast(json!({ "type": "approve", "id": id, "tool": r["tool"], "preview": preview, "from": from }), true);
+    };
+    for line in std::io::BufReader::new(stream).lines() {
+        let Ok(msg) = line.and_then(|l| serde_json::from_str::<Value>(&l).map_err(std::io::Error::other)) else { break };
+        match (msg["id"].as_u64(), msg["method"].as_str()) {
+            (Some(2), None) => msg["result"]["pending"].as_array().into_iter().flatten().for_each(&show),
+            (_, Some("orion/approval/request")) => show(&msg["params"]),
+            // Answered elsewhere (a terminal, a notification), or expired.
+            (_, Some("orion/approval/resolved")) => {
+                let Some(rid) = msg["params"]["id"].as_u64() else { continue };
+                let Some(id) = hub.agent_cards.lock().unwrap_or_else(|e| e.into_inner()).remove(&rid) else { continue };
+                if hub.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some() {
+                    let answer = match msg["params"]["outcome"].as_str() {
+                        Some("approved") => "yes",
+                        Some("declined") => "no",
+                        _ => "expired",
+                    };
+                    hub.broadcast(json!({ "type": "answered", "id": id, "answer": answer }), true);
+                }
+            }
+            _ => {}
+        }
+    }
+    *hub.agents.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 fn post(hub: &Arc<Hub>, path: &str, body: &Value) -> (u16, Value) {
     let busy = hub.busy.load(Ordering::SeqCst);
     let ok = json!({ "ok": true });
@@ -543,19 +621,7 @@ fn post(hub: &Arc<Hub>, path: &str, body: &Value) -> (u16, Value) {
             let Some(p) = hub.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) else {
                 return (409, json!({ "error": "already answered" }));
             };
-            match p {
-                Pending::Approve(tx) => {
-                    let a = match answer {
-                        "yes" => Answer::Yes,
-                        "always" => Answer::Always,
-                        _ => Answer::No,
-                    };
-                    let _ = tx.send(a);
-                }
-                Pending::Confirm(tx) => {
-                    let _ = tx.send(answer == "yes");
-                }
-            }
+            hub.resolve(p, answer);
             hub.broadcast(json!({ "type": "answered", "id": id, "answer": answer }), true);
             (200, ok)
         }
@@ -672,6 +738,8 @@ mod tests {
             wake_queue: Mutex::new(None),
             wake_error: Mutex::new(None),
             show_reasoning: true,
+            agents: Mutex::new(None),
+            agent_cards: Mutex::new(HashMap::new()),
         };
         (Arc::new(hub), rx)
     }

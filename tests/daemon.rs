@@ -24,7 +24,17 @@ fn serve_bridges_to_a_running_daemon() {
 
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_orion"));
     env(&mut daemon);
-    let mut daemon = daemon.arg("daemon").stderr(Stdio::null()).spawn().unwrap();
+    let daemon = daemon.arg("daemon").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    // Stopped however the test ends: a daemon left running would keep
+    // cargo waiting for the test's output forever.
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let daemon = Reap(daemon);
     let socket = run.join("orion/orion.sock");
     let start = Instant::now();
     while !socket.exists() {
@@ -72,11 +82,23 @@ fn serve_bridges_to_a_running_daemon() {
     // Only the daemon knows `orion/status`: proof the call went through it.
     let st = rpc(3, "orion/status", json!({}));
     assert_eq!(st["result"]["tool_calls"], 1, "{st}");
+    // Through the daemon, agents are offered tools that need approval too.
+    let list = rpc(4, "tools/list", json!({}));
+    let fs_write = list["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "fs_write").cloned();
+    assert!(fs_write.is_some_and(|t| t["description"].as_str().unwrap().contains("waits for a person")), "{list}");
+    // With nobody approving, a call that needs it is refused, and says why.
+    let w = rpc(5, "tools/call", json!({ "name": "fs_write", "arguments": { "path": "~/orion-workspace/x.txt", "content": "x" } }));
+    assert_eq!(w["result"]["isError"], true, "{w}");
+    assert!(w["result"]["content"][0]["text"].as_str().unwrap().contains("nobody is approving"), "{w}");
+    // But an agent may never approve, not even its own calls.
+    for (id, method) in [(6, "orion/approvals/self"), (7, "orion/approvals/watch"), (8, "orion/approvals/answer")] {
+        let r = rpc(id, method, json!({ "id": 1, "approve": true }));
+        assert!(r["error"]["message"].as_str().unwrap_or_default().contains("can't answer approval requests"), "{method}: {r}");
+    }
 
     drop(stdin);
     let _ = serve.wait(); // exits when its stdin closes
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+    drop(daemon);
     let log = std::fs::read_to_string(home.path().join(".local/state/orion/audit.jsonl")).unwrap();
     assert!(log.contains("\"caller\":\"bridge-test (pid "), "{log}");
 }

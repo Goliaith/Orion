@@ -686,6 +686,33 @@ orion status
 - **Policy edits apply live.** The daemon watches the policy file and reloads it within two seconds; connected agents see the new tool list on their next call. A broken edit is reported in `orion status`, and the old policy stays in force.
 - **The audit log names the caller.** Each entry carries the client's name and pid (`"caller": "claude-code (pid 5312)"`), so you can tell agents apart.
 - **`orion status`** adds an `orion/status` method that any client can call; it exits 1 when the daemon isn't running.
+- **The chat, the shell and `orion listen` use it too.** When the daemon runs this version of Orion with the same policy file, their tool calls go through it, so everything shares one sandbox and audit log. Their approval prompts still appear in the chat: the daemon asks the chat that made the call. Ctrl-C stops a program the daemon is running for the chat. The header says `tools run through the daemon (pid …)`; otherwise they call tools in-process, as before. `[daemon] chat = "never"` keeps them in-process.
+
+### Approvals for AI agents
+
+Through the daemon, agents are offered the tools the policy sets to `ask` too, and a person approves each call:
+
+```sh
+orion approvals              # prompts in this terminal, one request at a time
+orion approvals --notify     # desktop notifications with Approve and Decline
+orion approvals --list       # what waits now
+```
+
+```
+claude-code (pid 5312) asks to run fs_write (write):
+    {
+      "content": "hi",
+      "path": "~/orion-workspace/b.txt"
+    }
+  Write text to a file inside a writable root, …
+Approve fs_write? [y/N] y
+  approved
+```
+
+- **Where to answer:** `orion approvals` in a terminal, the notifications (`contrib/orion-approvals.service` keeps them running), or the [graphical shell](#graphical-shell), which shows each request as a card naming the agent. The first answer counts, and the others see it was answered.
+- **Nobody watching:** the call is refused at once, and the agent is told someone can run `orion approvals`. **Nobody answering** within `[daemon] approval_timeout_secs` (2 minutes) counts as no.
+- **What the person sees** is the agent's name and process, the tool, its description and the full arguments, with secrets blanked. Every answer is in the audit log.
+- **`[daemon] approvals = false`** goes back to offering agents only the `allow` tools.
 
 ### As a systemd service
 
@@ -756,6 +783,8 @@ src/
   audit.rs      JSONL audit log
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
   daemon.rs     the system service: socket, peer checks, live reload, the stdio bridge
+  approvals.rs  approvals through the daemon: the broker, and `orion approvals`
+  remote.rs     the chat calling tools through the daemon
   helper.rs     the privileged helper: the root service, its client, who may use it;
                 each tool module checks its own commands (helper_check)
   sandbox.rs    sandboxing for proc_run: bubblewrap, Landlock, resource limits
@@ -791,7 +820,8 @@ src/
                 neural speaker encoder (neural.rs), reading PyTorch weights
                 (torch.rs) and enrolling a voice (enroll.rs)
 docs/           install.md and operating.md: the installation and operating guides
-contrib/        orion.socket and orion.service (the daemon), orion-helper.socket and
+contrib/        orion.socket and orion.service (the daemon), orion-approvals.service
+                (approvals by notification), orion-helper.socket and
                 orion-helper.service (the privileged helper), orion-voice.service
                 (headless voice), orion-kiosk (boot into the shell), orion-shell.service
 tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
@@ -807,7 +837,7 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 ## Roadmap
 
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
-2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
+2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. The chat, the shell and `orion listen` call tools through it, and ~~`ask` approvals from MCP agents~~ reach you in a terminal, a notification or the shell.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits, and ~~a privileged helper~~ (`orion helper`) for root work in place of sudo rules. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots), on apt, dnf, zypper and pacman. Next: scheduled unattended updates, and a status-bar badge for pending security fixes.
 5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

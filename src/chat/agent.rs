@@ -67,6 +67,8 @@ pub struct Status {
     pub turns: usize,
     pub tools_auto: usize,
     pub tools_ask: usize,
+    /// Where tool calls run: "through the daemon (pid N)", or here.
+    pub tools_run: String,
     /// Whose conversation it is, and how much is remembered about them.
     pub person: String,
     pub notes: Option<usize>,
@@ -88,6 +90,7 @@ pub fn status(orion: &Orion, session: &Session) -> Status {
         turns: session.turns().len(),
         tools_auto: count(Decision::Allow),
         tools_ask: count(Decision::Ask),
+        tools_run: orion.runs_tools(),
         person: session.person().to_string(),
         notes: session.memory().map(|m| m.notes.len()),
     }
