@@ -215,7 +215,34 @@ How it works: the microphone stays open, and a pause detector (with a noise floo
 - **The cost:** transcribing every utterance is light with a GPU or a small Whisper model, but a dedicated detector uses far less power on a CPU.
 - **Your own phrase:** `wake_phrase` sets it, for example `"hey computer"`. A short, distinctive name works best.
 - **No leftover microphone:** the microphone is closed as soon as wake listening stops, and it can't outlive Orion even if Orion is killed.
-- **The line-by-line chat** can't take input while it waits at its prompt, so wake listening is only in the full-screen chat and the shell.
+- **The line-by-line chat** can't take input while it waits at its prompt, so wake listening is only in the full-screen chat, the shell and [headless voice](#headless-voice).
+
+#### Headless voice
+
+`orion listen` is Orion with no screen at all: it listens for the wake phrase, works on what you ask, and speaks the answer. That makes it a voice assistant for the machine, made to run as a service.
+
+```sh
+orion listen                        # until stopped; --local / --claude / --auto, --resume
+systemctl --user enable --now orion-voice.service    # or as a user service (contrib/)
+journalctl --user -u orion-voice -f                  # what it heard and said
+```
+
+```
+Orion is listening: say "orion" (heard by Systran/faster-whisper-small at http://127.0.0.1:8000/v1)
+approvals by voice: on ("Orion, yes")
+you: how long has this machine been up?
+⚙ proc_run {"command":"uptime"}
+asking: May I run uptime?
+you: yes. (approved)
+  ✓ 22ms
+orion: The machine says: up 35 min, load average: 0.45, 0.25, 0.21.
+```
+
+- **The same conversation engine.** Routing, tools, the policy, the sandbox, the audit log and saved conversations all work as in the chat. A new conversation starts when the last request is more than 10 minutes old (`listen_new_after_mins`).
+- **Approvals are asked aloud.** With `wake_approvals = true`, Orion asks "May I restart ollama? Say Orion yes, or Orion no." and waits 30 seconds for an answer; silence or anything else counts as no. With it off (the default), tools that need approval are declined, and Orion says so. Pre-approve what you want it to do freely in the policy (`[tools]`, `proc.allowed_commands`, `services.allowed`, …).
+- **Hands-free control:** "Orion, stop" interrupts the AI. A request made while it is working waits its turn ("I'll do that next."). Errors are spoken briefly and logged in full.
+- **It needs all three parts:** a microphone, speech to text and speech. It names whatever is missing at startup. If the microphone fails later, it tries again every 10 seconds.
+- **Only one listener:** run either this or wake listening in a chat or shell, not both, or both will answer.
 
 ### Saved conversations
 
@@ -349,6 +376,7 @@ orion call fs_list '{"path": "~"}'
 orion audit -n 20                             # recent calls, as JSON lines
 orion conversations                           # saved chats (see "Saved conversations")
 orion shell                                   # the graphical shell (see "Graphical shell")
+orion listen                                  # headless voice: "Orion, …" (see "Headless voice")
 orion serve                                   # MCP server on stdin/stdout (through the daemon when it runs)
 orion daemon                                  # the system service (see "System service")
 orion status                                  # whether the daemon runs, and how
@@ -499,7 +527,9 @@ src/
     http.rs     shared HTTP: retries, proxy rules, error bodies, SSE lines
     store.rs    saved conversations: atomic, private JSON files
     terminal.rs the line-by-line chat, shared commands, `orion conversations`
-    agent.rs    the conversation's own thread, shared by the full-screen chat and the shell
+    agent.rs    the conversation's own thread, shared by the full-screen chat, the shell
+                and headless voice
+    listen.rs   headless voice (`orion listen`): wake, spoken replies, spoken approvals
     machine.rs  live CPU, memory and GPU readings for status displays
     tui/        the full-screen chat: screen and keys (mod.rs), the message editor (input.rs)
     shell/      the graphical shell: server, event hub and security (mod.rs),
@@ -508,8 +538,8 @@ src/
   voice/        listening and the pause detector (record.rs), speech to text
                 (transcribe.rs), text to speech and sentence splitting (speak.rs),
                 the wake word (wake.rs)
-contrib/        orion.socket and orion.service (the daemon), orion-kiosk (boot into
-                the shell), orion-shell.service
+contrib/        orion.socket and orion.service (the daemon), orion-voice.service
+                (headless voice), orion-kiosk (boot into the shell), orion-shell.service
 tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
                 (daemon plus bridge)
 ```
@@ -522,4 +552,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. Next: GPU placement (which card a model goes on), network changes (Wi-Fi, firewall), disks and mounts, and updates.
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. Still to come: speaker verification (only your voice wakes it), and a headless voice mode that runs as a service.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`) is done too. Still to come: speaker verification, so only your voice wakes it.

@@ -78,6 +78,28 @@ enum Cmd {
         #[arg(long)]
         open: bool,
     },
+    /// Headless voice: listen for the wake phrase and speak the answers, with
+    /// no screen (see contrib/orion-voice.service).
+    Listen {
+        /// Always use the model served on this machine.
+        #[arg(long, conflicts_with_all = ["claude", "auto"])]
+        local: bool,
+        /// Always use Claude.
+        #[arg(long, conflicts_with = "auto")]
+        claude: bool,
+        /// Route each request to Claude or the local model (the default).
+        #[arg(long)]
+        auto: bool,
+        /// Use this model instead of the configured one (with --claude or --local).
+        #[arg(long)]
+        model: Option<String>,
+        /// Continue a saved conversation: the latest, or the one with this id (or id prefix).
+        #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
+        resume: Option<String>,
+        /// Don't say "Listening." at the start.
+        #[arg(long)]
+        quiet: bool,
+    },
     /// List, show or delete saved chat conversations.
     Conversations {
         #[command(subcommand)]
@@ -147,6 +169,15 @@ fn main() -> Result<()> {
                 _ => None,
             };
             terminal::run_shell(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), port, open)
+        }
+        Cmd::Listen { local, claude, auto, model, resume, quiet } => {
+            let mode = match (local, claude, auto) {
+                (true, _, _) => Some(Mode::Local),
+                (_, true, _) => Some(Mode::Claude),
+                (_, _, true) => Some(Mode::Auto),
+                _ => None,
+            };
+            orion::chat::listen::run(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), quiet)
         }
         Cmd::Daemon { socket } => daemon::run(policy, source, socket),
         Cmd::Status => {

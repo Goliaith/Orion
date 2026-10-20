@@ -10,6 +10,7 @@
 
 mod agent;
 mod classifier;
+pub mod listen;
 pub mod claude;
 pub(crate) mod http;
 mod machine;

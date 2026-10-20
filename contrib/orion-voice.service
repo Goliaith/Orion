@@ -1,0 +1,21 @@
+# Headless voice (`orion listen`): say "Orion, …" and hear the answer, with no
+# screen. A user service, so it can reach your PipeWire or PulseAudio session.
+#
+#   cp contrib/orion-voice.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now orion-voice.service
+#   journalctl --user -u orion-voice -f      # what it heard and said
+[Unit]
+Description=Orion voice: say "Orion, …"
+After=pipewire.service pipewire-pulse.service pulseaudio.service
+Wants=pipewire-pulse.service
+
+[Service]
+ExecStart=%h/.cargo/bin/orion listen
+Restart=on-failure
+RestartSec=5
+# Put ANTHROPIC_API_KEY or other variables here, one VAR=value per line.
+EnvironmentFile=-%h/.config/orion/env
+
+[Install]
+WantedBy=default.target

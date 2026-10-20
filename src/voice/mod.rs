@@ -80,6 +80,9 @@ pub struct VoiceConfig {
     pub wake_allow_remote: bool,
     /// Let "Orion, yes" approve a tool call. "No" always declines.
     pub wake_approvals: bool,
+    /// `orion listen`: start a new conversation when the last request is
+    /// this many minutes old (0: one conversation for good).
+    pub listen_new_after_mins: u64,
 }
 
 impl Default for VoiceConfig {
@@ -111,6 +114,7 @@ impl Default for VoiceConfig {
             wake_timeout_secs: 8,
             wake_allow_remote: false,
             wake_approvals: false,
+            listen_new_after_mins: 10,
         }
     }
 }

@@ -166,6 +166,8 @@ wake_chime = true               # chime when woken without a request
 wake_timeout_secs = 8           # how long to wait for the request after "Orion"
 wake_approvals = false          # true: "Orion, yes" approves a tool call ("no" always declines)
 wake_allow_remote = false       # allow a transcriber on another machine to hear everything
+# Headless voice (`orion listen`) always listens and speaks.
+listen_new_after_mins = 10      # a new conversation after this long a quiet spell (0: never)
 
 # The graphical shell: `orion shell`, then open the printed address.
 [shell]
