@@ -437,6 +437,37 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn signals_processes_but_never_the_ones_that_matter() {
+        let p = Policy::from_toml("").unwrap();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let r = ProcSignal.call(&p, json!({ "pid": pid, "wait_secs": 5 })).unwrap();
+        assert_eq!(r["processes"][0]["exited"], true, "{r}");
+        assert_eq!(r["signal"], "TERM");
+        child.wait().unwrap();
+
+        // One that ignores TERM: escalation kills it after the wait.
+        let mut stubborn = std::process::Command::new("sh").args(["-c", "trap '' TERM; exec sleep 30"]).spawn().unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let r = ProcSignal.call(&p, json!({ "pid": stubborn.id(), "wait_secs": 1, "escalate": true })).unwrap();
+        assert_eq!(r["processes"][0]["killed_after_wait"], true, "{r}");
+        assert_eq!(r["processes"][0]["exited"], true, "{r}");
+        stubborn.wait().unwrap();
+
+        let refused = |a: Value| ProcSignal.precheck(&p, &a).unwrap_err().to_string();
+        assert!(refused(json!({ "pid": 1 })).contains("PID 1"));
+        assert!(refused(json!({ "pid": std::process::id() })).contains("Orion itself"));
+        assert!(refused(json!({ "pid": 4_000_000 })).contains("no process"));
+        assert!(refused(json!({ "name": "orion-no-such-process" })).contains("no process"));
+        assert!(refused(json!({})).contains("either pid or name"));
+        let strict = Policy::from_toml("[proc]\nprotected = [\"sle*\"]\n").unwrap();
+        let mut guarded = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(ProcSignal.precheck(&strict, &json!({ "pid": guarded.id() })).unwrap_err().to_string().contains("protected"));
+        guarded.kill().unwrap();
+        guarded.wait().unwrap();
+    }
+
     fn policy(commands: &str) -> Policy {
         Policy::from_toml(&format!("[proc]\nallowed_commands = {commands}\ntimeout_secs = 2\nmax_output_bytes = 8\n"))
             .unwrap()
