@@ -449,7 +449,11 @@ mod tests {
 
         // One that ignores TERM: escalation kills it after the wait.
         let mut stubborn = std::process::Command::new("sh").args(["-c", "trap '' TERM; exec sleep 30"]).spawn().unwrap();
-        thread::sleep(Duration::from_millis(200));
+        // Once it is sleep, the shell has set the trap and exec'd.
+        let until = Instant::now() + Duration::from_secs(5);
+        while read_proc(stubborn.id()).is_none_or(|p| p.name != "sleep") && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
         let r = ProcSignal.call(&p, json!({ "pid": stubborn.id(), "wait_secs": 1, "escalate": true })).unwrap();
         assert_eq!(r["processes"][0]["killed_after_wait"], true, "{r}");
         assert_eq!(r["processes"][0]["exited"], true, "{r}");
