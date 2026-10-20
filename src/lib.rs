@@ -144,6 +144,20 @@ impl Orion {
         });
         CallError::Denied(reason.to_string())
     }
+
+    /// Record a call that something other than a tool handled (the chat's
+    /// memory), so the audit log is complete.
+    pub fn record(&self, name: &str, args: &Value, caller: Option<&str>, error: Option<&str>) {
+        self.audit.record(audit::Entry {
+            tool: name,
+            caller,
+            decision: Decision::Allow,
+            approved: None,
+            args,
+            error: error.map(str::to_string),
+            duration: std::time::Duration::ZERO,
+        });
+    }
 }
 
 #[cfg(test)]

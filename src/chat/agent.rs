@@ -67,6 +67,9 @@ pub struct Status {
     pub turns: usize,
     pub tools_auto: usize,
     pub tools_ask: usize,
+    /// Whose conversation it is, and how much is remembered about them.
+    pub person: String,
+    pub notes: Option<usize>,
 }
 
 pub fn status(orion: &Orion, session: &Session) -> Status {
@@ -85,6 +88,8 @@ pub fn status(orion: &Orion, session: &Session) -> Status {
         turns: session.turns().len(),
         tools_auto: count(Decision::Allow),
         tools_ask: count(Decision::Ask),
+        person: session.person().to_string(),
+        notes: session.memory().map(|m| m.notes.len()),
     }
 }
 
@@ -182,6 +187,32 @@ impl Ui for ChannelUi<'_> {
 
 pub use crate::voice::capitalize;
 
+/// Save this conversation and go to `person`'s: their latest, if it was
+/// active recently (`voice.listen_new_after_mins`), or a new one.
+fn switch_person(orion: &Orion, session: &mut Session, saver: &Saver, person: &str) -> String {
+    let mut out = String::new();
+    saver.save(session, &Style { on: false }, &mut out);
+    let mins = orion.policy().voice.listen_new_after_mins;
+    let fresh = |updated_ms: u64| mins == 0 || super::store::now_ms().saturating_sub(updated_ms) <= mins * 60_000;
+    let latest = saver
+        .store
+        .as_ref()
+        .and_then(|s| s.latest_for(person, &super::session::owner_name()).ok().flatten())
+        .filter(|c| fresh(c.updated_ms));
+    let name = capitalize(person);
+    match latest {
+        Some(conv) => {
+            session.restore(conv);
+            format!("{name}'s conversation")
+        }
+        None => {
+            session.clear();
+            session.set_person(person);
+            format!("a new conversation with {name}")
+        }
+    }
+}
+
 /// Serve the screen thread until it hangs up or a command quits.
 pub fn run(orion: &Orion, mut session: Session, saver: Saver, rx: Receiver<ToAgent>, tx: Sender<FromAgent>) {
     let plain = Style { on: false };
@@ -201,6 +232,14 @@ pub fn run(orion: &Orion, mut session: Session, saver: Saver, rx: Receiver<ToAge
                     ToAgent::Turn(text) => (text, None),
                     _ => unreachable!(),
                 };
+                // Each person has their own conversations; typed messages
+                // belong to whoever is logged in.
+                let person = speaker.as_ref().map_or_else(super::session::owner_name, |s| s.name.clone());
+                if session.person() != person {
+                    let notice = switch_person(orion, &mut session, &saver, &person);
+                    send(FromAgent::Transcript(session.turns().to_vec()));
+                    send(FromAgent::Notice(notice));
+                }
                 interrupt::clear();
                 let mut ui = ChannelUi { tx: &tx, always: &mut always, answered_at: None, speaker };
                 if let Err(e) = session.turn(&text, &mut ui) {
@@ -229,5 +268,54 @@ pub fn run(orion: &Orion, mut session: Session, saver: Saver, rx: Receiver<ToAge
         }
         send(FromAgent::Status(status(orion, &session)));
         send(FromAgent::Done);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::store::{Conversation, Store, Turn, FORMAT_VERSION};
+    use super::super::test_support::orion;
+    use super::*;
+
+    fn saved(store: &Store, id: &str, owner: &str, said: &str) {
+        let now = super::super::store::now_ms();
+        let turn = Turn { user: said.into(), provider: Provider::Local, private: false, reply: "ok".into(), tools: vec![] };
+        let conv = Conversation {
+            version: FORMAT_VERSION,
+            id: id.into(),
+            title: said.into(),
+            created_ms: now,
+            updated_ms: now,
+            mode: Mode::Local,
+            previous: None,
+            turns: vec![turn],
+            backends: Default::default(),
+            owner: owner.into(),
+        };
+        store.save(&conv).unwrap();
+    }
+
+    #[test]
+    fn each_person_has_their_own_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        saved(&store, "20261020-090000-aaaa", "ana", "what's using the GPU?");
+        let saver = Saver { store: Some(Store::new(dir.path())) };
+        let orion = orion();
+        let mut s = Session::with_backends(&orion, Mode::Local, None, None);
+        s.set_memory_dir(None);
+        assert_eq!(s.person(), super::super::session::owner_name());
+
+        // Ana continues her own recent conversation.
+        assert_eq!(switch_person(&orion, &mut s, &saver, "ana"), "Ana's conversation");
+        assert_eq!(s.person(), "ana");
+        assert_eq!(s.turns()[0].user, "what's using the GPU?");
+        // Ben has none yet: a new one, and Ana's is left as it was.
+        assert_eq!(switch_person(&orion, &mut s, &saver, "ben"), "a new conversation with Ben");
+        assert!(s.turns().is_empty() && s.person() == "ben");
+        assert_eq!(store.latest_for("ana", "x").unwrap().unwrap().turns.len(), 1);
+        // Back to Ana: hers again.
+        switch_person(&orion, &mut s, &saver, "ana");
+        assert_eq!(s.turns().len(), 1);
     }
 }

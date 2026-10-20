@@ -482,6 +482,10 @@ fn run_plain(orion: &Orion, mut session: Session, saver: Saver, resumed: bool) -
     Ok(())
 }
 
+fn session_owner() -> String {
+    super::session::owner_name()
+}
+
 /// Saves the conversation after each change, if saving is on.
 pub(super) struct Saver {
     pub(super) store: Option<Store>,
@@ -544,8 +548,12 @@ pub fn conversations(action: Option<(&str, &str)>) -> Result<()> {
             if all.is_empty() {
                 println!("no saved conversations ({})", store.dir().display());
             }
+            let owner = session_owner();
+            let shared = all.iter().any(|c| !c.owner.is_empty() && c.owner != owner);
             for c in all {
-                println!("{}  {:<14} {:>3} msg  {}", c.id, s.dim(&store::ago(c.updated_ms)), c.turns, c.title);
+                let whose = if c.owner.is_empty() { owner.clone() } else { c.owner.clone() };
+                let whose = if shared { format!("{whose:<10} ") } else { String::new() };
+                println!("{}  {whose}{:<14} {:>3} msg  {}", c.id, s.dim(&store::ago(c.updated_ms)), c.turns, c.title);
             }
         }
         Some(("show", id)) => {
@@ -739,6 +747,7 @@ pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style
             say!(out, "  /title <text>           rename this conversation");
             say!(out, "  /exit                   leave (Ctrl-D works too)");
             say!(out, "  /voice [speak on|off|test]  voice setup; Ctrl-T talks");
+            say!(out, "  /memory [forget <id>|clear]  what the AI remembers about whoever this conversation is with");
             say!(out, "  /keys                   the hotkeys");
         }
         "keys" => {
@@ -823,6 +832,33 @@ pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style
             saver.save(session, s, out);
             say!(out, "  {}", s.dim(&format!("title → {}", session.title())));
         }
+        "memory" => {
+            let name = crate::voice::capitalize(session.person());
+            let words: Vec<&str> = arg.split_whitespace().collect();
+            let result = match words.as_slice() {
+                [] => Ok(None),
+                ["forget", id] => match id.parse::<u32>() {
+                    Ok(id) => session.memory_mut().map(|m| m.forget(id).map(|n| Some(format!("forgot: {}", n.text)))).unwrap_or(Ok(None)),
+                    Err(_) => Ok(Some("usage: /memory forget <id>".to_string())),
+                },
+                ["clear"] => session.memory_mut().map(|m| m.clear().map(|n| Some(format!("forgot all {n} notes about {name}")))).unwrap_or(Ok(None)),
+                _ => Ok(Some("usage: /memory, /memory forget <id>, /memory clear".to_string())),
+            };
+            match (result, session.memory()) {
+                (Err(e), _) => say!(out, "  {}", s.red(&format!("{e:#}"))),
+                (Ok(Some(done)), _) => say!(out, "  {}", s.dim(&done)),
+                (Ok(None), None) => say!(out, "  {}", s.dim("memory is off (chat.memory)")),
+                (Ok(None), Some(m)) if m.notes.is_empty() => say!(out, "  {}", s.dim(&format!("nothing remembered about {name} yet"))),
+                (Ok(None), Some(m)) => {
+                    say!(out, "  {}", s.bold(&format!("What Orion remembers about {name}")));
+                    for n in &m.notes {
+                        let private = if n.private { s.dim(" (private: local model only)") } else { String::new() };
+                        say!(out, "  {:>3}. {}{private}", n.id, n.text);
+                    }
+                    say!(out, "  {}", s.dim("/memory forget <id> removes one"));
+                }
+            }
+        }
         "history" => match &saver.store {
             None => say!(out, "  {}", s.dim("saving is off (chat.save_conversations)")),
             Some(store) => match store.list() {
@@ -830,7 +866,8 @@ pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style
                 Ok(all) => {
                     for (i, c) in all.iter().take(20).enumerate() {
                         let here = if c.id == session.id() { s.green(" ← this one") } else { String::new() };
-                        say!(out, "  {:>2}. {:<44} {}{here}", i + 1, clip(&c.title, 44), s.dim(&format!("{} · {} msg", store::ago(c.updated_ms), c.turns)));
+                        let whose = if c.owner.is_empty() || c.owner == session_owner() { String::new() } else { format!("{} · ", crate::voice::capitalize(&c.owner)) };
+                        say!(out, "  {:>2}. {:<44} {}{here}", i + 1, clip(&c.title, 44), s.dim(&format!("{whose}{} · {} msg", store::ago(c.updated_ms), c.turns)));
                     }
                     say!(out, "  {}", s.dim("/resume <number> continues one"));
                 }
@@ -891,4 +928,39 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+/// `orion memory`: what the AI remembers about someone, and forgetting it.
+pub fn memory(person: Option<&str>, action: Option<(&str, Option<u32>)>) -> Result<()> {
+    let dir = super::memory::default_dir().context("no state directory (is HOME set?)")?;
+    let person = match person {
+        Some(p) => crate::voice::speaker::valid_name(p)?,
+        None => session_owner(),
+    };
+    let mut m = super::memory::Memory::load(&dir, &person)?;
+    let name = crate::voice::capitalize(&person);
+    match action {
+        None => {
+            if m.notes.is_empty() {
+                println!("Orion doesn't remember anything about {name}.");
+            }
+            for n in &m.notes {
+                println!("{:>3}. {}{}", n.id, n.text, if n.private { "  (private: local model only)" } else { "" });
+            }
+            let others: Vec<String> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .filter(|p| *p != person && !p.ends_with(".tmp"))
+                .collect();
+            if !others.is_empty() {
+                println!("(also remembered: {}; see --person <name>)", others.join(", "));
+            }
+        }
+        Some(("forget", Some(id))) => println!("Forgot: {}", m.forget(id)?.text),
+        Some(("clear", _)) => println!("Forgot all {} notes about {name}.", m.clear()?),
+        Some((other, _)) => anyhow::bail!("unknown memory action {other}"),
+    }
+    Ok(())
 }

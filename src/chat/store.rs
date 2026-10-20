@@ -55,6 +55,9 @@ pub struct Conversation {
     pub turns: Vec<Turn>,
     /// Keyed by "claude" / "local".
     pub backends: BTreeMap<String, SavedBackend>,
+    /// Whose conversation it is ("" in files from before that was kept).
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// What a listing shows.
@@ -64,6 +67,8 @@ pub struct Summary {
     pub title: String,
     pub updated_ms: u64,
     pub turns: usize,
+    /// Whose it is ("" for conversations from before that was kept).
+    pub owner: String,
 }
 
 pub struct Store {
@@ -154,11 +159,23 @@ impl Store {
                     return None;
                 }
                 let conv: Conversation = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
-                Some(Summary { id: conv.id, title: conv.title, updated_ms: conv.updated_ms, turns: conv.turns.len() })
+                Some(Summary { id: conv.id, title: conv.title, updated_ms: conv.updated_ms, turns: conv.turns.len(), owner: conv.owner })
             })
             .collect();
         out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then_with(|| b.id.cmp(&a.id)));
         Ok(out)
+    }
+}
+
+impl Store {
+    /// `person`'s most recent conversation. Conversations from before owners
+    /// were kept count as `default_owner`'s.
+    pub fn latest_for(&self, person: &str, default_owner: &str) -> Result<Option<Conversation>> {
+        let owner = |s: &Summary| if s.owner.is_empty() { default_owner.to_string() } else { s.owner.clone() };
+        match self.list()?.into_iter().find(|s| owner(s) == person) {
+            Some(s) => self.load(&s.id).map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -245,6 +262,7 @@ mod tests {
                     history: json!([{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"sig"}]}]),
                 },
             )]),
+            owner: String::new(),
         }
     }
 

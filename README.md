@@ -91,7 +91,7 @@ Firefox is using 3.1 GB of your 16 GB. I wrote the details to ~/orion-workspace/
 - **Streaming.** Replies stream as they are written. The model's progress notes and reasoning show dimmed, so long tasks don't sit silent.
 - **Every tool call is visible**, with its arguments and whether it worked.
 - **Approval prompts** show the full arguments of anything that changes the machine. `a` approves that tool for the rest of the session.
-- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/voice`, `/keys`, `/new`, `/history`, `/resume`, `/title`, `/exit`, plus `@claude` / `@local` prefixes and the [hotkeys](#hotkeys). Line history is kept in `~/.local/state/orion/chat_history`.
+- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/voice`, `/memory`, `/keys`, `/new`, `/history`, `/resume`, `/title`, `/exit`, plus `@claude` / `@local` prefixes and the [hotkeys](#hotkeys). Line history is kept in `~/.local/state/orion/chat_history`.
 - Settings live under `[chat]` in the policy file: the mode (`provider = "auto"`, `"claude"` or `"local"`) and the sections `[chat.claude]` (model, default `claude-opus-5-5`; effort; progress notes; fallbacks), `[chat.local]` and `[chat.router]`.
 
 `ANTHROPIC_AUTH_TOKEN` (an OAuth access token) also works in place of an API key.
@@ -332,6 +332,36 @@ How it works:
 - **The routing mode comes back as well.** If that mode's model is gone (say the local server is off), the conversation continues in `auto`. A model that isn't connected when you resume keeps its saved history in the file, and gets it back as soon as it connects (with `/use` or Shift-Tab).
 - **Files live in `~/.local/state/orion/conversations/`** (`$XDG_STATE_HOME`), one JSON file per conversation. They are readable only by you (the folder is `0700`, the files `0600`) and written atomically. They hold private turns too, which never leave the machine. Set `save_conversations = false` under `[chat]` to stop saving.
 
+### People and memory
+
+Each person has their own conversations, and Orion remembers things about each of them across conversations.
+
+- **Whose conversation it is:** a spoken request from someone [enrolled](#speaker-verification) goes to *their* conversation. Their latest one continues if it was active in the last 10 minutes (`voice.listen_new_after_mins`); otherwise a new one starts. Typed messages belong to whoever is logged in. When the speaker changes, Orion saves the current conversation and switches, and says so ("Ana's conversation").
+- **Memory:** the AI has two tools, `memory_save` and `memory_forget`, and uses them for lasting facts: a preference, a project and where it lives, how someone likes things done. Each conversation starts with what is remembered about that person ("You are talking with Ana. What you remember about Ana: …"), and only that person.
+
+  ```
+  bea: remember that I prefer metric units.
+  ⚙ memory_save {"text":"Prefers metric units"}
+  orion: Got it, Bea: I'll remember that.
+  carl: what do you know about me?
+  a new conversation with Carl
+  orion: Carl, I don't know anything about you yet.
+  bea: what do you know about me?
+  Bea's conversation
+  orion: Bea, I remember: Prefers metric units.
+  ```
+
+- **Secrets are never kept.** A note that looks like a password, key or token is refused.
+- **Private notes stay local.** A note the router would call private (health, money, private paths, …) is only given to the local model; Claude is told only that some notes are withheld.
+- **Limits:** at most 60 notes of 300 characters each per person, so memory stays small enough to send with every conversation.
+- **The memory part of the prompt is fixed for a conversation,** so saving a note doesn't upset Claude's prompt caching. The model knows about the new note from the tool result.
+- **You're in control:**
+  - `/memory` lists what is remembered about whoever the conversation is with, and `/memory forget <id>` or `/memory clear` removes notes.
+  - From the shell prompt: `orion memory [--person ana] [forget <id> | clear]`.
+  - Memory tool calls are in the audit log, with the speaker as caller.
+- **Where it's kept:** each person's memory is one file in `~/.local/state/orion/memory/`, readable only by you. Programs the AI runs can't see it. Set `memory = false` under `[chat]` to turn memory off.
+- **On screen:** the full-screen chat and the shell show whose conversation is open and how much is remembered. `/history` and `orion conversations` show whose each conversation is.
+
 ### Hotkeys
 
 | Key | What it does |
@@ -430,6 +460,7 @@ orion call system_info                        # call a tool yourself, exactly as
 orion call fs_list '{"path": "~"}'
 orion audit -n 20                             # recent calls, as JSON lines
 orion conversations                           # saved chats (see "Saved conversations")
+orion memory                                  # what the AI remembers (see "People and memory")
 orion shell                                   # the graphical shell (see "Graphical shell")
 orion listen                                  # headless voice: "Orion, …" (see "Headless voice")
 orion voice model install                     # the neural speaker model (see "Speaker verification")
@@ -577,6 +608,7 @@ src/
   chat/
     mod.rs      config, the Backend and Ui traits
     session.rs  one conversation across both models: routing, catch-up, fallback, tool loop
+    memory.rs   what the AI remembers about each person
     router.rs   the routing order, keyword rules and the private-path guard
     classifier.rs  the local model as routing judge
     claude.rs   Claude backend: streaming Messages API client (SSE)
@@ -611,4 +643,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. Next: GPU placement (which card a model goes on), network changes (Wi-Fi, firewall), disks and mounts, and updates.
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. Next for voice: a benchmark on real recordings, and per-person conversations and memory.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

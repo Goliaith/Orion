@@ -1016,6 +1016,10 @@ fn panel_lines(m: &Machine, s: &Status, width: usize) -> Vec<Line<'static>> {
 
     l.push(Line::raw(""));
     l.push(Line::styled(" Session", head));
+    if !s.person.is_empty() {
+        let notes = s.notes.filter(|n| *n > 0).map(|n| format!(" · {n} remembered")).unwrap_or_default();
+        l.push(Line::styled(fit(&format!(" with {}{notes}", capitalize(&s.person)), width + 1), dim));
+    }
     let turns = format!(" {} message{}", s.turns, if s.turns == 1 { "" } else { "s" });
     l.push(Line::styled(turns, dim));
     for (label, u) in &s.usage {

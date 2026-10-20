@@ -237,6 +237,10 @@ impl Backend for ClaudeBackend {
         self.messages.clear();
     }
 
+    fn set_system(&mut self, system: &str) {
+        self.system = system.to_string();
+    }
+
     fn export_history(&self) -> Value {
         Value::Array(self.messages.clone())
     }

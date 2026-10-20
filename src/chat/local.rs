@@ -204,6 +204,10 @@ impl Backend for LocalBackend {
         self.messages.truncate(1);
     }
 
+    fn set_system(&mut self, system: &str) {
+        self.messages[0] = json!({ "role": "system", "content": system });
+    }
+
     fn export_history(&self) -> Value {
         // The system prompt is rebuilt on resume, so only the rest is saved.
         Value::Array(self.messages[1..].to_vec())

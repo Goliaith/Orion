@@ -383,7 +383,8 @@ function status(s) {
   }).join("");
   $("routing").textContent = s.routing ? "Routing: " + s.routing : "";
   const k = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
-  $("sess").innerHTML = `<div class="kv"><span>Messages</span><span>${s.turns}</span></div>`
+  $("sess").innerHTML = (s.person ? `<div class="kv"><span>With</span><span>${esc(s.person)}${s.notes ? ` · ${s.notes} remembered` : ""}</span></div>` : "")
+    + `<div class="kv"><span>Messages</span><span>${s.turns}</span></div>`
     + s.usage.map(u => `<div class="kv"><span>${u.label === "claude" ? "Claude" : "Local"}</span><span title="${u.cached ? k(u.cached) + " input tokens read from cache" : ""}">${k(u.input)} in · ${k(u.output)} out</span></div>`
       + (u.cached ? `<div class="kv"><span></span><span style="color:var(--faint)">${k(u.cached)} from cache</span></div>` : "")).join("")
     + `<div class="kv"><span>Tools</span><span>${s.tools_auto} automatic · ${s.tools_ask} ask first</span></div>`;

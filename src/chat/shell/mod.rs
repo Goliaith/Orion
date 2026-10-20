@@ -157,6 +157,8 @@ fn status_json(s: &Status) -> Value {
         })).collect::<Vec<_>>(),
         "title": s.title,
         "turns": s.turns,
+        "person": capitalize(&s.person),
+        "notes": s.notes,
         "tools_auto": s.tools_auto,
         "tools_ask": s.tools_ask,
     })

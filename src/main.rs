@@ -32,6 +32,16 @@ enum ConversationCmd {
 }
 
 #[derive(Subcommand)]
+enum MemoryCmd {
+    /// What is remembered (the default).
+    List,
+    /// Forget one note, by its number.
+    Forget { id: u32 },
+    /// Forget everything about the person.
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum VoiceCmd {
     /// Teach Orion someone's voice; only enrolled people can wake it.
     Enroll {
@@ -139,6 +149,14 @@ enum Cmd {
         #[arg(long)]
         quiet: bool,
     },
+    /// What the AI remembers about each person, across conversations.
+    Memory {
+        /// Whose memory (default: yours, the login name).
+        #[arg(long)]
+        person: Option<String>,
+        #[command(subcommand)]
+        action: Option<MemoryCmd>,
+    },
     /// Speaker verification: enroll your voice, test it, or forget it.
     Voice {
         #[command(subcommand)]
@@ -223,6 +241,14 @@ fn main() -> Result<()> {
             };
             orion::chat::listen::run(&Orion::new(policy), mode, model.as_deref(), resume.as_deref(), quiet)
         }
+        Cmd::Memory { person, action } => terminal::memory(
+            person.as_deref(),
+            match action {
+                None | Some(MemoryCmd::List) => None,
+                Some(MemoryCmd::Forget { id }) => Some(("forget", Some(id))),
+                Some(MemoryCmd::Clear) => Some(("clear", None)),
+            },
+        ),
         Cmd::Voice { action } => {
             let v = &policy.voice;
             match action {

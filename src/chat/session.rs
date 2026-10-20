@@ -4,6 +4,7 @@
 //! other one handled. Private turns are never shown to Claude.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -11,6 +12,7 @@ use anyhow::{bail, Result};
 use super::classifier::LocalClassifier;
 use super::router::{self, Classifier, Route, RouteContext, Router, Strategy};
 use super::{connect, Backend, Event, Mode, Provider, Stop, ToolCall, ToolResult, Ui, UiApprover};
+use super::memory::{self, Memory};
 use super::store::{self, Conversation, SavedBackend, Turn};
 use crate::{interrupt, Orion};
 
@@ -87,6 +89,15 @@ pub struct Session<'a> {
     /// first message.
     title: Option<String>,
     created_ms: u64,
+    /// Whose conversation this is: someone enrolled by voice, or the
+    /// person at the keyboard (the login name).
+    person: String,
+    /// What is remembered about them (when `chat.memory` is on).
+    memory: Option<Memory>,
+    memory_dir: Option<PathBuf>,
+    /// The memory part of the system prompt, fixed for a conversation so a
+    /// note saved mid-way doesn't upset prompt caching: (Claude, local).
+    context: (String, String),
 }
 
 impl<'a> Session<'a> {
@@ -114,6 +125,7 @@ impl<'a> Session<'a> {
             bail!("{}", errors.join("\n"));
         }
         s.classifier = s.build_classifier();
+        s.refresh_context();
         Ok(s)
     }
 
@@ -162,7 +174,71 @@ impl<'a> Session<'a> {
             id: store::new_id(),
             title: None,
             created_ms: store::now_ms(),
+            person: owner_name(),
+            memory: None,
+            memory_dir: chat.memory.then(memory::default_dir).flatten(),
+            context: Default::default(),
         }
+    }
+
+    /// Whose conversation this is.
+    pub fn person(&self) -> &str {
+        &self.person
+    }
+
+    pub fn memory(&self) -> Option<&Memory> {
+        self.memory.as_ref()
+    }
+
+    pub fn memory_mut(&mut self) -> Option<&mut Memory> {
+        self.memory.as_mut()
+    }
+
+    /// Keep memories somewhere else (tests), or nowhere (`None`).
+    pub fn set_memory_dir(&mut self, dir: Option<PathBuf>) {
+        self.memory_dir = dir;
+        self.memory = None;
+        self.refresh_context();
+    }
+
+    /// Make this `person`'s conversation: their memory, in the prompt.
+    pub fn set_person(&mut self, person: &str) {
+        self.person = person.to_string();
+        self.memory = None;
+        self.refresh_context();
+    }
+
+    /// Load the person's memory and put it in every model's system prompt.
+    fn refresh_context(&mut self) {
+        if self.memory.as_ref().is_none_or(|m| m.person != self.person) {
+            self.memory = self.memory_dir.as_ref().and_then(|d| match Memory::load(d, &self.person) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::warn!("memory: {e:#}");
+                    None
+                }
+            });
+        }
+        let name = crate::voice::capitalize(&self.person);
+        self.context = match &self.memory {
+            Some(m) => (m.prompt(&name, false), m.prompt(&name, true)),
+            None => Default::default(),
+        };
+        for p in [Provider::Claude, Provider::Local] {
+            let system = self.system_for(p);
+            if let Some(b) = self.slot_mut(p).backend.as_mut() {
+                b.set_system(&system);
+            }
+        }
+    }
+
+    fn system_for(&self, p: Provider) -> String {
+        let base = super::system_prompt(self.orion.policy());
+        let extra = match p {
+            Provider::Claude => &self.context.0,
+            Provider::Local => &self.context.1,
+        };
+        if extra.is_empty() { base } else { format!("{base}\n\n{extra}") }
     }
 
     fn slot(&self, p: Provider) -> &Slot {
@@ -212,7 +288,10 @@ impl<'a> Session<'a> {
         };
         for p in needed {
             if self.slot(p).backend.is_none() {
-                let connected = connect(self.orion, p, None);
+                let connected = connect(self.orion, p, None).map(|mut b| {
+                    b.set_system(&self.system_for(p));
+                    b
+                });
                 let slot = self.slot_mut(p);
                 match connected {
                     Ok(b) => slot.attach(b),
@@ -243,6 +322,7 @@ impl<'a> Session<'a> {
         self.id = store::new_id();
         self.title = None;
         self.created_ms = store::now_ms();
+        self.refresh_context();
     }
 
     pub fn id(&self) -> &str {
@@ -288,6 +368,7 @@ impl<'a> Session<'a> {
             previous: self.previous,
             turns: self.log.clone(),
             backends,
+            owner: self.person.clone(),
         })
     }
 
@@ -301,6 +382,9 @@ impl<'a> Session<'a> {
         self.created_ms = conv.created_ms;
         self.previous = conv.previous;
         self.log = conv.turns;
+        self.person = if conv.owner.is_empty() { owner_name() } else { conv.owner };
+        self.memory = None;
+        self.refresh_context();
         for (p, key) in [(Provider::Claude, "claude"), (Provider::Local, "local")] {
             let Some(saved) = conv.backends.get(key).cloned() else { continue };
             let slot = self.slot_mut(p);
@@ -439,7 +523,7 @@ impl<'a> Session<'a> {
     }
 
     fn tool_loop(&mut self, provider: Provider, record: &mut TurnRecord, ui: &mut dyn Ui) -> Result<()> {
-        let Self { orion, router, claude, local, max_tool_rounds, .. } = self;
+        let Self { orion, router, claude, local, max_tool_rounds, memory, .. } = self;
         let backend = match provider {
             Provider::Claude => claude.backend.as_mut(),
             Provider::Local => local.backend.as_mut(),
@@ -489,7 +573,7 @@ impl<'a> Session<'a> {
                     } else if reply.stop == Stop::Truncated {
                         ("Not run: the tool input was cut off by the output limit.".to_string(), true)
                     } else {
-                        run_tool(orion, router, provider, call, ui)
+                        run_tool(orion, router, provider, call, memory.as_mut(), ui)
                     };
                     record.tools.push(summarize(call, &content, is_error));
                     ToolResult { id: call.id.clone(), content, is_error }
@@ -503,9 +587,30 @@ impl<'a> Session<'a> {
     }
 }
 
-fn run_tool(orion: &Orion, router: &Router, provider: Provider, call: &ToolCall, ui: &mut dyn Ui) -> (String, bool) {
+fn run_tool(
+    orion: &Orion,
+    router: &Router,
+    provider: Provider,
+    call: &ToolCall,
+    memory: Option<&mut Memory>,
+    ui: &mut dyn Ui,
+) -> (String, bool) {
     ui.tool_start(&call.name, &call.input);
     let start = Instant::now();
+    if memory::is_memory_tool(&call.name) {
+        // Orion's own memory of the person, not the machine: no policy, but
+        // it goes in the audit log like everything else.
+        let result = match memory {
+            Some(m) => memory::call(m, &call.name, &call.input, |t| router.private_reason(t)).map_err(|e| format!("{e:#}")),
+            None => Err("memory is off (chat.memory)".to_string()),
+        };
+        orion.record(&call.name, &call.input, ui.caller().as_deref(), result.as_ref().err().map(String::as_str));
+        ui.tool_end(&call.name, &result, start.elapsed());
+        return match result {
+            Ok(v) => (v.to_string(), false),
+            Err(e) => (e, true),
+        };
+    }
     let risk = orion.tools().find(|(t, _)| t.name() == call.name).map(|(t, _)| t.risk());
     let caller = ui.caller();
     let refused = risk.and_then(|r| ui.refuses(&call.name, r));
@@ -525,6 +630,11 @@ fn run_tool(orion: &Orion, router: &Router, provider: Provider, call: &ToolCall,
         Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_default(), false),
         Err(e) => (e, true),
     }
+}
+
+/// Whose conversations typed messages belong to: the login name.
+pub fn owner_name() -> String {
+    crate::voice::speaker::default_name()
 }
 
 /// One line per tool call for the other model: what ran and a taste of
@@ -566,11 +676,12 @@ mod tests {
         /// What it has been told, as its "history".
         history: Vec<String>,
         model: String,
+        system: String,
     }
 
     impl Scripted {
         fn new(name: &'static str, log: &Log, script: Vec<Result<(String, Vec<ToolCall>)>>) -> Box<Self> {
-            Box::new(Self { name, script: script.into(), log: log.clone(), history: Vec::new(), model: name.into() })
+            Box::new(Self { name, script: script.into(), log: log.clone(), history: Vec::new(), model: name.into(), system: String::new() })
         }
 
         fn note(&mut self, entry: String) {
@@ -588,6 +699,9 @@ mod tests {
         }
         fn set_model(&mut self, model: &str) {
             self.model = model.into();
+        }
+        fn set_system(&mut self, system: &str) {
+            self.system = system.to_string();
         }
         fn push_user(&mut self, text: &str) {
             self.note(format!("{} user: {text}", self.name));
@@ -814,6 +928,42 @@ mod tests {
         let results = entries(&log, "local result");
         assert_eq!(results[0], "local result: ok");
         assert!(results[1].contains("ana may only use tools that look at the machine"), "{results:?}");
+    }
+
+    #[test]
+    fn remembers_each_person_and_keeps_private_notes_local() {
+        let log = Log::default();
+        let orion = orion();
+        let dir = tempfile::tempdir().unwrap();
+        let save = |id: &str, text: &str| ToolCall {
+            id: id.into(),
+            name: "memory_save".into(),
+            input: json!({ "text": text }),
+            invalid_input: None,
+        };
+        let calls = vec![save("a", "Prefers metric units"), save("b", "Has a medical appointment on Tuesdays")];
+        let local = Scripted::new("local", &log, vec![Ok(("Noted.".into(), calls)), say("done")]);
+        let claude = Scripted::new("claude", &log, vec![]);
+        let mut s = Session::with_backends(&orion, Mode::Local, Some(claude), Some(local));
+        s.set_memory_dir(Some(dir.path().into()));
+        s.set_person("ana");
+        s.turn("Ana (by voice): remember these", &mut Recorder::default()).unwrap();
+        assert_eq!(entries(&log, "local result"), ["local result: ok", "local result: ok"]);
+        let saved = Memory::load(dir.path(), "ana").unwrap();
+        assert_eq!(saved.notes.len(), 2);
+        assert!(saved.notes[1].private, "it mentions \"medical\"");
+
+        // Her next conversation starts with what was remembered; Claude
+        // never gets the private note.
+        s.clear();
+        let (for_claude, for_local) = (s.system_for(Provider::Claude), s.system_for(Provider::Local));
+        assert!(for_claude.contains("You are talking with Ana.") && for_claude.contains("[1] Prefers metric units"));
+        assert!(!for_claude.contains("medical"), "{for_claude}");
+        assert!(for_local.contains("[2] Has a medical appointment on Tuesdays"));
+        // Ben's are his own.
+        s.set_person("ben");
+        assert!(s.system_for(Provider::Local).contains("You are talking with Ben. You don't remember anything"));
+        assert!(!s.system_for(Provider::Local).contains("metric"));
     }
 
     #[test]

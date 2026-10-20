@@ -10,6 +10,7 @@
 
 mod agent;
 mod classifier;
+pub mod memory;
 pub mod listen;
 pub mod claude;
 pub(crate) mod http;
@@ -46,6 +47,9 @@ pub struct ChatConfig {
     pub show_reasoning: bool,
     /// Save conversations after every message so they can be resumed.
     pub save_conversations: bool,
+    /// Remember things about each person across conversations (memory_save
+    /// and memory_forget, and the notes in each conversation's prompt).
+    pub memory: bool,
     /// `tui` (full screen) or `plain` (line by line). Plain is also used
     /// whenever input or output is not a terminal.
     pub interface: Interface,
@@ -61,6 +65,7 @@ impl Default for ChatConfig {
             max_tool_rounds: 50,
             show_reasoning: true,
             save_conversations: true,
+            memory: true,
             interface: Interface::Tui,
             claude: Default::default(),
             local: Default::default(),
@@ -172,6 +177,9 @@ pub trait Backend: Send {
     fn list_models(&self) -> Result<Vec<String>> {
         anyhow::bail!("this backend cannot list models")
     }
+    /// Replace the system prompt (it carries what is remembered about the
+    /// person in the conversation).
+    fn set_system(&mut self, system: &str);
     fn push_user(&mut self, text: &str);
     /// Record an assistant turn this backend did not produce (one the other
     /// model handled), after the matching `push_user`.
@@ -236,7 +244,10 @@ pub fn offered_tools(orion: &Orion) -> Vec<ToolSpec> {
 pub fn connect(orion: &Orion, provider: Provider, model: Option<&str>) -> Result<Box<dyn Backend>> {
     let config = &orion.policy().chat;
     let system = system_prompt(orion.policy());
-    let tools = offered_tools(orion);
+    let mut tools = offered_tools(orion);
+    if config.memory {
+        tools.extend(memory::tool_specs());
+    }
     Ok(match provider {
         Provider::Claude => {
             let mut b = claude::ClaudeBackend::from_env(config.claude.clone(), system, &tools)?;
@@ -255,7 +266,7 @@ pub fn connect(orion: &Orion, provider: Provider, model: Option<&str>) -> Result
     })
 }
 
-fn system_prompt(policy: &Policy) -> String {
+pub(crate) fn system_prompt(policy: &Policy) -> String {
     let list = |items: Vec<String>| if items.is_empty() { "none".to_string() } else { items.join(", ") };
     let paths = |roots: &[std::path::PathBuf]| list(roots.iter().map(|r| r.display().to_string()).collect());
     let read = |p: &str| std::fs::read_to_string(p).map(|s| s.trim().to_string()).unwrap_or_default();
