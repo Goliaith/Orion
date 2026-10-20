@@ -152,12 +152,16 @@ write_roots = ["~/projects/website"]
 svc_control = "deny"        # look at services, never change them
 fs_write = "allow"          # still only inside [fs] write_roots
 proc_run = "allow"          # only the commands below
+update_apply = "allow"      # only what [packages] updates covers
 
 [proc]
 allowed_commands = ["git", "make", "cargo"]
+
+[packages]
+updates = "security"        # security fixes only
 ```
 
-Be careful with `allow` on the machine tools. `pkg_install` on `allow` installs only what `[packages] allowed` lists, but `update_apply` on `allow` runs any update the agent asks for, including `full: true`; `[packages] updates` only skips the prompt, it doesn't limit an allowed tool. For unattended security updates, use [a scheduled job](#scheduled-security-updates) instead.
+On `allow`, nobody is asked, so each tool's pre-approval setting becomes a hard limit: `proc_run` runs only `allowed_commands`, `pkg_install` installs only `[packages] allowed`, and `update_apply` runs only what `[packages] updates` covers (`"security"`: security-only updates; `"all"`: any update). Anything else is refused, and the agent is told why. An update with `full: true`, which may remove packages, always needs a person, so on `allow` it is refused too.
 
 **Strict sandbox.** Programs get no network and no GPU (the default), and nothing runs without bubblewrap or Landlock:
 
@@ -260,7 +264,7 @@ journalctl -u orion-updates                    # what was checked and installed,
 
 This needs the binary in `/usr/local/bin` ([installing for every user](install.md#1-build-and-install)). It runs as root, so it needs no sudo rule. The first step refreshes the package lists; the second installs only security fixes, never removes a package, and says which services to restart and whether to reboot. Orion never restarts or reboots on its own.
 
-`orion call` fails, and so does the service, when a call is refused or can't start. When the package manager itself fails partway, the result says `"ok": false` with the error, but the command still exits 0, so look at the journal. Arch has no security labels, so this does nothing there.
+`orion call` exits non-zero, so the service run shows as failed, when a call is refused, can't start, or the package manager fails partway. In that last case the result says `"ok": false` with the error, and the audit log records the failure. Arch has no security labels, so this does nothing there.
 
 ### Services
 
@@ -324,7 +328,7 @@ Every tool call, by any model, agent or person, is one JSON line in `~/.local/st
 | `decision` | `allow`, `ask` or `deny` |
 | `approved` | your answer to an `ask`, or `null` when nobody was asked |
 | `caller` | who asked: an MCP client and its pid (`"claude-code (pid 5312)"`), or a person by voice (`"ana (by voice)"`) |
-| `ok`, `error`, `duration_ms` | how it went |
+| `ok`, `error`, `duration_ms` | how it went: `ok` is false when the call was refused or failed, or when what the tool drove failed (a package manager partway), and `error` says why |
 | `ts_ms` | when, in milliseconds since 1970 |
 
 ```sh
@@ -431,7 +435,11 @@ orion audit -n 20      # what was called, and how it went
 
 **`tool X needs interactive approval, which is not available here`.** The tool is `ask` and nobody can be asked (`orion call` without a terminal, `orion serve`, a script). Run it from `orion chat`, or set it to `allow` under `[tools]`.
 
-**`"X" is not in packages.allowed`** (or a similar refusal with the tool set to `allow`). With a tool on `allow`, its pre-approval list is a hard limit. Add the package to `[packages] allowed`, or set the tool back to `ask`.
+**`"X" is not in packages.allowed`, or `packages.updates = "security" lets only security_only updates run without approval`.** With a tool on `allow`, its pre-approval setting is a hard limit. Widen the setting (`[packages] allowed`, `[packages] updates`), or set the tool back to `ask` to be asked instead.
+
+**`an update with full may remove packages, so a person must approve it`.** `update_apply` is on `allow`, where nobody is asked. Run that update from the chat with the tool on `ask`.
+
+**`orion call` printed a result, then `… failed: …`, and exited 1.** The tool ran, but what it drove failed partway, typically the package manager. The `error` in the result has its last lines; fix the cause (a broken package, a full disk, another package manager holding the lock) and run it again.
 
 **`sudo: a password is required (sudo needs a password here; see [admin] elevate …)`.** Orion uses `sudo -n` and never prompts for a password. Add the sudoers rule from [the install guide](install.md#6-root-access-for-the-machine-tools), set `[admin] elevate = "pkexec"` on a desktop, or do that task yourself.
 

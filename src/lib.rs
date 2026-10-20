@@ -28,6 +28,17 @@ pub use policy::{Decision, Policy};
 pub use tool::{Preapproval, Risk, Tool};
 
 /// Why a tool call did not produce a result.
+/// The failure a tool reports in its result, when it ran but what it
+/// drove did not succeed: `"ok": false` (a package manager that failed
+/// partway), with its `"error"`.
+pub fn reported_failure(value: &Value) -> Option<String> {
+    if value.get("ok") != Some(&Value::Bool(false)) {
+        return None;
+    }
+    let why = value.get("error").and_then(Value::as_str).unwrap_or("the tool reported a failure");
+    Some(why.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(why).trim().to_string())
+}
+
 #[derive(Debug)]
 pub enum CallError {
     Unknown(String),
@@ -101,8 +112,9 @@ impl Orion {
         let precheck = || tool.precheck(&self.policy, &args).map_err(|e| format!("{e:#}"));
         let verdict = match (decision, tool.preapproval(&self.policy, &args)) {
             (Decision::Deny, _) => Err(format!("tool {name} is denied by the Orion policy")),
-            (_, _) if let Err(e) = precheck() => Err(e),
+            // Refused before the checks, which can be slow (a dry run).
             (Decision::Allow, Preapproval::Refused(reason)) => Err(reason),
+            (_, _) if let Err(e) = precheck() => Err(e),
             (Decision::Allow, _) | (Decision::Ask, Preapproval::Granted) => Ok(()),
             (Decision::Ask, _) => match approver {
                 Some(approver) => {
@@ -125,7 +137,10 @@ impl Orion {
             decision,
             approved,
             args: &shown,
-            error: result.as_ref().err().map(ToString::to_string),
+            error: match &result {
+                Err(e) => Some(e.to_string()),
+                Ok(value) => reported_failure(value),
+            },
             duration: start.elapsed(),
         });
         result
@@ -168,6 +183,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn reported_failures() {
+        assert_eq!(reported_failure(&json!({ "ok": true })), None);
+        assert_eq!(reported_failure(&json!({ "files": [] })), None);
+        let failed = json!({ "ok": false, "error": "Reading package lists...\nE: Could not get lock\n\n" });
+        assert_eq!(reported_failure(&failed).as_deref(), Some("E: Could not get lock"));
+        assert_eq!(reported_failure(&json!({ "ok": false })).as_deref(), Some("the tool reported a failure"));
+    }
 
     struct Answer {
         yes: bool,

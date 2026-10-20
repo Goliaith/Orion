@@ -334,6 +334,12 @@ fn main() -> Result<()> {
             let approver = PromptApprover::new();
             let value = orion.call(&name, args, approver.as_ref().map(|a| a as &dyn Approver))?;
             println!("{}", serde_json::to_string_pretty(&value)?);
+            // It ran, but what it drove failed (a package manager partway):
+            // exit non-zero, so scripts and services see it.
+            if let Some(why) = orion::reported_failure(&value) {
+                eprintln!("{name} failed: {why}");
+                std::process::exit(1);
+            }
             Ok(())
         }
         Cmd::Audit { lines } => {

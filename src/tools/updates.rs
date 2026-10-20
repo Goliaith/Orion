@@ -974,13 +974,22 @@ impl Tool for UpdateApply {
             Ok(a) => a,
             Err(e) => return Preapproval::Refused(format!("{e:#}")),
         };
-        // packages.updates never pre-approves an update that may remove
-        // packages; the tool-level decision (ask, by default) stands.
+        // packages.updates is what may run without a person approving it.
+        // With update_apply on "ask", anything else is asked about; on
+        // "allow", where nobody is asked, anything else is refused.
+        let ask = "set [tools] update_apply = \"ask\" to be asked";
         match policy.packages.updates.as_str() {
-            "all" | "security" | "ask" if a.full => Preapproval::NotApplicable,
+            "all" | "security" | "ask" if a.full => {
+                Preapproval::Refused(format!("an update with full may remove packages, so a person must approve it ({ask})"))
+            }
             "all" => Preapproval::Granted,
             "security" if a.security_only => Preapproval::Granted,
-            "security" | "ask" => Preapproval::NotApplicable,
+            "security" => Preapproval::Refused(format!(
+                "packages.updates = \"security\" lets only security_only updates run without approval ({ask})"
+            )),
+            "ask" => Preapproval::Refused(format!(
+                "packages.updates = \"ask\": updates need approval (allow some with \"security\" or \"all\", or {ask})"
+            )),
             other => Preapproval::Refused(format!("packages.updates must be ask, security or all, not {other:?}")),
         }
     }
@@ -1029,6 +1038,7 @@ impl Tool for UpdateApply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Orion;
 
     #[test]
     fn parses_upgradable_lists() {
@@ -1204,6 +1214,18 @@ mod tests {
         assert!(granted(&p("all"), json!({ "packages": ["curl"] })));
         assert!(!granted(&p("all"), json!({ "full": true })));
         assert!(matches!(UpdateApply.preapproval(&p("sometimes"), &json!({})), Preapproval::Refused(_)));
+
+        // On "allow", nobody is asked: packages.updates is a hard limit.
+        let allowed = |mode: &str| {
+            Orion::new(Policy::from_toml(&format!("[tools]\nupdate_apply = \"allow\"\n[packages]\nupdates = \"{mode}\"\n[audit]\nenabled = false\n")).unwrap())
+        };
+        let refused = |o: &Orion, a: Value| match o.call("update_apply", a, None) {
+            Err(crate::CallError::Denied(why)) => why,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(refused(&allowed("security"), json!({ "packages": ["curl"] })).contains("only security_only"));
+        assert!(refused(&allowed("all"), json!({ "full": true })).contains("a person must approve"));
+        assert!(refused(&allowed("ask"), json!({})).contains("updates need approval"));
     }
 
     #[test]

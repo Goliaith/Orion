@@ -549,7 +549,8 @@ Beyond files and processes, the AI sees and manages the parts of the machine an 
   - processes that belong to a systemd service: restart that service (`svc_control`);
   - other processes: list them;
   - the kernel, `/run/reboot-required`, or PID 1: say the machine needs a reboot, and why.
-- **Pre-approving updates:** set `[packages] updates = "security"` (security fixes need no approval) or `"all"`. `packages.updates` never pre-approves an update with `full: true`.
+- **Pre-approving updates:** set `[packages] updates = "security"` (security fixes need no approval) or `"all"`. An update with `full: true` always needs a person. With `update_apply` on `allow`, where nobody is asked, this setting is a hard limit: anything outside it is refused.
+- **`orion call` exits 1** when the package manager fails partway, and the audit log records it as a failure, so scripts and timers notice. [Operating Orion](docs/operating.md#scheduled-security-updates) has a systemd timer for unattended security updates.
 
 ### Network
 

@@ -62,6 +62,7 @@ protected = ["sudo", "systemd", "systemd-*", "openssh-server", "openssh", "linux
              "libc6", "bash"]
 # update_apply runs that need no approval: "ask" (none), "security" (security-only
 # updates) or "all". Never an update with full = true, which may remove packages.
+# With update_apply = "allow", where nobody is asked, anything else is refused.
 updates = "ask"
 timeout_secs = 900
 
