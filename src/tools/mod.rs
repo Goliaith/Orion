@@ -1,9 +1,11 @@
 //! Built-in tools. Each module groups one area of the machine.
 
+mod disks;
 mod exec;
 mod fs;
 pub mod gpu;
 mod models;
+mod netconf;
 mod network;
 mod packages;
 mod process;
@@ -23,6 +25,17 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(system::SystemInfo),
         Box::new(gpu::GpuInfo),
         Box::new(network::NetInfo),
+        Box::new(netconf::NetConnections),
+        Box::new(netconf::WifiScan),
+        Box::new(netconf::WifiConnect),
+        Box::new(netconf::NetConnection),
+        Box::new(netconf::FwStatus),
+        Box::new(netconf::FwRule),
+        Box::new(netconf::FwEnable),
+        Box::new(disks::DiskList),
+        Box::new(disks::DiskUsage),
+        Box::new(disks::DiskMount),
+        Box::new(disks::DiskUnmount),
         Box::new(fs::FsList),
         Box::new(fs::FsRead),
         Box::new(fs::FsWrite),

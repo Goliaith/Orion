@@ -31,6 +31,17 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `system_info`  | read    | allow   | Hostname, OS, kernel, CPU, memory, load, uptime |
 | `gpu_info`     | read    | allow   | Every GPU (NVIDIA, AMD, Intel) by name: memory, load, temperature, power, compute stacks, and what runs on each, down to the model |
 | `net_info`     | read    | allow   | Interfaces and addresses, default routes, DNS, and listening ports with the process behind each |
+| `net_connections` | read | allow  | NetworkManager's devices and saved connections, marking those that carry an SSH session |
+| `wifi_scan`    | read    | allow   | Wi-Fi networks in range, strongest first |
+| `wifi_connect` | write   | ask     | Join a Wi-Fi network (the password never reaches logs or command lines) |
+| `net_connection` | write | ask     | Bring a saved connection up or down, forget it, toggle auto-connect |
+| `fw_status`    | read    | allow   | The firewall (ufw or firewalld): on or off, defaults, rules |
+| `fw_rule`      | write   | ask     | Allow or deny a port, optionally from one network; never blocks SSH |
+| `fw_enable`    | write   | ask     | Turn the firewall on or off; on only with SSH allowed |
+| `disk_list`    | read    | allow   | Disks and partitions: model, size, filesystem, mounts, how full |
+| `disk_usage`   | read    | allow   | What is using the space under a folder, biggest first |
+| `disk_mount`   | write   | ask     | Mount a filesystem under /mnt or /media, with `nosuid,nodev` |
+| `disk_unmount` | write   | ask     | Unmount (and eject) a filesystem; never the system's own |
 | `fs_list`      | read    | allow   | Directory listing inside the readable roots |
 | `fs_read`      | read    | allow   | Read a file, or a byte range of one, inside the readable roots |
 | `fs_write`     | write   | ask     | Write or append to a file inside the writable roots |
@@ -548,6 +559,37 @@ Beyond files and processes, the AI sees and manages the parts of the machine an 
 - The machine panel in the full-screen chat and the shell lists the loaded models with their VRAM, and any failed services.
 - Without memory readings (an Intel GPU, or no `nvidia-smi`), loads aren't budgeted and `model_status` says so.
 
+### Network changes
+
+Orion changes the network through NetworkManager (`nmcli`), and the firewall through ufw or firewalld, whichever is installed.
+
+- **Wi-Fi:** `wifi_scan` lists networks in range (one entry per name: the access point in use, or else the strongest). `wifi_connect` joins a saved network by name, an open one, or a new one with its password, which is saved for next time.
+- **The password stays out of sight:**
+  - The audit log, approval prompts and tool displays show `••••••`, and the result doesn't contain it.
+  - It reaches `nmcli` through a file only the owner can read, deleted right after, never on a command line other processes could see.
+  - "password" is one of the router's private words, so a message containing it goes to the local model.
+- **Connections:** `net_connections` lists devices and saved connections, and `net_connection` brings one up or down, forgets it, or turns auto-connect on or off. As a normal user, NetworkManager's own permissions (polkit) usually allow this; otherwise Orion uses `[admin] elevate`.
+- **Firewall:** `fw_status`, `fw_rule` (allow or deny a port or range, TCP or UDP, optionally only from an address or network) and `fw_enable`.
+  - Rules Orion adds to ufw carry the comment "added by Orion".
+  - While ufw is off, `fw_status` lists the rules that will apply once it's on.
+- **Remote access can't be cut off by mistake.** Before anyone is asked, Orion refuses to:
+  - take down or forget a connection an SSH session into this machine runs over (it reads established connections to sshd's ports and the interface they arrive on);
+  - switch Wi-Fi networks when the Wi-Fi carries such a session;
+  - deny the SSH port, or remove the rule that allows it;
+  - turn the firewall on unless SSH is allowed from anywhere.
+
+### Disks and mounts
+
+- **`disk_list`:** every disk and partition with its model, size, how it's attached (NVMe, SATA, USB), filesystem and label, where it is mounted, and how full it is. "Free" means what can still be written, after quotas and reserved space. Removable drives and the disks the system runs from are marked. Where udev hasn't identified a filesystem (containers, a just-attached drive), Orion asks `blkid`.
+- **`disk_usage`:** what is filling a folder: its biggest entries, staying on that filesystem, within the readable roots.
+- **`disk_mount`** mounts a drive by path, `LABEL=` or `UUID=`.
+  - **Where:** udisks puts it where a desktop would; otherwise `mount` puts it under `/mnt`, `/media` or a writable root (`[disks] mount_roots`), only into an empty folder.
+  - **Options:** always `nosuid,nodev`. FAT, exFAT and NTFS drives are mounted as the user, so they can write.
+  - **Refused:** encrypted volumes (unlock first), swap, RAID or LVM members, drives already mounted, and anything on the system's own disk.
+- **`disk_unmount`** unmounts by mount point or device. `eject: true` then powers the drive off, so it's safe to unplug. If the drive is busy, it names the programs using it.
+- **The system's own mounts are protected:** `/`, `/boot`, `/usr`, `/var`, `/home`, `/etc`, `/opt`, `/tmp`, `/run`, snaps and the like (`[disks] protected`). No approval can unmount them.
+- **Not offered, deliberately:** formatting, partitioning, and editing `/etc/fstab`.
+
 ## System service
 
 `orion daemon` runs Orion as a long-lived service, so every agent on the machine shares one policy, one audit log and one sandbox:
@@ -631,7 +673,8 @@ src/
   sandbox.rs    sandboxing for proc_run: bubblewrap, Landlock, resource limits
   tools/        built-in tools: system, fs, process, network, services
                 (systemd), packages, models (inference servers, VRAM budget), gpu
-                (recognition, per-process use, placement, gpu_assign);
+                (recognition, per-process use, placement, gpu_assign), netconf
+                (Wi-Fi, connections, firewall), disks (disks, usage, mounts);
                 exec.rs runs programs for them
   chat/
     mod.rs      config, the Backend and Ui traits
@@ -670,5 +713,5 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
-4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~ are done too. Next: network changes (Wi-Fi, firewall), disks and mounts, and updates.
+4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too. Next: system updates.
 5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

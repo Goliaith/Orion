@@ -118,12 +118,13 @@ impl Orion {
             Ok(()) => tool.call(&self.policy, args.clone()).map_err(CallError::Failed),
             Err(reason) => Err(CallError::Denied(reason)),
         };
+        let shown = tool.redact(&args);
         self.audit.record(audit::Entry {
             tool: name,
             caller,
             decision,
             approved,
-            args: &args,
+            args: &shown,
             error: result.as_ref().err().map(ToString::to_string),
             duration: start.elapsed(),
         });

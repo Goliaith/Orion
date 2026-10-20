@@ -250,6 +250,62 @@ pub fn listening() -> Vec<Listener> {
     out
 }
 
+/// SSH sessions into this machine: (interface, remote address). Changing
+/// that interface's connection, or the firewall for SSH, would cut them off.
+pub fn ssh_sessions() -> Vec<(String, String)> {
+    let ports = ssh_ports();
+    let addrs = addresses();
+    let iface_of = |ip: &IpAddr| {
+        addrs
+            .iter()
+            .find(|(_, list)| list.iter().any(|a| a.split('/').next() == Some(ip.to_string().as_str())))
+            .map(|(name, _)| name.clone())
+    };
+    let mut out = Vec::new();
+    for file in ["tcp", "tcp6"] {
+        let text = read(format!("/proc/net/{file}")).unwrap_or_default();
+        for (local, remote) in established(&text, &ports) {
+            if let Some(iface) = iface_of(&local).filter(|i| i != "lo") {
+                out.push((iface, remote));
+            }
+        }
+    }
+    out
+}
+
+/// The ports sshd listens on (22 if it can't be seen).
+pub fn ssh_ports() -> Vec<u16> {
+    let mut ports: Vec<u16> = listening().iter().filter(|l| l.proto == "tcp" && l.process.as_deref() == Some("sshd")).map(|l| l.port).collect();
+    if ports.is_empty() {
+        ports.push(22);
+    }
+    ports.sort();
+    ports.dedup();
+    ports
+}
+
+/// Established TCP connections to one of `ports`: (local address, remote).
+pub fn established(proc_net: &str, ports: &[u16]) -> Vec<(IpAddr, String)> {
+    proc_net
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 4 || f[3] != "01" {
+                return None;
+            }
+            let (la, lp) = f[1].split_once(':')?;
+            let (ra, rp) = f[2].split_once(':')?;
+            let port = u16::from_str_radix(lp, 16).ok()?;
+            if !ports.contains(&port) {
+                return None;
+            }
+            let remote = format!("{}:{}", proc_addr(ra)?, u16::from_str_radix(rp, 16).ok()?);
+            Some((proc_addr(la)?, remote))
+        })
+        .collect()
+}
+
 /// Socket inode → (pid, process name).
 fn socket_owners() -> HashMap<u64, (u32, String)> {
     let mut out = HashMap::new();
@@ -273,6 +329,14 @@ fn socket_owners() -> HashMap<u64, (u32, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_ssh_sessions() {
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue\n   0: 0F02000A:0016 1402A8C0:D431 01 00000000:00000000\n   1: 00000000:0016 00000000:0000 0A 00000000:00000000\n   2: 0F02000A:1F90 1402A8C0:D432 01 00000000:00000000\n";
+        let s = established(tcp, &[22]);
+        assert_eq!(s, [("10.0.2.15".parse::<IpAddr>().unwrap(), "192.168.2.20:54321".to_string())]);
+        assert!(established(tcp, &[2222]).is_empty());
+    }
 
     #[test]
     fn decodes_proc_addresses() {

@@ -121,7 +121,7 @@ impl Terminal {
         self.line_break();
         let s = &self.style;
         println!("  {} Approve {}?", s.yellow("?"), s.bold(tool.name()));
-        for line in preview(args).lines() {
+        for line in preview(&tool.redact(args)).lines() {
             println!("    {}", s.dim(line));
         }
         loop {

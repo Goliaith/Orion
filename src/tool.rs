@@ -46,6 +46,13 @@ pub trait Tool: Send + Sync {
         Preapproval::NotApplicable
     }
 
+    /// The arguments as they may be shown and logged: secrets (a Wi-Fi
+    /// password) blanked out. Used for the audit log, approval prompts and
+    /// tool-call displays.
+    fn redact(&self, args: &Value) -> Value {
+        args.clone()
+    }
+
     /// Hard checks that no approval can override (such as path scopes). They
     /// run before the user is asked, so nobody approves a call that would fail.
     fn precheck(&self, _policy: &Policy, _args: &Value) -> Result<()> {

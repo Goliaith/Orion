@@ -68,6 +68,14 @@ discover = true                 # also look on the usual ports: 11434, 8080, 800
 vram_reserve_mb = 1024          # kept free on each GPU; models load only within the rest
 keep_alive = "30m"              # how long a loaded model stays after its last use
 
+# Mounting and unmounting (disk_mount, disk_unmount).
+[disks]
+# Mounts no approval can unmount; a disk holding one is never mounted again.
+protected = ["/", "/boot", "/boot/*", "/efi", "/usr", "/usr/*", "/var", "/var/*", "/home", "/home/*", "/etc",
+             "/opt", "/opt/*", "/srv", "/srv/*", "/root", "/tmp", "/proc", "/proc/*", "/sys", "/sys/*", "/dev",
+             "/dev/*", "/run", "/run/user/*", "/run/lock", "/nix", "/nix/*", "/snap/*"]
+mount_roots = ["/mnt", "/media", "/run/media"]   # where new mounts may go (and the writable roots)
+
 [audit]
 enabled = true
 # path = "~/.local/state/orion/audit.jsonl"

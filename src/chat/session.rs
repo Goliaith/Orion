@@ -575,7 +575,8 @@ impl<'a> Session<'a> {
                     } else {
                         run_tool(orion, router, provider, call, memory.as_mut(), ui)
                     };
-                    record.tools.push(summarize(call, &content, is_error));
+                    let input = orion.tools().find(|(t, _)| t.name() == call.name).map_or_else(|| call.input.clone(), |(t, _)| t.redact(&call.input));
+                    record.tools.push(summarize(&call.name, &input, &content, is_error));
                     ToolResult { id: call.id.clone(), content, is_error }
                 })
                 .collect();
@@ -595,7 +596,8 @@ fn run_tool(
     memory: Option<&mut Memory>,
     ui: &mut dyn Ui,
 ) -> (String, bool) {
-    ui.tool_start(&call.name, &call.input);
+    let shown = orion.tools().find(|(t, _)| t.name() == call.name).map_or_else(|| call.input.clone(), |(t, _)| t.redact(&call.input));
+    ui.tool_start(&call.name, &shown);
     let start = Instant::now();
     if memory::is_memory_tool(&call.name) {
         // Orion's own memory of the person, not the machine: no policy, but
@@ -615,7 +617,7 @@ fn run_tool(
     let caller = ui.caller();
     let refused = risk.and_then(|r| ui.refuses(&call.name, r));
     let result = match (router.private_path_in(&call.input), refused) {
-        (_, Some(reason)) => Err(orion.refuse(&call.name, &call.input, &reason, caller.as_deref()).to_string()),
+        (_, Some(reason)) => Err(orion.refuse(&call.name, &shown, &reason, caller.as_deref()).to_string()),
         // Private files never reach Claude, whatever the policy allows.
         (Some(path), None) if provider == Provider::Claude => {
             Err(format!("{path} is private: only the local model may access it (chat.router.private_paths)"))
@@ -639,7 +641,7 @@ pub fn owner_name() -> String {
 
 /// One line per tool call for the other model: what ran and a taste of
 /// what came back.
-fn summarize(call: &ToolCall, content: &str, is_error: bool) -> String {
+fn summarize(name: &str, input: &serde_json::Value, content: &str, is_error: bool) -> String {
     let squash = |s: &str, max: usize| {
         let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
         if flat.len() <= max {
@@ -652,7 +654,7 @@ fn summarize(call: &ToolCall, content: &str, is_error: bool) -> String {
         format!("{}…", &flat[..end])
     };
     let outcome = if is_error { "error" } else { "ok" };
-    format!("{} {} → {outcome}: {}", call.name, squash(&call.input.to_string(), 200), squash(content, 300))
+    format!("{name} {} → {outcome}: {}", squash(&input.to_string(), 200), squash(content, 300))
 }
 
 #[cfg(test)]

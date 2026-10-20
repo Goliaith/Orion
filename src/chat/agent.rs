@@ -155,7 +155,7 @@ impl Ui for ChannelUi<'_> {
             return true;
         }
         let (reply, rx) = std::sync::mpsc::channel();
-        self.send(FromAgent::Approve { tool: tool.name().to_string(), preview: preview(args), reply });
+        self.send(FromAgent::Approve { tool: tool.name().to_string(), preview: preview(&tool.redact(args)), reply });
         let answer = Self::wait(rx, Answer::No);
         self.answered_at = Some(Instant::now());
         if answer == Answer::Always {

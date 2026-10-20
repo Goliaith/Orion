@@ -149,6 +149,31 @@ impl Default for PackagesPolicy {
     }
 }
 
+/// `[disks]`: mounting and unmounting.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DisksPolicy {
+    /// Mount points no approval can unmount (`*` wildcards); a disk holding
+    /// one is never mounted a second time.
+    pub protected: Vec<String>,
+    /// Where new mounts may go (besides the writable roots).
+    pub mount_roots: Vec<PathBuf>,
+}
+
+impl Default for DisksPolicy {
+    fn default() -> Self {
+        let protected = [
+            "/", "/boot", "/boot/*", "/efi", "/usr", "/usr/*", "/var", "/var/*", "/home", "/home/*", "/etc", "/opt", "/opt/*", "/srv", "/srv/*",
+            "/root", "/tmp", "/proc", "/proc/*", "/sys", "/sys/*", "/dev", "/dev/*", "/run", "/run/user/*", "/run/lock",
+            "/nix", "/nix/*", "/snap/*",
+        ];
+        Self {
+            protected: protected.map(String::from).to_vec(),
+            mount_roots: ["/mnt", "/media", "/run/media"].map(PathBuf::from).to_vec(),
+        }
+    }
+}
+
 /// `[models]`: local inference servers and the VRAM they share.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -201,6 +226,7 @@ pub struct Policy {
     pub services: ServicesPolicy,
     pub packages: PackagesPolicy,
     pub models: ModelsPolicy,
+    pub disks: DisksPolicy,
     pub audit: AuditPolicy,
     /// Settings for the `orion chat` front-end.
     pub chat: crate::chat::ChatConfig,
