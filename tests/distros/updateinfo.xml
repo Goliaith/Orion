@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<updates>
+  <update from="orion@example.org" status="stable" type="security" version="1">
+    <id>ORION-2026-1</id>
+    <title>orion-sec security update</title>
+    <severity>Important</severity>
+    <issued date="2026-10-01 00:00:00"/>
+    <description>Fixes a test vulnerability.</description>
+    <pkglist>
+      <collection short="orion">
+        <name>Orion</name>
+        <package name="orion-sec" version="1.1" release="1" epoch="0" arch="noarch">
+          <filename>orion-sec-1.1-1.noarch.rpm</filename>
+        </package>
+      </collection>
+    </pkglist>
+  </update>
+</updates>

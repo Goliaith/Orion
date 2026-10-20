@@ -1,4 +1,4 @@
-//! The system package manager (apt, dnf or pacman): what is installed, what
+//! The system package manager (apt, dnf, zypper or pacman): what is installed, what
 //! is available, and installing or removing packages within `[packages]`.
 //!
 //! Installs run outside the sandbox, as root (see `[admin] elevate`): a
@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::exec::{self, glob_match};
+use super::updates::{command, dry_run, Action, Plan};
 use crate::policy::Policy;
 use crate::tool::{parse_args, Preapproval, Risk, Tool};
 
@@ -20,6 +21,7 @@ use crate::tool::{parse_args, Preapproval, Risk, Tool};
 pub(super) enum Manager {
     Apt,
     Dnf,
+    Zypper,
     Pacman,
 }
 
@@ -28,6 +30,7 @@ impl Manager {
         match self {
             Manager::Apt => "apt",
             Manager::Dnf => "dnf",
+            Manager::Zypper => "zypper",
             Manager::Pacman => "pacman",
         }
     }
@@ -37,12 +40,14 @@ pub(super) fn manager(policy: &Policy) -> Result<Manager> {
     Ok(match policy.packages.manager.as_str() {
         "apt" => Manager::Apt,
         "dnf" => Manager::Dnf,
+        "zypper" => Manager::Zypper,
         "pacman" => Manager::Pacman,
         "auto" if exec::installed("apt-get") && exec::installed("dpkg-query") => Manager::Apt,
         "auto" if exec::installed("dnf") && exec::installed("rpm") => Manager::Dnf,
+        "auto" if exec::installed("zypper") && exec::installed("rpm") => Manager::Zypper,
         "auto" if exec::installed("pacman") => Manager::Pacman,
-        "auto" => bail!("no supported package manager (apt, dnf or pacman) is installed"),
-        other => bail!("packages.manager must be auto, apt, dnf or pacman, not {other:?}"),
+        "auto" => bail!("no supported package manager (apt, dnf, zypper or pacman) is installed"),
+        other => bail!("packages.manager must be auto, apt, dnf, zypper or pacman, not {other:?}"),
     })
 }
 
@@ -70,7 +75,7 @@ fn installed(m: Manager) -> Result<Vec<Installed>> {
             "dpkg-query",
             &["-W", "-f", "${db:Status-Abbrev}\t${Package}\t${Version}\t${Installed-Size}\t${binary:Summary}\n"],
         )?,
-        Manager::Dnf => {
+        Manager::Dnf | Manager::Zypper => {
             exec::output("rpm", &["-qa", "--qf", "ii\t%{NAME}\t%{VERSION}-%{RELEASE}\t%{SIZE}\t%{SUMMARY}\n"])?
         }
         Manager::Pacman => exec::output("pacman", &["-Q"])?
@@ -87,13 +92,14 @@ fn installed(m: Manager) -> Result<Vec<Installed>> {
             if f.len() < 5 || !f[0].starts_with("ii") {
                 return None;
             }
-            let size = f[3].parse::<u64>().ok().map(|n| if m == Manager::Dnf { n / 1024 } else { n });
+            let rpm = matches!(m, Manager::Dnf | Manager::Zypper);
+            let size = f[3].parse::<u64>().ok().map(|n| if rpm { n / 1024 } else { n });
             Some(Installed { name: f[1].into(), version: f[2].into(), size_kib: size, summary: f[4].into() })
         })
         .collect())
 }
 
-/// `apt-cache search`, `dnf search` or `pacman -Ss`: (name, summary).
+/// `apt-cache search`, `dnf search`, `zypper --xmlout search` or `pacman -Ss`: (name, summary).
 fn parse_search(m: Manager, text: &str) -> Vec<(String, String)> {
     match m {
         Manager::Apt => text
@@ -101,16 +107,22 @@ fn parse_search(m: Manager, text: &str) -> Vec<(String, String)> {
             .filter_map(|l| l.split_once(" - "))
             .map(|(n, s)| (n.trim().to_string(), s.trim().to_string()))
             .collect(),
+        // dnf4: "jq.x86_64 : summary" under "=== … ===" headers;
+        // dnf5: " jq.x86_64\tsummary" under "Matched fields: …".
         Manager::Dnf => text
             .lines()
-            .filter(|l| !l.starts_with('=') && !l.starts_with(' '))
-            .filter_map(|l| l.split_once(" : "))
+            .filter(|l| !l.starts_with('='))
+            .filter_map(|l| if l.starts_with(' ') { l.split_once('\t') } else { l.split_once(" : ") })
             .map(|(n, s)| {
                 // name.arch
                 let n = n.trim();
                 let n = n.rsplit_once('.').map_or(n, |(name, _)| name);
                 (n.to_string(), s.trim().to_string())
             })
+            .collect(),
+        Manager::Zypper => xml_elements(text, "solvable")
+            .filter(|a| a.get("kind").is_none_or(|k| k == "package"))
+            .filter_map(|mut a| Some((a.remove("name")?, a.remove("summary").unwrap_or_default())))
             .collect(),
         Manager::Pacman => {
             let mut out = Vec::new();
@@ -128,9 +140,32 @@ fn parse_search(m: Manager, text: &str) -> Vec<(String, String)> {
     }
 }
 
+/// The attributes of each `<tag …>` in zypper's XML output, unescaped.
+/// Enough for zypper's flat, attribute-only records; not a general parser.
+pub(super) fn xml_elements(text: &str, tag: &str) -> impl Iterator<Item = BTreeMap<String, String>> {
+    let open = format!("<{tag} ");
+    let found: Vec<_> = text.match_indices(&open).filter_map(|(i, _)| {
+        let rest = &text[i + open.len()..];
+        let end = rest.find('>')?;
+        let mut attrs = BTreeMap::new();
+        let mut body = rest[..end].trim_end_matches('/');
+        while let Some((key, after)) = body.split_once("=\"") {
+            let (value, next) = after.split_once('"')?;
+            attrs.insert(key.trim().to_string(), xml_unescape(value));
+            body = next;
+        }
+        Some(attrs)
+    }).collect();
+    found.into_iter()
+}
+
+pub(super) fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
 /// `Key: value` lines (apt-cache show, dnf info, pacman -Si), with
 /// continuation lines folded in.
-fn parse_fields(text: &str) -> BTreeMap<String, String> {
+pub(super) fn parse_fields(text: &str) -> BTreeMap<String, String> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     let mut last: Option<String> = None;
     for line in text.lines() {
@@ -138,7 +173,9 @@ fn parse_fields(text: &str) -> BTreeMap<String, String> {
             if let Some(v) = last.as_ref().and_then(|k| out.get_mut(k)) {
                 let t = line.trim().trim_start_matches(": ").trim();
                 if !t.is_empty() && t != "." {
-                    v.push(' ');
+                    if !v.is_empty() {
+                        v.push(' ');
+                    }
                     v.push_str(t);
                 }
             }
@@ -146,56 +183,13 @@ fn parse_fields(text: &str) -> BTreeMap<String, String> {
         }
         if let Some((k, v)) = line.split_once(':') {
             let k = k.trim().to_string();
-            if !k.is_empty() && !k.contains(' ') || matches!(k.as_str(), "Install Date" | "Installed Size" | "Depends On") {
+            if !k.is_empty() && !k.contains(' ') || matches!(k.as_str(), "Install Date" | "Installed Size" | "Installed size" | "Depends On") {
                 out.entry(k.clone()).or_insert_with(|| v.trim().to_string());
                 last = Some(k);
             }
         }
     }
     out
-}
-
-/// What `apt-get -s` would do: (package, version) per action.
-#[derive(Default, Debug)]
-struct Plan {
-    install: Vec<(String, String)>,
-    remove: Vec<(String, String)>,
-}
-
-fn parse_apt_simulation(text: &str) -> Plan {
-    let mut plan = Plan::default();
-    for line in text.lines() {
-        let (list, rest) = match line.split_once(' ') {
-            Some(("Inst", rest)) => (&mut plan.install, rest),
-            Some(("Remv", rest)) => (&mut plan.remove, rest),
-            _ => continue,
-        };
-        let mut f = rest.split_whitespace();
-        let name = f.next().unwrap_or_default().to_string();
-        // "Inst sl (5.02-1 …)", "Inst x [old] (new …)", "Remv curl [8.5.0]"
-        let version = f
-            .find(|w| w.starts_with('('))
-            .or_else(|| rest.split_whitespace().nth(1))
-            .unwrap_or_default()
-            .trim_matches(['(', ')', '[', ']'])
-            .to_string();
-        list.push((name, version));
-    }
-    plan
-}
-
-fn simulate(packages: &[String], remove: bool) -> Result<Plan> {
-    let mut args = vec!["-s", if remove { "remove" } else { "install" }, "--"];
-    args.extend(packages.iter().map(String::as_str));
-    match exec::output("apt-get", &args) {
-        Ok(text) => Ok(parse_apt_simulation(&text)),
-        Err(e) => {
-            // "apt-get: … E: Unable to locate package foo"
-            let msg = format!("{e:#}");
-            let reason = msg.lines().filter(|l| l.contains("E: ")).map(|l| l.trim_start_matches("apt-get: ")).collect::<Vec<_>>();
-            bail!("{}", if reason.is_empty() { msg } else { reason.join("; ") })
-        }
-    }
 }
 
 pub(super) fn essential(name: &str) -> bool {
@@ -309,6 +303,8 @@ impl Tool for PkgSearch {
         let text = match m {
             Manager::Apt => exec::output("apt-cache", &["search", "--", q])?,
             Manager::Dnf => exec::output("dnf", &["-q", "search", "--", q])?,
+            // Exits 104 when nothing matches.
+            Manager::Zypper => exec::output("zypper", &["-n", "--xmlout", "search", "--", q]).unwrap_or_default(),
             Manager::Pacman => exec::output("pacman", &["-Ss", "--", q]).unwrap_or_default(),
         };
         let mut hits = parse_search(m, &text);
@@ -378,8 +374,17 @@ impl Tool for PkgInfo {
                 (parse_fields(&show), candidate)
             }
             Manager::Dnf => {
-                let f = parse_fields(&exec::output("dnf", &["-q", "info", "--", name])?);
+                // The newest available version comes after the installed one, if any.
+                let text = exec::output("dnf", &["-q", "info", "--", name])?;
+                let f = parse_fields(text.split("Available").nth(1).unwrap_or(&text));
                 let v = f.get("Version").map(|v| format!("{v}-{}", f.get("Release").cloned().unwrap_or_default()));
+                (f, v)
+            }
+            Manager::Zypper => {
+                let text = exec::output("zypper", &["-n", "-q", "info", "--", name])?;
+                ensure!(!text.contains("not found"), "there is no package {name}");
+                let f = parse_fields(&text);
+                let v = f.get("Version").cloned();
                 (f, v)
             }
             Manager::Pacman => {
@@ -397,7 +402,7 @@ impl Tool for PkgInfo {
             "available": candidate,
             "update": installed_version.is_some() && candidate.is_some() && installed_version != candidate,
             "summary": field(&["Description", "Summary"]),
-            "size": f.get("Installed-Size").map(|kib| format!("{kib} KiB")).or_else(|| field(&["Installed Size", "Size"])),
+            "size": f.get("Installed-Size").map(|kib| format!("{kib} KiB")).or_else(|| field(&["Installed Size", "Installed size", "Size"])),
             "depends": field(&["Depends", "Depends On"]),
             "homepage": field(&["Homepage", "URL"]),
             "section": field(&["Section", "Repository", "Repo"]),
@@ -423,8 +428,9 @@ fn change_schema(verb: &str) -> Value {
     })
 }
 
-/// Validate the names, and for apt, work out exactly what would change.
-fn check_change(policy: &Policy, args: &Value, remove: bool) -> Result<(Manager, Vec<String>, Option<Plan>)> {
+/// Validate the names and work out exactly what would change, from the
+/// package manager's own dry run.
+fn check_change(policy: &Policy, args: &Value, remove: bool) -> Result<(Manager, Vec<String>, Plan)> {
     let a: ChangeArgs = parse_args(args.clone())?;
     ensure!(!a.packages.is_empty() && a.packages.len() <= 50, "name 1 to 50 packages");
     for p in &a.packages {
@@ -444,46 +450,39 @@ fn check_change(policy: &Policy, args: &Value, remove: bool) -> Result<(Manager,
     if remove {
         a.packages.iter().try_for_each(|p| guard(p))?;
     }
-    let plan = if m == Manager::Apt { Some(simulate(&a.packages, remove)?) } else { None };
-    if remove {
-        // Removing a package also removes what depends on it.
-        for (name, _) in plan.iter().flat_map(|p| &p.remove) {
-            guard(name).map_err(|e| anyhow::anyhow!("removing these would also remove {name}: {e:#}"))?;
-        }
+    let plan = dry_run(policy, m, if remove { Action::Remove } else { Action::Install }, &a.packages)?;
+    // Removing a package also removes what depends on it, and installing
+    // one can replace another.
+    for (name, _) in &plan.remove {
+        guard(name).map_err(|e| anyhow::anyhow!("this would also remove {name}: {e:#}"))?;
     }
     Ok((m, a.packages, plan))
 }
 
 fn change(policy: &Policy, args: Value, remove: bool) -> Result<Value> {
     let (m, packages, plan) = check_change(policy, &args, remove)?;
-    let mut argv: Vec<String> = match (m, remove) {
-        (Manager::Apt, r) => {
-            vec!["DEBIAN_FRONTEND=noninteractive".into(), "apt-get".into(), if r { "remove" } else { "install" }.into()]
-                .into_iter()
-                .chain(["-y", "-q", "-o", "Dpkg::Options::=--force-confold"].map(String::from))
-                .collect()
-        }
-        (Manager::Dnf, r) => vec!["dnf".into(), if r { "remove" } else { "install" }.into(), "-y".into(), "-q".into()],
-        (Manager::Pacman, false) => ["pacman", "-S", "--noconfirm", "--needed"].map(String::from).to_vec(),
-        (Manager::Pacman, true) => ["pacman", "-R", "--noconfirm"].map(String::from).to_vec(),
-    };
-    argv.push("--".into());
-    argv.extend(packages.iter().cloned());
+    let argv = command(m, if remove { Action::Remove } else { Action::Install }, &packages, false);
     let (done, elevated) = run_as_root(policy, m, argv)?;
-    let changed = plan.map(|p| {
-        let list = if remove { p.remove } else { p.install };
-        list.into_iter().map(|(name, version)| json!({ "name": name, "version": version })).collect::<Vec<_>>()
-    });
+    let pairs = |list: Vec<(String, String)>| list.into_iter().map(|(name, version)| json!({ "name": name, "version": version })).collect::<Vec<_>>();
     let mut out = json!({
         "ok": done.success(),
         "manager": m.name(),
         "requested": packages,
-        if remove { "removed" } else { "installed" }: if done.success() { changed } else { None },
         "elevated": elevated,
         "duration_secs": done.duration.as_secs(),
         "output": tail(&done.stdout),
     });
-    if !done.success() {
+    if done.success() {
+        // Upgraded dependencies count as installed.
+        let mut installed = plan.install;
+        installed.extend(plan.upgrade.into_iter().map(|u| (u.name, u.to)));
+        if !installed.is_empty() || !remove {
+            out["installed"] = json!(pairs(installed));
+        }
+        if !plan.remove.is_empty() || remove {
+            out["removed"] = json!(pairs(plan.remove));
+        }
+    } else {
         out["error"] = json!(complaint(&done));
     }
     Ok(out)
@@ -603,13 +602,6 @@ mod tests {
 
     #[test]
     fn parses_manager_output() {
-        let plan = parse_apt_simulation(
-            "Inst sl (5.02-1 Ubuntu:24.04/noble [amd64])\nInst libjq1 [1.6] (1.7.1-3 Ubuntu [amd64])\n\
-             Conf sl (5.02-1 Ubuntu:24.04/noble [amd64])\nRemv curl [8.5.0-2ubuntu10.15]\n",
-        );
-        assert_eq!(plan.install, [("sl".into(), "5.02-1".into()), ("libjq1".into(), "1.7.1-3".into())]);
-        assert_eq!(plan.remove, [("curl".into(), "8.5.0-2ubuntu10.15".into())]);
-
         let apt = parse_search(Manager::Apt, "jq - lightweight JSON processor\njc - JSON CLI output\n");
         assert_eq!(apt[0], ("jq".into(), "lightweight JSON processor".into()));
         let dnf = parse_search(
@@ -617,12 +609,19 @@ mod tests {
             "======= Name Exactly Matched: jq =======\njq.x86_64 : Command-line JSON processor\n",
         );
         assert_eq!(dnf, [("jq".into(), "Command-line JSON processor".into())]);
+        let dnf5 = parse_search(Manager::Dnf, "Matched fields: name, summary\n jq.x86_64\tCommand-line JSON processor\n");
+        assert_eq!(dnf5, dnf);
         let pac = parse_search(
             Manager::Pacman,
             "extra/jq 1.7.1-2 [installed]\n    Command-line JSON processor\ncore/jx 1-1\n    x\n",
         );
         assert_eq!(pac[0], ("jq".into(), "Command-line JSON processor".into()));
         assert_eq!(pac[1].0, "jx");
+        let zyp = parse_search(
+            Manager::Zypper,
+            r#"<solvable status="installed" name="jq" summary="A &quot;JSON&quot; processor" kind="package"/><solvable status="not-installed" name="jq" summary="x" kind="srcpackage"/>"#,
+        );
+        assert_eq!(zyp, [("jq".into(), "A \"JSON\" processor".into())]);
 
         let f = parse_fields("Package: jq\nDescription: lightweight\n and flexible\n .\nDepends: libc6\n");
         assert_eq!(f["Description"], "lightweight and flexible");

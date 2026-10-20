@@ -124,7 +124,7 @@ impl Default for ServicesPolicy {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PackagesPolicy {
-    /// `auto`, `apt`, `dnf` or `pacman`.
+    /// `auto`, `apt`, `dnf`, `zypper` or `pacman`.
     pub manager: String,
     /// Packages `pkg_install` may install without asking (`*` wildcards).
     pub allowed: Vec<String>,
@@ -141,7 +141,8 @@ impl Default for PackagesPolicy {
     fn default() -> Self {
         let protected = [
             "sudo", "systemd", "systemd-*", "openssh-server", "openssh", "linux", "linux-image-*", "kernel",
-            "kernel-core", "bubblewrap", "apt", "dnf", "pacman", "dpkg", "rpm", "glibc", "libc6", "bash",
+            "kernel-core", "kernel-default", "bubblewrap", "apt", "dnf", "zypper", "pacman", "dpkg", "rpm", "glibc",
+            "libc6", "bash",
         ];
         Self {
             manager: "auto".into(),

@@ -50,7 +50,7 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `svc_list`     | read    | allow   | systemd units: running, failed or stopped, and enabled at boot |
 | `svc_status`   | read    | allow   | One unit's state, last result, memory, CPU, restarts and recent log |
 | `svc_control`  | write   | ask     | Start, stop, restart, reload, enable or disable a unit (critical ones are protected) |
-| `pkg_list`     | read    | allow   | Installed packages (apt, dnf or pacman) |
+| `pkg_list`     | read    | allow   | Installed packages (apt, dnf, zypper or pacman) |
 | `pkg_search`   | read    | allow   | Search the repositories |
 | `pkg_info`     | read    | allow   | One package: installed and available versions, description, dependencies |
 | `pkg_install`  | execute | ask     | Install packages, as root and outside the sandbox |
@@ -513,26 +513,36 @@ Beyond files and processes, the AI sees and manages the parts of the machine an 
 
 ### Packages
 
-`pkg_list`, `pkg_search`, `pkg_info`, `pkg_install` and `pkg_remove` drive apt, dnf or pacman (detected automatically, or set `[packages] manager`).
+`pkg_list`, `pkg_search`, `pkg_info`, `pkg_install` and `pkg_remove` drive apt, dnf, zypper or pacman (detected automatically, or set `[packages] manager`).
 
-- **Nothing runs on a bad request.** Names that could be read as options are refused. On apt, the change is simulated before you are asked, so unknown packages fail first, and the result lists every package that changed, dependencies included.
-- **Removal is guarded.** A removal is refused, before you are asked, if it would take away a package the system marks essential or required, or one in `[packages] protected` (the kernel, systemd, sudo, ssh, libc, the package manager, bubblewrap, …). That holds even when the package would only go as a dependent of what you named.
+| Package manager | Distributions | Tested |
+|---|---|---|
+| apt | Debian, Ubuntu, Mint, Pop!_OS | Ubuntu 24.04, against its real repositories |
+| dnf (dnf4 and dnf5) | Fedora, RHEL 8+, Rocky, Alma | Fedora 44 (dnf5), against a local test repository |
+| zypper | openSUSE Tumbleweed and Leap, SLES | Tumbleweed, against a local test repository |
+| pacman | Arch, Manjaro, EndeavourOS | Arch, against a local test repository |
+
+`tests/distros/run.sh` repeats the Fedora, openSUSE and Arch runs in Docker; see the script for what it needs.
+
+- **Nothing runs on a bad request.** Names that could be read as options are refused. Every change is dry-run with the package manager itself before you are asked (`apt-get -s`, `dnf --assumeno`, `zypper --dry-run`, `pacman -p`), so unknown packages fail first, and the result lists every package that changed, dependencies included.
+- **Removal is guarded.** A removal is refused, before you are asked, if it would take away a package the system marks essential or required, or one in `[packages] protected` (the kernel, systemd, sudo, ssh, libc, the package manager, bubblewrap, …). That holds even when the package would only go as a dependent of what you named, or be replaced by one you install.
 - **`[packages] allowed`** pre-approves installs by name (wildcards work), e.g. `["python3-*"]`.
 - **Installs run as root and outside the sandbox,** because package scripts need that. That is why both tools are `execute`. As a normal user Orion uses `sudo -n`, which needs a `NOPASSWD` rule for the package manager, or set `[admin] elevate = "pkexec"` for a graphical password prompt.
 
 ### System updates
 
-- **`update_check`** refreshes the package lists, then lists every package that can be upgraded, from and to which version, security fixes first. Security fixes come from the repositories' own labels (apt's `-security` suites, dnf's updateinfo). Arch publishes none, so there nothing is marked.
+- **`update_check`** refreshes the package lists, then lists every package that can be upgraded, from and to which version, security fixes first. Security fixes come from the repositories' own labels: apt's `-security` suites, and the security advisories of dnf and zypper. Arch publishes none, so there nothing is marked. On Arch the check reads a private copy of the package lists, so it never leaves the system half-updated, as `pacman -Sy` alone would.
 - **`update_apply`** installs updates: everything, only the security fixes (`security_only`), or only the packages named.
-  - **Nothing is removed by default.** On apt, an upgrade that would remove or replace a package is kept back, and the result says which ones were. `full: true` allows those (`dist-upgrade`).
-  - **Removals stay guarded.** On apt the upgrade is simulated before you are asked. It is refused if it would remove a package the system needs or one in `[packages] protected`.
+  - **Nothing is removed by default.** Updates can remove packages: a package replaced by a renamed one (dnf's obsoletes, pacman's replaces), or one in the way of a new dependency. On apt such upgrades are kept back, and the result says which ones were. On dnf, zypper and pacman the update is refused, naming what it would remove. `full: true` allows those removals (`dist-upgrade` on apt).
+  - **Removals stay guarded.** The update is dry-run before you are asked. It is refused, even with `full`, if it would remove a package the system needs or one in `[packages] protected`.
   - **Configuration files you changed are kept** (`--force-confold`), and nothing waits on a prompt.
   - **Arch:** partial upgrades break Arch, so there it is everything or nothing.
+  - **openSUSE:** Tumbleweed is upgraded with `zypper dist-upgrade`, as it must be, and Leap with `zypper update`. Security-only updates use `zypper patch --category security`.
 - **After an update, both tools say what still runs old code.** Orion reads every process's memory maps for system files that were replaced, then sorts them:
   - processes that belong to a systemd service: restart that service (`svc_control`);
   - other processes: list them;
   - the kernel, `/run/reboot-required`, or PID 1: say the machine needs a reboot, and why.
-- **Pre-approving updates:** set `[packages] updates = "security"` (security fixes need no approval) or `"all"`. An update with `full: true` always asks.
+- **Pre-approving updates:** set `[packages] updates = "security"` (security fixes need no approval) or `"all"`. `packages.updates` never pre-approves an update with `full: true`.
 
 ### Network
 
@@ -720,7 +730,8 @@ src/
 contrib/        orion.socket and orion.service (the daemon), orion-voice.service
                 (headless voice), orion-kiosk (boot into the shell), orion-shell.service
 tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
-                (daemon plus bridge)
+                (daemon plus bridge), distros/ (package and update tools on
+                Fedora, openSUSE and Arch, in Docker)
 ```
 
 To add a capability, implement `Tool` in `src/tools/` and register it in `tools::builtin()`. Pick its `Risk` honestly, because that is what the policy defaults key off. Put checks that no approval should override in `precheck`, and argument-dependent pre-approval (like `proc_run`'s command list) in `preapproval`.
@@ -730,5 +741,5 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
-4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots). Next: scheduled unattended updates, and a status-bar badge for pending security fixes.
+4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots), on apt, dnf, zypper and pacman. Next: scheduled unattended updates, and a status-bar badge for pending security fixes.
 5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

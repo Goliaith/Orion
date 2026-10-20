@@ -2,30 +2,32 @@
 //! problems), upgrading, and what still runs old code afterwards: the
 //! services to restart and whether the machine needs a reboot.
 //!
-//! Like `pkg_install`, upgrades run as root and outside the sandbox. For apt
-//! the upgrade is simulated first, and refused before any approval if it
-//! would remove a package the system needs or the policy protects.
+//! Like `pkg_install`, upgrades run as root and outside the sandbox. Every
+//! change is worked out first (`apt-get -s`, `dnf --assumeno`, `zypper
+//! --dry-run`, `pacman -p`), and refused before any approval if it would
+//! remove a package the system needs or the policy protects. `pkg_install`
+//! and `pkg_remove` use the same dry run.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::exec::{self, glob_match};
-use super::packages::{complaint, essential, manager, package_name, run_as_root, tail, Manager};
+use super::packages::{complaint, essential, manager, package_name, parse_fields, run_as_root, tail, xml_elements, xml_unescape, Manager};
 use crate::policy::Policy;
 use crate::tool::{parse_args, Preapproval, Risk, Tool};
 
 /// One package that can be upgraded.
 #[derive(Debug, Default, PartialEq)]
-struct Update {
-    name: String,
-    from: Option<String>,
-    to: String,
+pub(super) struct Update {
+    pub name: String,
+    pub from: Option<String>,
+    pub to: String,
     /// The repositories (suites) the new version comes from.
     origin: String,
     security: bool,
@@ -41,12 +43,42 @@ impl Update {
 }
 
 fn kernel_package(name: &str) -> bool {
-    ["linux", "linux-lts", "linux-zen", "linux-hardened", "kernel", "kernel-core"].contains(&name)
-        || ["linux-image-", "linux-modules-", "kernel-core-", "kernel-modules"].iter().any(|p| name.starts_with(p))
+    ["linux", "linux-lts", "linux-zen", "linux-hardened", "kernel", "kernel-core", "kernel-default"].contains(&name)
+        || ["linux-image-", "linux-modules-", "kernel-core-", "kernel-modules", "kernel-default-"]
+            .iter()
+            .any(|p| name.starts_with(p))
 }
 
 fn security_origin(origin: &str) -> bool {
     origin.to_ascii_lowercase().contains("security")
+}
+
+const ARCHES: [&str; 12] =
+    ["noarch", "x86_64", "aarch64", "i686", "i586", "i386", "ppc64le", "ppc64", "s390x", "armv7hl", "riscv64", "src"];
+
+/// `curl.x86_64` → `curl`.
+fn strip_arch(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((n, arch)) if ARCHES.contains(&arch) => n,
+        _ => name,
+    }
+}
+
+/// What a change would do, from the package manager's own dry run.
+#[derive(Debug, Default)]
+pub(super) struct Plan {
+    pub upgrade: Vec<Update>,
+    /// New packages (named ones, dependencies, a new kernel, a replacement).
+    pub install: Vec<(String, String)>,
+    pub remove: Vec<(String, String)>,
+    /// Upgradable, but left alone: held, phased, or needing a removal.
+    kept_back: Vec<String>,
+}
+
+impl Plan {
+    fn is_empty(&self) -> bool {
+        self.upgrade.is_empty() && self.install.is_empty() && self.remove.is_empty()
+    }
 }
 
 /// `apt list --upgradable`:
@@ -63,19 +95,9 @@ fn parse_apt_upgradable(text: &str) -> Vec<Update> {
         .collect()
 }
 
-/// What `apt-get -s upgrade` (or `dist-upgrade`) would do.
-#[derive(Debug, Default)]
-struct UpgradePlan {
-    upgrade: Vec<Update>,
-    /// New packages pulled in (a new kernel, a renamed library).
-    install: Vec<(String, String)>,
-    remove: Vec<(String, String)>,
-    /// Upgradable, but left alone: held, phased, or needing a removal.
-    kept_back: Vec<String>,
-}
-
-fn parse_apt_upgrade(text: &str) -> UpgradePlan {
-    let mut plan = UpgradePlan::default();
+/// `apt-get -s install|remove|upgrade|dist-upgrade`.
+fn parse_apt_plan(text: &str) -> Plan {
+    let mut plan = Plan::default();
     let mut in_kept = false;
     for line in text.lines() {
         if line.starts_with("The following packages have been kept back")
@@ -127,7 +149,7 @@ fn parse_apt_upgrade(text: &str) -> UpgradePlan {
 }
 
 /// `dnf check-update`: `curl.x86_64   8.6.0-1.fc40   updates`, after a
-/// header and before any "Obsoleting Packages" section.
+/// header (dnf5: "Upgrades") and before any "Obsoleting Packages" section.
 fn parse_dnf_updates(text: &str, security: &BTreeSet<String>) -> Vec<Update> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -151,17 +173,158 @@ fn parse_dnf_updates(text: &str, security: &BTreeSet<String>) -> Vec<Update> {
     out
 }
 
-/// `dnf updateinfo list --security --updates`:
-/// `FEDORA-2024-1a2b3c  Important/Sec.  curl-8.6.0-1.fc40.x86_64`
+/// `dnf updateinfo list --security --updates`, the package names:
+/// dnf4 `FEDORA-2024-1a2b3c  Important/Sec.  curl-8.6.0-1.fc40.x86_64`,
+/// dnf5 `FEDORA-2024-1a2b3c  security  Important  curl-8.6.0-1.fc40.x86_64  2024-06-01 00:00:00`.
 fn parse_dnf_security(text: &str) -> BTreeSet<String> {
     text.lines()
-        .filter_map(|l| l.split_whitespace().nth(2))
-        .filter_map(|nevra| {
-            let no_arch = nevra.rsplit_once('.')?.0;
-            let (rest, _release) = no_arch.rsplit_once('-')?;
+        .filter_map(|l| {
+            let nevra = l.split_whitespace().skip(1).find(|f| strip_arch(f) != *f)?;
+            let (rest, _release) = strip_arch(nevra).rsplit_once('-')?;
             Some(rest.rsplit_once('-')?.0.to_string())
         })
         .collect()
+}
+
+/// The transaction table `dnf --assumeno` prints. dnf4:
+/// ```text
+/// Upgrading:
+///  curl        x86_64   8.6.0-1.fc40   updates   300 k
+/// Installing:
+///  orion-new   noarch   2.0-1          test        6 k
+///      replacing  orion-old.noarch 1.0-1
+/// Removing:
+///  foo         x86_64   1.0-1          @System    10 k
+/// ```
+/// dnf5 is alike, with epochs (`0:2.0-1`) and `replacing orion-old noarch 0:1.0-1 …`.
+/// A package replacing an older version of itself is an upgrade; one
+/// replacing another package removes that package.
+fn parse_dnf_transaction(text: &str) -> Plan {
+    #[derive(PartialEq)]
+    enum Section {
+        Other,
+        Upgrade,
+        Install,
+        Remove,
+    }
+    let version = |v: &str| v.strip_prefix("0:").unwrap_or(v).to_string();
+    let mut plan = Plan::default();
+    let mut section = Section::Other;
+    let mut last: Option<String> = None;
+    for line in text.lines() {
+        if line.starts_with("Transaction Summary") {
+            break;
+        }
+        if !line.starts_with(' ') && line.ends_with(':') {
+            section = match line {
+                l if l.starts_with("Upgrading") => Section::Upgrade,
+                l if l.starts_with("Installing") => Section::Install,
+                l if l.starts_with("Removing") => Section::Remove,
+                _ => Section::Other,
+            };
+            last = None;
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.first() == Some(&"replacing") && f.len() >= 3 {
+            let (name, ver) = if f.len() >= 4 && ARCHES.contains(&f[2]) { (f[1], f[3]) } else { (strip_arch(f[1]), f[2]) };
+            if last.as_deref() == Some(name) {
+                if let Some(u) = plan.upgrade.iter_mut().find(|u| u.name == name) {
+                    u.from = Some(version(ver));
+                }
+            } else {
+                plan.remove.push((name.to_string(), version(ver)));
+            }
+            continue;
+        }
+        if !line.starts_with(' ') || f.len() < 4 || section == Section::Other {
+            continue;
+        }
+        let (name, ver, repo) = (f[0].to_string(), version(f[2]), f[3].to_string());
+        last = Some(name.clone());
+        match section {
+            Section::Upgrade => plan.upgrade.push(Update { name, to: ver, origin: repo, ..Default::default() }),
+            Section::Install => plan.install.push((name, ver)),
+            Section::Remove => plan.remove.push((name, ver)),
+            Section::Other => {}
+        }
+    }
+    plan
+}
+
+/// `zypper --xmlout list-updates`.
+fn parse_zypper_updates(xml: &str, security: &BTreeSet<String>) -> Vec<Update> {
+    xml.split("<update ")
+        .skip(1)
+        .filter_map(|chunk| {
+            let a = xml_elements(&format!("<update {chunk}"), "update").next()?;
+            if a.get("kind").is_some_and(|k| k != "package") {
+                return None;
+            }
+            let name = a.get("name")?.clone();
+            let origin = xml_elements(chunk, "source").next().and_then(|s| s.get("alias").cloned()).unwrap_or_default();
+            Some(Update {
+                security: security.contains(&name),
+                from: a.get("edition-old").cloned(),
+                to: a.get("edition").cloned().unwrap_or_default(),
+                origin,
+                name,
+            })
+        })
+        .collect()
+}
+
+/// The `<install-summary>` of a `zypper --xmlout … --dry-run`.
+fn parse_zypper_plan(xml: &str) -> Plan {
+    let mut plan = Plan::default();
+    let Some(start) = xml.find("<install-summary") else { return plan };
+    let summary = &xml[start..xml[start..].find("</install-summary>").map_or(xml.len(), |e| start + e)];
+    for chunk in summary.split("<to-").skip(1) {
+        let section = chunk.split(['>', ' ']).next().unwrap_or_default();
+        for a in xml_elements(chunk, "solvable").filter(|a| a.get("type").is_none_or(|t| t == "package")) {
+            let name = a.get("name").cloned().unwrap_or_default();
+            let edition = a.get("edition").cloned().unwrap_or_default();
+            match section {
+                "upgrade" | "downgrade" | "change-arch" | "change-vendor" => plan.upgrade.push(Update {
+                    name,
+                    from: a.get("edition-old").cloned(),
+                    to: edition,
+                    origin: a.get("repository").cloned().unwrap_or_default(),
+                    security: false,
+                }),
+                "install" | "reinstall" => plan.install.push((name, edition)),
+                "remove" => plan.remove.push((name, edition)),
+                _ => {}
+            }
+        }
+    }
+    plan
+}
+
+/// The packages the security patches fix, from `zypper info -t patch`:
+/// `Conflicts : orion-sec < 1.1-1` and continuation lines like it.
+fn parse_zypper_patch_packages(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut in_conflicts = false;
+    for line in text.lines() {
+        let item = match line.split_once(" : ") {
+            Some((key, value)) if !key.starts_with(' ') => {
+                in_conflicts = key.trim() == "Conflicts";
+                value
+            }
+            _ if in_conflicts && line.starts_with(' ') => line,
+            _ => {
+                in_conflicts = false;
+                continue;
+            }
+        };
+        if in_conflicts {
+            if let Some(name) = item.split_whitespace().next().filter(|n| !n.is_empty()) {
+                out.insert(strip_arch(name.trim_start_matches("srcpackage:")).to_string());
+            }
+        }
+    }
+    out
 }
 
 /// `checkupdates` / `pacman -Qu`: `curl 8.5.0-1 -> 8.6.0-1`.
@@ -179,10 +342,72 @@ fn parse_pacman_updates(text: &str) -> Vec<Update> {
         .collect()
 }
 
+/// `pacman -Si`: each package's `Replaces` list (`None` when empty).
+fn parse_pacman_replaces(text: &str) -> BTreeMap<String, Vec<String>> {
+    text.split("\n\n")
+        .filter_map(|block| {
+            let f = parse_fields(block);
+            let replaces = f.get("Replaces")?.split_whitespace().filter(|r| *r != "None");
+            // "foo>=1.0" → foo
+            let replaces = replaces.map(|r| r.split(['<', '>', '=']).next().unwrap_or(r).to_string()).collect();
+            Some((f.get("Name")?.clone(), replaces))
+        })
+        .collect()
+}
+
 fn run_quiet(program: &str, args: &[&str], secs: u64) -> Result<exec::Finished> {
     let mut cmd = Command::new(program);
     cmd.args(args).env("LC_ALL", "C");
     exec::run(cmd, None, Duration::from_secs(secs), 4 << 20)
+}
+
+fn tumbleweed() -> bool {
+    let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    os.lines().any(|l| l.starts_with("ID=") && ["tumbleweed", "slowroll", "microos"].iter().any(|t| l.contains(t)))
+}
+
+/// A private copy of pacman's sync databases, so checking never sets up a
+/// partial upgrade (`pacman -Sy` alone would). The same idea as checkupdates.
+fn pacman_db() -> Option<PathBuf> {
+    Policy::state_dir().map(|d| d.join("pacman-db"))
+}
+
+fn sync_pacman_db() -> Result<()> {
+    let dir = pacman_db().context("no state directory for a private pacman database")?;
+    std::fs::create_dir_all(&dir)?;
+    let local = dir.join("local");
+    if std::fs::symlink_metadata(&local).is_err() {
+        std::os::unix::fs::symlink("/var/lib/pacman/local", &local)?;
+    }
+    let dir = dir.to_string_lossy();
+    let mut args = vec!["pacman", "-Sy", "--dbpath", &dir, "--logfile", "/dev/null"];
+    // SAFETY: geteuid has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    if !root {
+        ensure!(exec::installed("fakeroot"), "refreshing a private pacman database needs root or fakeroot");
+        args.insert(0, "fakeroot");
+        args.insert(1, "--");
+    }
+    let mut done = run_quiet(args[0], &args[1..], 300)?;
+    if root && !done.success() && done.stderr.contains("Permission denied") {
+        // pacman 7 downloads as an unprivileged user (DownloadUser), which
+        // can't write into root's state directory. The lists are signed.
+        args.push("--disable-sandbox");
+        done = run_quiet(args[0], &args[1..], 300)?;
+    }
+    ensure!(done.success(), "pacman -Sy: {}", done.complaint());
+    Ok(())
+}
+
+/// `--dbpath <private copy>`, once a refresh has filled one.
+fn pacman_db_args() -> Vec<String> {
+    let synced = |d: &PathBuf| {
+        std::fs::read_dir(d.join("sync")).is_ok_and(|e| e.flatten().any(|f| f.file_name().to_string_lossy().ends_with(".db")))
+    };
+    match pacman_db().filter(synced) {
+        Some(d) => vec!["--dbpath".into(), d.to_string_lossy().into_owned()],
+        None => Vec::new(),
+    }
 }
 
 /// Fetch the latest package lists. Returns why it couldn't, if it couldn't.
@@ -190,14 +415,39 @@ fn refresh(policy: &Policy, m: Manager) -> Option<String> {
     let argv: Vec<String> = match m {
         Manager::Apt => ["DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-q"].map(String::from).to_vec(),
         Manager::Dnf => ["dnf", "makecache", "-q"].map(String::from).to_vec(),
-        // `pacman -Sy` alone would set up a partial upgrade; checkupdates
-        // refreshes a private copy of the database instead.
-        Manager::Pacman => return None,
+        Manager::Zypper => ["zypper", "-n", "-q", "refresh"].map(String::from).to_vec(),
+        Manager::Pacman => return sync_pacman_db().err().map(|e| format!("{e:#}")),
     };
     match run_as_root(policy, m, argv) {
         Ok((done, _)) if done.success() => None,
         Ok((done, _)) => Some(complaint(&done)),
         Err(e) => Some(format!("{e:#}")),
+    }
+}
+
+/// The names of packages with a pending security fix (dnf and zypper).
+fn security_names(m: Manager) -> BTreeSet<String> {
+    match m {
+        Manager::Dnf => run_quiet("dnf", &["-q", "updateinfo", "list", "--security", "--updates"], 300)
+            .map(|d| parse_dnf_security(&d.stdout))
+            .unwrap_or_default(),
+        Manager::Zypper => {
+            let patches: Vec<String> = run_quiet("zypper", &["-n", "--xmlout", "list-patches", "--category", "security"], 300)
+                .map(|d| {
+                    xml_elements(&d.stdout, "update")
+                        .filter(|a| a.get("status").is_none_or(|s| s == "needed"))
+                        .filter_map(|mut a| a.remove("name"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if patches.is_empty() {
+                return BTreeSet::new();
+            }
+            let mut args = vec!["-n", "-q", "info", "-t", "patch", "--"];
+            args.extend(patches.iter().map(String::as_str));
+            run_quiet("zypper", &args, 300).map(|d| parse_zypper_patch_packages(&d.stdout)).unwrap_or_default()
+        }
+        Manager::Apt | Manager::Pacman => BTreeSet::new(),
     }
 }
 
@@ -208,10 +458,7 @@ fn pending(m: Manager) -> Result<Vec<Update>> {
             // check-update exits 100 when there are updates.
             let done = run_quiet("dnf", &["-q", "check-update"], 300)?;
             ensure!(done.success() || done.status.code() == Some(100), "dnf check-update: {}", done.complaint());
-            let security = run_quiet("dnf", &["-q", "updateinfo", "list", "--security", "--updates"], 300)
-                .map(|d| parse_dnf_security(&d.stdout))
-                .unwrap_or_default();
-            let mut list = parse_dnf_updates(&done.stdout, &security);
+            let mut list = parse_dnf_updates(&done.stdout, &security_names(m));
             let names: Vec<&str> = list.iter().map(|u| u.name.as_str()).collect();
             if !names.is_empty() {
                 let mut args = vec!["-q", "--qf", "%{NAME} %{VERSION}-%{RELEASE}\\n", "--"];
@@ -225,17 +472,170 @@ fn pending(m: Manager) -> Result<Vec<Update>> {
             }
             list
         }
-        Manager::Pacman if exec::installed("checkupdates") => {
-            // Exits 2 when there is nothing to update.
-            let done = run_quiet("checkupdates", &[], 300)?;
-            ensure!(done.success() || done.status.code() == Some(2), "checkupdates: {}", done.complaint());
-            parse_pacman_updates(&done.stdout)
+        Manager::Zypper => {
+            let done = run_quiet("zypper", &["-n", "--xmlout", "list-updates"], 300)?;
+            ensure!(done.success(), "zypper list-updates: {}", done.complaint());
+            parse_zypper_updates(&done.stdout, &security_names(m))
         }
         Manager::Pacman => {
-            let done = run_quiet("pacman", &["-Qu"], 60)?;
-            parse_pacman_updates(&done.stdout)
+            // Exits 1 when there is nothing to update.
+            let mut args = pacman_db_args();
+            args.push("-Qu".into());
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            parse_pacman_updates(&run_quiet("pacman", &refs, 60)?.stdout)
         }
     })
+}
+
+/// A change to the installed packages.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Action {
+    Install,
+    Remove,
+    Upgrade { security_only: bool, full: bool },
+}
+
+/// The command line for `action` on `packages`: the real one, or (`dry`)
+/// the dry run that shows what it would do.
+pub(super) fn command(m: Manager, action: Action, packages: &[String], dry: bool) -> Vec<String> {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let mut v = match (m, dry) {
+        (Manager::Apt, true) => s(&["apt-get", "-s"]),
+        (Manager::Apt, false) => {
+            s(&["DEBIAN_FRONTEND=noninteractive", "apt-get", "-y", "-q", "-o", "Dpkg::Options::=--force-confold"])
+        }
+        (Manager::Dnf, true) => s(&["dnf", "--assumeno"]),
+        (Manager::Dnf, false) => s(&["dnf", "-y", "-q"]),
+        (Manager::Zypper, true) => s(&["zypper", "-n", "--xmlout"]),
+        (Manager::Zypper, false) => s(&["zypper", "-n"]),
+        (Manager::Pacman, _) => s(&["pacman"]),
+    };
+    let rest = match (m, action) {
+        (Manager::Apt, Action::Install) => s(&["install"]),
+        (Manager::Apt, Action::Remove) => s(&["remove"]),
+        (Manager::Apt, Action::Upgrade { .. }) if !packages.is_empty() => s(&["install", "--only-upgrade"]),
+        // New dependencies (a new kernel's packages) are fine; removals are not.
+        (Manager::Apt, Action::Upgrade { full: false, .. }) => s(&["upgrade", "--with-new-pkgs"]),
+        (Manager::Apt, Action::Upgrade { full: true, .. }) => s(&["dist-upgrade"]),
+        (Manager::Dnf, Action::Install) => s(&["install"]),
+        (Manager::Dnf, Action::Remove) => s(&["remove"]),
+        (Manager::Dnf, Action::Upgrade { security_only, .. }) => {
+            if security_only { s(&["upgrade", "--security"]) } else { s(&["upgrade"]) }
+        }
+        (Manager::Zypper, Action::Install) => s(&["install"]),
+        (Manager::Zypper, Action::Remove) => s(&["remove"]),
+        (Manager::Zypper, Action::Upgrade { security_only: true, .. }) => s(&["patch", "--category", "security"]),
+        // Tumbleweed is only ever upgraded as a whole distribution.
+        (Manager::Zypper, Action::Upgrade { .. }) if packages.is_empty() && tumbleweed() => s(&["dist-upgrade"]),
+        (Manager::Zypper, Action::Upgrade { .. }) => s(&["update"]),
+        (Manager::Pacman, Action::Install) => s(&[if dry { "-Sp" } else { "-S" }, "--needed"]),
+        (Manager::Pacman, Action::Remove) => s(&[if dry { "-Rp" } else { "-R" }]),
+        (Manager::Pacman, Action::Upgrade { .. }) => s(&[if dry { "-Sup" } else { "-Syu" }]),
+    };
+    v.extend(rest);
+    match m {
+        Manager::Zypper if dry => v.push("--dry-run".into()),
+        Manager::Pacman if dry => {
+            v.extend(pacman_db_args().into_iter().filter(|_| matches!(action, Action::Upgrade { .. })));
+            v.extend(["--print-format".into(), "%n %v".into()]);
+        }
+        Manager::Pacman => v.push("--noconfirm".into()),
+        _ => {}
+    }
+    if !packages.is_empty() {
+        v.push("--".into());
+        v.extend(packages.iter().cloned());
+    }
+    v
+}
+
+/// The error lines of a failed dry run (`E: …`, `Error: …`, zypper's XML messages).
+fn dry_run_error(program: &str, text: &str) -> String {
+    let xml: Vec<String> = text
+        .split("<message type=\"error\">")
+        .skip(1)
+        .filter_map(|m| m.split_once("</message>").map(|(t, _)| xml_unescape(t.trim())))
+        .collect();
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim().trim_start_matches(&format!("{program}: ")).to_string())
+        .filter(|l| l.starts_with("E: ") || l.starts_with("Error") || l.starts_with("error:") || l.starts_with("No match"))
+        .map(|l| l.trim_start_matches("error: ").to_string())
+        .collect();
+    let found = if xml.is_empty() { lines } else { xml };
+    if found.is_empty() { tail(text) } else { found.join("; ") }
+}
+
+/// What `action` would do, from the package manager's dry run. Unknown
+/// packages fail here, before anyone is asked.
+pub(super) fn dry_run(policy: &Policy, m: Manager, action: Action, packages: &[String]) -> Result<Plan> {
+    let argv = command(m, action, packages, true);
+    match m {
+        Manager::Apt => {
+            let refs: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+            let text = exec::output("apt-get", &refs).map_err(|e| anyhow::anyhow!("{}", dry_run_error("apt-get", &format!("{e:#}"))))?;
+            Ok(parse_apt_plan(&text))
+        }
+        Manager::Dnf => {
+            let (done, _) = run_as_root(policy, m, argv)?;
+            // --assumeno ends in "Operation aborted" and exit 1; anything else failed.
+            let all = format!("{}\n{}", done.stdout, done.stderr);
+            let nothing = all.contains("Nothing to do");
+            ensure!(done.success() || nothing || all.contains("Operation aborted"), "{}", dry_run_error("dnf", &all));
+            Ok(parse_dnf_transaction(&done.stdout))
+        }
+        Manager::Zypper => {
+            let (done, _) = run_as_root(policy, m, argv)?;
+            // 100-103: updates or patches pending, a reboot or restart needed.
+            let ok = done.success() || matches!(done.status.code(), Some(100..=103));
+            ensure!(ok, "{}", dry_run_error("zypper", &format!("{}\n{}", done.stdout, done.stderr)));
+            Ok(parse_zypper_plan(&done.stdout))
+        }
+        Manager::Pacman => pacman_plan(m, action, &argv),
+    }
+}
+
+fn pacman_plan(m: Manager, action: Action, argv: &[String]) -> Result<Plan> {
+    let refs: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    let done = run_quiet("pacman", &refs, 120)?;
+    ensure!(done.success(), "{}", dry_run_error("pacman", &format!("{}\n{}", done.stdout, done.stderr)));
+    let targets: Vec<(String, String)> = done
+        .stdout
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+    let mut plan = Plan::default();
+    match action {
+        Action::Remove => plan.remove = targets,
+        Action::Install => plan.install = targets,
+        Action::Upgrade { .. } => {
+            let upgrades = pending(m)?;
+            let have: BTreeMap<String, String> = exec::output("pacman", &["-Q"])?
+                .lines()
+                .filter_map(|l| l.split_once(' '))
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect();
+            let new: Vec<(String, String)> = targets.into_iter().filter(|(n, _)| !have.contains_key(n)).collect();
+            // --noconfirm accepts "Replace orion-old with orion-new?": a removal.
+            if !new.is_empty() {
+                let mut args = pacman_db_args();
+                args.push("-Si".into());
+                args.push("--".into());
+                args.extend(new.iter().map(|(n, _)| n.clone()));
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let replaces = parse_pacman_replaces(&run_quiet("pacman", &refs, 60)?.stdout);
+                for old in replaces.values().flatten() {
+                    if let Some(version) = have.get(old) {
+                        plan.remove.push((old.clone(), version.clone()));
+                    }
+                }
+            }
+            plan.upgrade = upgrades;
+            plan.install = new;
+        }
+    }
+    Ok(plan)
 }
 
 /// A process still running code an update replaced.
@@ -281,6 +681,10 @@ fn stale_processes(proc: &Path) -> (Vec<Stale>, usize) {
     let Ok(dir) = std::fs::read_dir(proc) else { return (out, 1) };
     for e in dir.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        // Orion itself is about to exit.
+        if pid == std::process::id() {
+            continue;
+        }
         let base = e.path();
         let maps = match std::fs::read_to_string(base.join("maps")) {
             Ok(m) => m,
@@ -304,7 +708,7 @@ fn stale_processes(proc: &Path) -> (Vec<Stale>, usize) {
 }
 
 /// Whether the machine needs a reboot, and why.
-fn reboot_reasons(stale: &[Stale]) -> Vec<String> {
+fn reboot_reasons(m: Manager, stale: &[Stale]) -> Vec<String> {
     let mut why = Vec::new();
     if Path::new("/run/reboot-required").exists() || Path::new("/var/run/reboot-required").exists() {
         let pkgs = std::fs::read_to_string("/run/reboot-required.pkgs")
@@ -330,10 +734,15 @@ fn reboot_reasons(stale: &[Stale]) -> Vec<String> {
     if let Some(init) = stale.iter().find(|s| s.pid == 1) {
         why.push(format!("{} (PID 1) runs replaced libraries", init.name));
     }
-    if why.is_empty() && exec::installed("needs-restarting") {
-        // dnf-utils: exits 1 when core packages changed since boot.
-        if run_quiet("needs-restarting", &["-r"], 60).is_ok_and(|d| d.status.code() == Some(1)) {
-            why.push("needs-restarting reports core packages updated since boot".into());
+    if why.is_empty() {
+        // Each manager's own verdict on core packages updated since boot.
+        let asked = match m {
+            Manager::Dnf => run_quiet("dnf", &["-q", "-C", "needs-restarting", "-r"], 60).is_ok_and(|d| d.status.code() == Some(1)),
+            Manager::Zypper => run_quiet("zypper", &["-n", "needs-rebooting"], 60).is_ok_and(|d| d.status.code() == Some(102)),
+            Manager::Apt | Manager::Pacman => false,
+        };
+        if asked {
+            why.push(format!("{} reports core packages updated since boot", m.name()));
         }
     }
     why.dedup();
@@ -341,9 +750,9 @@ fn reboot_reasons(stale: &[Stale]) -> Vec<String> {
 }
 
 /// What still runs old code: services to restart, other processes, reboot.
-fn after_effects() -> Value {
+fn after_effects(m: Manager) -> Value {
     let (stale, unreadable) = stale_processes(Path::new("/proc"));
-    let reboot = reboot_reasons(&stale);
+    let reboot = reboot_reasons(m, &stale);
     let mut system: BTreeSet<&str> = BTreeSet::new();
     let mut user: BTreeSet<&str> = BTreeSet::new();
     for s in stale.iter().filter(|s| s.pid != 1) {
@@ -371,6 +780,16 @@ fn after_effects() -> Value {
         ));
     }
     out
+}
+
+/// Fold `more` into `out`, joining the two notes if both have one.
+fn merge(out: &mut Value, mut more: Value) {
+    if let (Some(a), Some(b)) = (out.get("note").and_then(Value::as_str), more.get("note").and_then(Value::as_str)) {
+        more["note"] = json!(format!("{a}; {b}"));
+    }
+    if let (Value::Object(out), Value::Object(more)) = (out, more) {
+        out.extend(more);
+    }
 }
 
 pub struct UpdateCheck;
@@ -426,15 +845,20 @@ impl Tool for UpdateCheck {
             "kernel": list.iter().any(|u| kernel_package(&u.name)),
             "updates": list.iter().map(Update::json).collect::<Vec<_>>(),
         });
+        let mut notes = Vec::new();
         if m == Manager::Pacman {
-            out["note"] = json!("Arch publishes no security metadata, so no update is marked as a security fix");
+            notes.push("Arch publishes no security metadata, so no update is marked as a security fix");
+        }
+        if m == Manager::Zypper && tumbleweed() {
+            notes.push("on Tumbleweed, update_apply runs a full distribution upgrade, which may change more than this list");
+        }
+        if !notes.is_empty() {
+            out["note"] = json!(notes.join("; "));
         }
         if let Some(e) = refresh_error {
             out["refresh_error"] = json!(e);
         }
-        if let Value::Object(after) = after_effects() {
-            out.as_object_mut().unwrap().extend(after);
-        }
+        merge(&mut out, after_effects(m));
         Ok(out)
     }
 }
@@ -455,13 +879,15 @@ struct ApplyArgs {
 /// What an update run will do, worked out before any approval.
 struct Prepared {
     m: Manager,
+    action: Action,
     /// Only these packages (empty: everything).
     only: Vec<String>,
-    plan: Option<UpgradePlan>,
-    full: bool,
+    plan: Plan,
 }
 
-fn guard_removals(policy: &Policy, m: Manager, plan: &UpgradePlan) -> Result<()> {
+/// Refuse a removal of anything protected or essential, and without
+/// `full`, any removal at all.
+fn guard_removals(policy: &Policy, m: Manager, plan: &Plan, full: bool) -> Result<()> {
     for (name, _) in &plan.remove {
         let bare = name.split(':').next().unwrap_or(name);
         if let Some(p) = policy.packages.protected.iter().find(|p| glob_match(p, bare)) {
@@ -471,27 +897,11 @@ fn guard_removals(policy: &Policy, m: Manager, plan: &UpgradePlan) -> Result<()>
             bail!("this update would remove {name}, which the system needs");
         }
     }
+    if !full && !plan.remove.is_empty() {
+        let names: Vec<&str> = plan.remove.iter().map(|(n, _)| n.as_str()).collect();
+        bail!("this update would remove {} (replaced or obsoleted); set full to allow that", names.join(", "));
+    }
     Ok(())
-}
-
-fn apt_argv(only: &[String], full: bool, simulate: bool) -> Vec<String> {
-    let mut v: Vec<String> = if simulate { vec!["apt-get".into(), "-s".into()] } else { vec![] };
-    if !simulate {
-        v = ["DEBIAN_FRONTEND=noninteractive", "apt-get", "-y", "-q", "-o", "Dpkg::Options::=--force-confold"]
-            .map(String::from)
-            .to_vec();
-    }
-    if only.is_empty() {
-        v.push(if full { "dist-upgrade" } else { "upgrade" }.into());
-        if !full {
-            // New dependencies (a new kernel's packages) are fine; removals are not.
-            v.push("--with-new-pkgs".into());
-        }
-    } else {
-        v.extend(["install".into(), "--only-upgrade".into(), "--".into()]);
-        v.extend(only.iter().cloned());
-    }
-    v
 }
 
 fn prepare(policy: &Policy, args: &Value) -> Result<Prepared> {
@@ -500,34 +910,31 @@ fn prepare(policy: &Policy, args: &Value) -> Result<Prepared> {
     for p in &a.packages {
         package_name(p)?;
     }
-    ensure!(
-        a.packages.is_empty() || !a.security_only,
-        "give either packages or security_only, not both"
-    );
+    ensure!(a.packages.is_empty() || !a.security_only, "give either packages or security_only, not both");
     let m = manager(policy)?;
     if m == Manager::Pacman {
         ensure!(a.packages.is_empty(), "Arch does not support upgrading only some packages; upgrade everything");
         ensure!(!a.security_only, "Arch publishes no security metadata; upgrade everything");
     }
     let mut only = a.packages;
+    let mut action = Action::Upgrade { security_only: a.security_only, full: a.full };
     if a.security_only && m == Manager::Apt {
+        // apt has no security-only upgrade: name the packages instead.
         only = pending(m)?.into_iter().filter(|u| u.security).map(|u| u.name).collect();
+        if only.is_empty() {
+            return Ok(Prepared { m, action, only, plan: Plan::default() });
+        }
+        action = Action::Upgrade { security_only: false, full: a.full };
     }
-    let plan = if m == Manager::Apt && !(a.security_only && only.is_empty()) {
-        let argv = apt_argv(&only, a.full, true);
-        let refs: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-        let text = exec::output("apt-get", &refs).map_err(|e| {
-            let msg = format!("{e:#}");
-            let reason: Vec<&str> = msg.lines().filter(|l| l.contains("E: ")).collect();
-            anyhow::anyhow!("{}", if reason.is_empty() { msg.clone() } else { reason.join("; ") })
-        })?;
-        let plan = parse_apt_upgrade(&text);
-        guard_removals(policy, m, &plan)?;
-        Some(plan)
-    } else {
-        None
-    };
-    Ok(Prepared { m, only, plan, full: a.full })
+    let plan = dry_run(policy, m, action, &only)?;
+    guard_removals(policy, m, &plan, a.full)?;
+    Ok(Prepared { m, action, only, plan })
+}
+
+/// The ok exit codes of a real run: zypper uses 100-103 for "done, and a
+/// reboot (102) or another run (103, after it updated itself) is due".
+fn finished_ok(m: Manager, done: &exec::Finished) -> bool {
+    done.success() || (m == Manager::Zypper && matches!(done.status.code(), Some(100..=103)))
 }
 
 impl Tool for UpdateApply {
@@ -537,9 +944,9 @@ impl Tool for UpdateApply {
 
     fn description(&self) -> &'static str {
         "Install system updates, as root and outside the sandbox: everything, only security fixes \
-         (security_only), or only the named packages. Never removes packages unless full is set (apt \
-         dist-upgrade), and even then never one the system needs or the policy protects. Returns what \
-         was upgraded and whether services need a restart or the machine a reboot. Use update_check first."
+         (security_only), or only the named packages. Never removes packages unless full is set, and even \
+         then never one the system needs or the policy protects. Returns what was upgraded and whether \
+         services need a restart or the machine a reboot. Use update_check first."
     }
 
     fn risk(&self) -> Risk {
@@ -555,7 +962,8 @@ impl Tool for UpdateApply {
                 "security_only": { "type": "boolean", "description": "Only updates that fix security problems." },
                 "full": { "type": "boolean",
                           "description": "Also allow upgrades that remove or replace packages (apt dist-upgrade). \
-                                          Default false: such upgrades are kept back." }
+                                          Default false: on apt such upgrades are kept back; elsewhere the \
+                                          update is refused, naming what it would remove." }
             },
             "additionalProperties": false
         })
@@ -566,13 +974,13 @@ impl Tool for UpdateApply {
             Ok(a) => a,
             Err(e) => return Preapproval::Refused(format!("{e:#}")),
         };
-        let mode = policy.packages.updates.as_str();
-        match mode {
-            _ if a.full => Preapproval::Refused("updates that may remove packages always ask".into()),
+        // packages.updates never pre-approves an update that may remove
+        // packages; the tool-level decision (ask, by default) stands.
+        match policy.packages.updates.as_str() {
+            "all" | "security" | "ask" if a.full => Preapproval::NotApplicable,
             "all" => Preapproval::Granted,
             "security" if a.security_only => Preapproval::Granted,
-            "security" => Preapproval::Refused("packages.updates allows only security_only updates".into()),
-            "ask" => Preapproval::NotApplicable,
+            "security" | "ask" => Preapproval::NotApplicable,
             other => Preapproval::Refused(format!("packages.updates must be ask, security or all, not {other:?}")),
         }
     }
@@ -582,54 +990,38 @@ impl Tool for UpdateApply {
     }
 
     fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
-        let p = prepare(policy, &args)?;
-        let a: ApplyArgs = parse_args(args)?;
-        if p.plan.as_ref().is_some_and(|plan| plan.upgrade.is_empty() && plan.install.is_empty() && plan.remove.is_empty())
-            || (a.security_only && p.m == Manager::Apt && p.only.is_empty())
-        {
-            let mut out = json!({ "ok": true, "manager": p.m.name(), "upgraded": [], "message": "nothing to update" });
-            if let Some(plan) = &p.plan {
-                out["kept_back"] = json!(plan.kept_back);
-            }
-            return Ok(out);
+        let Prepared { m, action, only, mut plan } = prepare(policy, &args)?;
+        if plan.is_empty() {
+            return Ok(json!({ "ok": true, "manager": m.name(), "upgraded": [], "kept_back": plan.kept_back,
+                              "message": "nothing to update" }));
         }
-        let argv: Vec<String> = match p.m {
-            Manager::Apt => apt_argv(&p.only, p.full, false),
-            Manager::Dnf => {
-                let mut v: Vec<String> = ["dnf", "upgrade", "-y", "-q"].map(String::from).to_vec();
-                if a.security_only {
-                    v.push("--security".into());
-                }
-                if !p.only.is_empty() {
-                    v.push("--".into());
-                    v.extend(p.only.iter().cloned());
-                }
-                v
-            }
-            Manager::Pacman => ["pacman", "-Syu", "--noconfirm"].map(String::from).to_vec(),
-        };
-        let (done, elevated) = run_as_root(policy, p.m, argv)?;
+        // Mark security fixes where the dry run doesn't say (dnf, zypper).
+        let security = security_names(m);
+        for u in &mut plan.upgrade {
+            u.security |= security.contains(&u.name);
+        }
+        let (done, elevated) = run_as_root(policy, m, command(m, action, &only, false))?;
+        let ok = finished_ok(m, &done);
+        let pairs = |list: &[(String, String)]| list.iter().map(|(n, v)| json!({ "name": n, "version": v })).collect::<Vec<_>>();
         let mut out = json!({
-            "ok": done.success(),
-            "manager": p.m.name(),
+            "ok": ok,
+            "manager": m.name(),
             "elevated": elevated,
             "duration_secs": done.duration.as_secs(),
+            "kept_back": plan.kept_back,
             "output": tail(&done.stdout),
         });
-        if let Some(plan) = &p.plan {
-            if done.success() {
-                out["upgraded"] = json!(plan.upgrade.iter().map(Update::json).collect::<Vec<_>>());
-                out["installed"] = json!(plan.install.iter().map(|(n, v)| json!({ "name": n, "version": v })).collect::<Vec<_>>());
-                out["removed"] = json!(plan.remove.iter().map(|(n, v)| json!({ "name": n, "version": v })).collect::<Vec<_>>());
+        if ok {
+            out["upgraded"] = json!(plan.upgrade.iter().map(Update::json).collect::<Vec<_>>());
+            out["installed"] = json!(pairs(&plan.install));
+            out["removed"] = json!(pairs(&plan.remove));
+            if m == Manager::Zypper && done.status.code() == Some(103) {
+                out["message"] = json!("zypper updated itself first; run update_apply again for the rest");
             }
-            out["kept_back"] = json!(plan.kept_back);
-        }
-        if !done.success() {
+        } else {
             out["error"] = json!(complaint(&done));
         }
-        if let Value::Object(after) = after_effects() {
-            out.as_object_mut().unwrap().extend(after);
-        }
+        merge(&mut out, after_effects(m));
         Ok(out)
     }
 }
@@ -652,24 +1044,46 @@ mod tests {
         assert!(apt[0].security);
         assert!(!apt[1].security);
 
-        let security = parse_dnf_security("FEDORA-2024-1a2b3c Important/Sec. curl-8.6.0-1.fc40.x86_64\n");
-        assert_eq!(security, BTreeSet::from(["curl".to_string()]));
+        // dnf4, then dnf5 (as Fedora 44 prints it).
+        let dnf4 = parse_dnf_security("FEDORA-2024-1a2b3c Important/Sec. curl-8.6.0-1.fc40.x86_64\n");
+        let dnf5 = parse_dnf_security(
+            "Name         Type     Severity                 Package              Issued\n\
+             ORION-2026-1 security Important orion-sec-1.1-1.noarch 2026-10-01 00:00:00\n",
+        );
+        assert_eq!(dnf4, BTreeSet::from(["curl".to_string()]));
+        assert_eq!(dnf5, BTreeSet::from(["orion-sec".to_string()]));
         let dnf = parse_dnf_updates(
-            "\ncurl.x86_64        8.6.0-1.fc40       updates\nkernel-core.x86_64 6.9.4-200.fc40 updates\n\
+            "Upgrades\ncurl.x86_64        8.6.0-1.fc40       updates\nkernel-core.x86_64 6.9.4-200.fc40 updates\n\
              Obsoleting Packages\ngrub2-tools.x86_64 1:2.06-1 updates\n",
-            &security,
+            &dnf4,
         );
         assert_eq!(dnf.len(), 2);
         assert!(dnf[0].security && !dnf[1].security);
         assert!(kernel_package(&dnf[1].name));
 
+        let zypper = parse_zypper_updates(
+            r#"<update-list><update kind="package" name="orion-sec" edition="1.1-1" arch="noarch" edition-old="1.0-1"><summary>x</summary><source url="file:/t/repo" alias="orion-test"/></update><update kind="patch" name="P-1" edition="1"/></update-list>"#,
+            &BTreeSet::from(["orion-sec".to_string()]),
+        );
+        assert_eq!(zypper.len(), 1);
+        assert_eq!((zypper[0].from.as_deref(), zypper[0].to.as_str(), zypper[0].origin.as_str()), (Some("1.0-1"), "1.1-1", "orion-test"));
+        assert!(zypper[0].security);
+        let fixed = parse_zypper_patch_packages(
+            "Name        : ORION-2026-1\nProvides    : patch:ORION-2026-1 = 1\nConflicts   : orion-sec < 1.1-1\n\
+             \x20             libfoo1.x86_64 < 2.0\nSummary     : x\n",
+        );
+        assert_eq!(fixed, BTreeSet::from(["orion-sec".to_string(), "libfoo1".to_string()]));
+
         let pac = parse_pacman_updates("curl 8.5.0-1 -> 8.6.0-1\nlinux 6.9.1.arch1-1 -> 6.9.2.arch1-1\n");
         assert_eq!(pac[1], Update { name: "linux".into(), from: Some("6.9.1.arch1-1".into()), to: "6.9.2.arch1-1".into(), ..Default::default() });
+        let replaces = parse_pacman_replaces("Name            : orion-new\nReplaces        : orion-old>=1 other\n\nName            : x\nReplaces        : None\n");
+        assert_eq!(replaces["orion-new"], ["orion-old", "other"]);
+        assert!(replaces["x"].is_empty());
     }
 
     #[test]
-    fn parses_upgrade_simulation() {
-        let plan = parse_apt_upgrade(
+    fn parses_dry_runs() {
+        let plan = parse_apt_plan(
             "Reading package lists...\n\
              The following packages have been kept back:\n  docker-ce docker-ce-cli\n\
              The following packages will be upgraded:\n  curl fonts-opensymbol\n\
@@ -687,6 +1101,78 @@ mod tests {
         assert!(plan.upgrade[1].security);
         assert_eq!(plan.install, [("linux-image-6.8.0-50-generic".into(), "6.8.0-50.51".into())]);
         assert_eq!(plan.remove, [("oldlib".into(), "1.0".into())]);
+
+        // dnf5, as Fedora 44 prints it: orion-new obsoletes orion-old.
+        let dnf5 = parse_dnf_transaction(
+            "Updating and loading repositories:\nRepositories loaded.\n\
+             Package                 Arch   Version Repository      Size\n\
+             Upgrading:\n \
+             orion-demo             noarch 0:2.0-1 orion-test   4.0   B\n   \
+               replacing orion-demo noarch 0:1.0-1 <unknown>    4.0   B\n\
+             Installing:\n \
+             orion-new              noarch 0:2.0-1 orion-test   4.0   B\n   \
+               replacing orion-old  noarch 0:1.0-1 <unknown>    4.0   B\n\
+             \nTransaction Summary:\n Installing:         1 package\n",
+        );
+        assert_eq!(dnf5.upgrade.len(), 1);
+        assert_eq!((dnf5.upgrade[0].from.as_deref(), dnf5.upgrade[0].to.as_str()), (Some("1.0-1"), "2.0-1"));
+        assert_eq!(dnf5.install, [("orion-new".into(), "2.0-1".into())]);
+        assert_eq!(dnf5.remove, [("orion-old".into(), "1.0-1".into())]);
+        // dnf4.
+        let dnf4 = parse_dnf_transaction(
+            " Package        Arch     Version        Repository   Size\n\
+             ==========\nUpgrading:\n curl           x86_64   8.6.0-1.fc40   updates     300 k\n\
+             Installing:\n orion-new      noarch   2.0-1          test          6 k\n     \
+             replacing  orion-old.noarch 1.0-1\n\
+             Removing dependent packages:\n foo            x86_64   1.0-1          @System      10 k\n\
+             \nTransaction Summary\n",
+        );
+        assert_eq!(dnf4.upgrade[0].name, "curl");
+        assert_eq!(dnf4.remove, [("orion-old".into(), "1.0-1".into()), ("foo".into(), "1.0-1".into())]);
+
+        let zypper = parse_zypper_plan(
+            r#"<stream><install-summary packages-to-change="4"><to-upgrade>
+<solvable type="package" name="orion-sec" edition="1.1-1" arch="noarch" repository="orion-test" edition-old="1.0-1" arch-old="noarch" summary="x">
+<description>Test package.</description></solvable>
+</to-upgrade><to-install>
+<solvable type="package" name="orion-new" edition="2.0-1" arch="noarch" repository="orion-test" summary="x">
+<solvable type="patch" name="ORION-2026-1" edition="1" arch="noarch" repository="orion-test" summary="x"/>
+</to-install><to-remove>
+<solvable type="package" name="orion-old" edition="1.0-1" arch="noarch" repository="@System" summary="x &amp; y">
+</to-remove></install-summary></stream>"#,
+        );
+        assert_eq!(zypper.upgrade[0].from.as_deref(), Some("1.0-1"));
+        assert_eq!(zypper.install, [("orion-new".into(), "2.0-1".into())]);
+        assert_eq!(zypper.remove, [("orion-old".into(), "1.0-1".into())]);
+    }
+
+    #[test]
+    fn builds_commands() {
+        let pkgs = ["curl".to_string()];
+        let up = |security_only, full| Action::Upgrade { security_only, full };
+        assert_eq!(command(Manager::Apt, up(false, false), &[], true), ["apt-get", "-s", "upgrade", "--with-new-pkgs"]);
+        assert_eq!(command(Manager::Apt, up(false, false), &pkgs, true), ["apt-get", "-s", "install", "--only-upgrade", "--", "curl"]);
+        assert_eq!(command(Manager::Dnf, up(true, false), &[], true), ["dnf", "--assumeno", "upgrade", "--security"]);
+        assert_eq!(command(Manager::Dnf, Action::Remove, &pkgs, false), ["dnf", "-y", "-q", "remove", "--", "curl"]);
+        assert_eq!(
+            command(Manager::Zypper, up(true, false), &[], true),
+            ["zypper", "-n", "--xmlout", "patch", "--category", "security", "--dry-run"]
+        );
+        assert_eq!(command(Manager::Zypper, up(false, false), &pkgs, false), ["zypper", "-n", "update", "--", "curl"]);
+        assert_eq!(command(Manager::Pacman, Action::Install, &pkgs, false), ["pacman", "-S", "--needed", "--noconfirm", "--", "curl"]);
+        assert_eq!(command(Manager::Pacman, up(false, false), &[], false), ["pacman", "-Syu", "--noconfirm"]);
+    }
+
+    #[test]
+    fn guards_removals() {
+        let p = Policy::from_toml("").unwrap();
+        let plan = |names: &[&str]| Plan { remove: names.iter().map(|n| (n.to_string(), String::new())).collect(), ..Default::default() };
+        assert!(guard_removals(&p, Manager::Dnf, &plan(&[]), false).is_ok());
+        let err = guard_removals(&p, Manager::Dnf, &plan(&["orion-old"]), false).unwrap_err();
+        assert!(format!("{err:#}").contains("set full"), "{err:#}");
+        assert!(guard_removals(&p, Manager::Dnf, &plan(&["orion-old"]), true).is_ok());
+        let err = guard_removals(&p, Manager::Dnf, &plan(&["systemd-udev"]), true).unwrap_err();
+        assert!(format!("{err:#}").contains("protected"), "{err:#}");
     }
 
     #[test]
@@ -717,7 +1203,7 @@ mod tests {
         assert!(!granted(&p("security"), json!({})));
         assert!(granted(&p("all"), json!({ "packages": ["curl"] })));
         assert!(!granted(&p("all"), json!({ "full": true })));
-        assert!(!granted(&p("sometimes"), json!({})));
+        assert!(matches!(UpdateApply.preapproval(&p("sometimes"), &json!({})), Preapproval::Refused(_)));
     }
 
     #[test]
