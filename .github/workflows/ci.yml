@@ -1,0 +1,58 @@
+# Orion's checks: lint, tests, the oldest supported Rust, and the package
+# and update tools against Fedora, openSUSE and Arch in Docker.
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"        # nightly, to catch breakage from new distro releases
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System packages the tests use
+        run: sudo apt-get update -q && sudo apt-get install -y -q bubblewrap
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+
+  msrv:
+    name: Oldest supported Rust (1.95)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+
+  distros:
+    name: Package tools on Fedora, openSUSE and Arch
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools to build the test repositories
+        run: sudo apt-get update -q && sudo apt-get install -y -q rpm createrepo-c zstd
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: tests/distros/run.sh
