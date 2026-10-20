@@ -61,7 +61,7 @@ protected = ["sudo", "systemd", "systemd-*", "openssh-server", "openssh", "linux
              "kernel-core", "kernel-default", "bubblewrap", "apt", "dnf", "zypper", "pacman", "dpkg", "rpm", "glibc",
              "libc6", "bash"]
 # update_apply runs that need no approval: "ask" (none), "security" (security-only
-# updates) or "all". An update that would remove packages always asks.
+# updates) or "all". Never an update with full = true, which may remove packages.
 updates = "ask"
 timeout_secs = 900
 
