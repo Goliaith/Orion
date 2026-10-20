@@ -1,0 +1,361 @@
+# Installing Orion
+
+This guide takes a Linux machine from nothing to a working Orion: building it, giving it a model to talk to, the optional parts (sandbox, voice, the graphical shell, network and disk tools), root access for the machine tools, and running it as a service. [Operating Orion](operating.md) covers using it day to day.
+
+- [What you need](#what-you-need)
+- [1. Build and install](#1-build-and-install)
+- [2. Check it works](#2-check-it-works)
+- [3. Write a policy](#3-write-a-policy)
+- [4. Connect a model](#4-connect-a-model)
+- [5. Optional parts](#5-optional-parts)
+- [6. Root access for the machine tools](#6-root-access-for-the-machine-tools)
+- [7. Run it as a service](#7-run-it-as-a-service)
+- [8. Connect other AI agents (MCP)](#8-connect-other-ai-agents-mcp)
+- [Upgrading](#upgrading)
+- [Uninstalling](#uninstalling)
+
+## What you need
+
+| | Required | Notes |
+|---|---|---|
+| Linux | yes | Any distribution. The tools read `/proc` and `/sys` directly, so Orion doesn't build or run on macOS or Windows. |
+| Rust 1.95 or newer | to build | Older compilers stop with "rustc … is not supported". Distribution packages are often older; [rustup](https://rustup.rs) always works. |
+| A C compiler | to build | One dependency (`ring`, for TLS) compiles C. |
+| A model | to chat | Claude (an API key), a model on this machine (Ollama, llama.cpp, vLLM or LM Studio), or both. |
+| systemd | for some tools | The service tools, `gpu_assign` and the service units in `contrib/`. Everything else works without it. |
+
+What works on which distribution:
+
+| | Debian, Ubuntu | Fedora, RHEL 8+ | openSUSE, SLES | Arch |
+|---|---|---|---|---|
+| Package and update tools | apt | dnf | zypper | pacman |
+| Tested on | Ubuntu 24.04 | Fedora 44 | Tumbleweed | Arch |
+
+Other distributions (Alpine, Void, Gentoo, NixOS, image-based systems such as Fedora Silverblue) run everything except the package and update tools. The network tools need NetworkManager, and the firewall tools ufw or firewalld.
+
+## 1. Build and install
+
+Install the build tools. Pick your distribution:
+
+```sh
+sudo apt install build-essential git curl        # Debian, Ubuntu
+sudo dnf install gcc git curl                    # Fedora, RHEL
+sudo zypper install gcc git curl                 # openSUSE
+sudo pacman -S --needed base-devel git curl      # Arch
+```
+
+Install Rust with rustup, unless `rustc --version` already says 1.95 or newer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+Get the source and install the `orion` binary:
+
+```sh
+git clone https://github.com/Goliaith/Orion.git
+cd Orion
+cargo install --path .        # builds a release binary into ~/.cargo/bin/orion
+```
+
+That is one self-contained binary, about 11 MB. `~/.cargo/bin` is on your `PATH` after rustup's setup. The systemd units in `contrib/` expect it there.
+
+To install it for every user instead:
+
+```sh
+cargo build --release
+sudo install -m 755 target/release/orion /usr/local/bin/orion
+```
+
+If you do that, change `ExecStart=%h/.cargo/bin/orion` to `ExecStart=/usr/local/bin/orion` in the units you copy from `contrib/`.
+
+To run the tests (optional, about a minute):
+
+```sh
+cargo test
+```
+
+## 2. Check it works
+
+```sh
+orion --version
+orion tools
+```
+
+`orion tools` lists every tool, its risk level and what the policy decides for it, and ends with the sandbox it will use:
+
+```
+TOOL         RISK     POLICY DESCRIPTION
+system_info  read     allow  Describe this machine: hostname, OS, kernel, CPU, memory, load average and uptime
+…
+programs run sandboxed: bubblewrap, read-only outside the writable roots, private paths hidden, no network, no GPU
+```
+
+Call a tool yourself, exactly as the AI would:
+
+```sh
+orion call system_info
+orion call disk_list
+orion call update_check '{"refresh": false}'
+```
+
+No model is involved yet. These are the same tools, policy and audit log the AI gets.
+
+## 3. Write a policy
+
+Orion works with no policy file: the AI may look at the machine, and anything that changes it asks you first. To change that, start from the example:
+
+```sh
+mkdir -p ~/.config/orion
+cp orion.example.toml ~/.config/orion/orion.toml
+```
+
+Every key in it is optional, and the values shown are the defaults. Orion reads `~/.config/orion/orion.toml`, or the file in `ORION_CONFIG`, or the one given with `--config`. A misspelled key is an error, so a typo can't silently do nothing. Run `orion tools` after each edit to see the result.
+
+Settings worth deciding on now:
+
+- **`[fs] write_roots`**: where the AI may write files. The default is `~/orion-workspace`.
+- **`[proc] allowed_commands`**: programs the AI may run without asking, such as `["df", "free", "uname", "git"]`.
+- **`[packages] updates`**: `"security"` lets security updates install without asking.
+- **`[chat] provider`**: `"auto"` (route each message), `"claude"` or `"local"`.
+
+[Operating Orion](operating.md#tuning-the-policy) has ready-made policies for common setups.
+
+## 4. Connect a model
+
+You need at least one. With both, Orion routes each message: private and simple work stays on this machine, complex work goes to Claude.
+
+### Claude
+
+Create an API key at [console.anthropic.com](https://console.anthropic.com) and export it:
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+orion chat --claude
+```
+
+Put the `export` line in your shell profile to keep it. For the services in step 7, put it in `~/.config/orion/env` instead (one `VAR=value` per line), readable only by you:
+
+```sh
+install -m 600 /dev/null ~/.config/orion/env
+echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.config/orion/env
+```
+
+`ANTHROPIC_AUTH_TOKEN` (an OAuth access token) works in place of a key, and `ANTHROPIC_BASE_URL` points Orion at a different endpoint. The model is `claude-opus-5-5` unless you set `[chat.claude] model`.
+
+### A model on this machine
+
+Any server with the OpenAI-compatible chat API works. Ollama is the simplest:
+
+```sh
+curl -fsSL https://ollama.com/install.sh | sh     # installs and starts the Ollama service
+ollama pull qwen3:8b
+orion chat --local
+```
+
+- **Pick a model trained for tool calling:** Qwen3, Llama 3.1+, Mistral Small 3 or gpt-oss. Models under about 7B often call tools badly.
+- **Give it room:** Orion's tools fill a small context window fast. For Ollama, set `OLLAMA_CONTEXT_LENGTH=32768` in its service environment (`sudo systemctl edit ollama`, then `Environment=OLLAMA_CONTEXT_LENGTH=32768` under `[Service]`).
+- **Other servers:** point `[chat.local] base_url` at them. llama.cpp's `llama-server --jinja` is on `http://127.0.0.1:8080/v1`, vLLM on `:8000/v1`, LM Studio on `:1234/v1`.
+- **A small judge for routing:** `[chat.router] classifier_model = "qwen3:1.7b"` makes automatic routing faster. Pull it with `ollama pull qwen3:1.7b`.
+
+### Check
+
+```sh
+orion chat
+```
+
+The header names the models it found. With neither, it says what is missing:
+
+```
+Error: no Claude credentials: set ANTHROPIC_API_KEY (from console.anthropic.com), … Or run a local model with `orion chat --local`
+asking http://127.0.0.1:11434/v1 for its models: cannot connect to http://127.0.0.1:11434/v1: is the server running?
+```
+
+## 5. Optional parts
+
+Each part is independent. Install what you'll use.
+
+### The sandbox
+
+Programs the AI starts with `proc_run` always run confined. With bubblewrap installed the confinement is strongest (no network, no GPU, private paths gone). Without it, Orion uses the kernel's Landlock (Linux 5.13+), or limits only.
+
+```sh
+sudo apt install bubblewrap        # dnf / zypper / pacman: bubblewrap
+orion tools | tail -1              # which sandbox is in use
+```
+
+If it says Landlock although bubblewrap is installed, bubblewrap couldn't create its namespaces here; see [Troubleshooting](operating.md#troubleshooting). Set `[sandbox] require = true` to refuse to run programs with limits only.
+
+### Voice
+
+Voice needs three things on this machine: a microphone recorder, speech to text, and text to speech. `/voice` in the chat shows what Orion found.
+
+| Part | Install | Orion uses |
+|---|---|---|
+| Microphone | `pulseaudio-utils` (Arch: `libpulse`) for `parecord`, or `alsa-utils` for `arecord`, or `sox` or `ffmpeg` | the first one it finds, or `[voice] record_command` |
+| Speech to text | an OpenAI-compatible transcription server on `http://127.0.0.1:8000/v1`, such as [speaches](https://github.com/speaches-ai/speaches), LocalAI or whisper.cpp's server; or whisper.cpp's `whisper-cli` as a command | `[voice] transcribe_url` and `transcribe_model`, or `transcribe_command` |
+| Text to speech | `espeak-ng` (or `espeak`, `spd-say`); or [piper](https://github.com/rhasspy/piper); or a speech server such as Kokoro-FastAPI | the first one it finds, or `speak_command` / `speak_url` |
+
+With whisper.cpp and no server, for example:
+
+```toml
+[voice]
+transcribe_command = "whisper-cli -m ~/models/ggml-base.en.bin -nt -np -f {wav}"
+```
+
+Speaker verification, so only enrolled voices can wake Orion:
+
+```sh
+orion voice model install     # the neural speaker model, about 16 MB from PyPI, once
+orion voice enroll            # you: six short phrases
+orion voice enroll --name ana # anyone else
+orion voice test
+```
+
+On a machine without internet, download the Resemblyzer 0.1.4 wheel elsewhere and use `orion voice model install --from <file>`.
+
+### The graphical shell
+
+`orion shell` needs only a browser on the same machine. To make Orion the whole desktop, install the `cage` kiosk compositor and Chromium (or Firefox), then run `contrib/orion-kiosk` as the session:
+
+```sh
+sudo apt install cage chromium-browser     # Fedora, openSUSE, Arch: cage chromium
+sudo install -m 755 contrib/orion-kiosk /usr/local/bin/orion-kiosk
+cage -- orion-kiosk                        # from a TTY login or a display manager session
+```
+
+`orion-kiosk` runs `orion` from the `PATH`, so the session needs `~/.cargo/bin` on it (or the binary in `/usr/local/bin`).
+
+### Network, firewall, disks and GPUs
+
+| Tools | Need |
+|---|---|
+| `net_connections`, `wifi_scan`, `wifi_connect`, `net_connection` | NetworkManager (`nmcli`) |
+| `fw_status`, `fw_rule`, `fw_enable` | ufw or firewalld |
+| `disk_mount`, `disk_unmount` | `mount`, or udisks2 for desktop-style mounts without root |
+| `gpu_info` on NVIDIA | the NVIDIA driver's `nvidia-smi`. AMD and Intel need nothing extra. |
+| `model_load`, `model_pull` | Ollama |
+
+Tools whose program is missing report that when called. The others still work.
+
+## 6. Root access for the machine tools
+
+Installing packages and updates, controlling system services, changing the network or firewall, mounting disks and pinning GPUs need root. Orion never asks for your password itself. It gets root one of four ways, set by `[admin] elevate`:
+
+| `elevate` | How |
+|---|---|
+| `"auto"` (default) | Nothing extra when Orion runs as root. Otherwise system services and NetworkManager are tried directly first (polkit may allow them), and the rest use `sudo -n`. |
+| `"sudo"` | Always `sudo -n`: it works only with a passwordless sudoers rule, and fails at once without one. |
+| `"pkexec"` | polkit's password dialog, for a desktop session. |
+| `"none"` | Never. Those tools then fail unless Orion runs as root. |
+
+**With sudo**, add a sudoers rule for the programs you want the AI to be able to run, with `sudo visudo -f /etc/sudoers.d/orion`. Replace `you` with your login name and keep only the lines you need:
+
+```
+# Packages and updates (Debian/Ubuntu: Orion runs apt-get through env)
+you ALL=(root) NOPASSWD: /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get *
+# Fedora: /usr/bin/dnf *    openSUSE: /usr/bin/zypper *    Arch: /usr/bin/pacman *
+# System services, and the GPU pins gpu_assign writes as systemd drop-ins
+you ALL=(root) NOPASSWD: /usr/bin/systemctl *
+you ALL=(root) NOPASSWD: /usr/bin/mkdir -p -- /etc/systemd/system/*, /usr/bin/tee -- /etc/systemd/system/*/50-orion-gpu.conf, /usr/bin/rm -f -- /etc/systemd/system/*/50-orion-gpu.conf
+# Network and firewall
+you ALL=(root) NOPASSWD: /usr/bin/nmcli *, /usr/sbin/ufw *
+# Disks (without udisks2)
+you ALL=(root) NOPASSWD: /usr/bin/mkdir -p -- /mnt/*, /usr/bin/mkdir -p -- /media/*, /usr/bin/mount -o *, /usr/bin/umount -- *, /usr/bin/eject -- *
+```
+
+Check the paths on your system with `command -v apt-get systemctl nmcli ufw`.
+
+**Know what this grants.** Orion checks every request against its policy and protected lists before it runs anything. But a passwordless rule for a package manager or `systemctl` lets *anything running as your user* become root, not only Orion: a package manager can run any script, and `systemctl` can start any unit. On a shared or exposed machine, prefer `"pkexec"`, narrow polkit rules, or no root access at all.
+
+**Running the daemon with the hardened service unit?** `contrib/orion.service` sets `NoNewPrivileges=yes`, which stops sudo and pkexec from working inside it. Remove that line if you want the daemon's tools to use sudo; see [step 7](#7-run-it-as-a-service).
+
+## 7. Run it as a service
+
+Three user services come in `contrib/`. Each reads variables such as `ANTHROPIC_API_KEY` from `~/.config/orion/env`.
+
+```sh
+mkdir -p ~/.config/systemd/user
+```
+
+**The daemon**, so every AI agent on the machine shares one policy, audit log and sandbox. systemd holds the socket and starts the daemon on the first connection:
+
+```sh
+cp contrib/orion.socket contrib/orion.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now orion.socket
+orion status
+```
+
+**Headless voice** (`orion listen`): a voice assistant with no screen.
+
+```sh
+cp contrib/orion-voice.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now orion-voice.service
+journalctl --user -u orion-voice -f
+```
+
+**The graphical shell** in the background. Its address, with this run's token, is in `~/.local/state/orion/shell-url`:
+
+```sh
+cp contrib/orion-shell.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now orion-shell.service
+cat ~/.local/state/orion/shell-url
+```
+
+User services stop when you log out. To keep them running without a login session (on a server, or for headless voice):
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+## 8. Connect other AI agents (MCP)
+
+Any MCP client can use Orion's tools by launching `orion serve`. For Claude Code:
+
+```sh
+claude mcp add orion -- ~/.cargo/bin/orion serve
+```
+
+In a client's JSON configuration:
+
+```json
+{ "mcpServers": { "orion": { "command": "/home/you/.cargo/bin/orion", "args": ["serve"] } } }
+```
+
+With no human at the keyboard, `ask` means no: an MCP client is offered only the tools the policy sets to `allow`. When the daemon runs, `orion serve` connects to it, so every client shares it, and the audit log names each one.
+
+## Upgrading
+
+```sh
+cd Orion
+git pull
+cargo install --path . --force
+systemctl --user restart orion.service orion-voice.service orion-shell.service 2>/dev/null
+```
+
+Your policy, conversations, memory, voiceprints and audit log are kept. A new version may refuse a setting it no longer knows; the error names it.
+
+## Uninstalling
+
+```sh
+systemctl --user disable --now orion.socket orion.service orion-voice.service orion-shell.service 2>/dev/null
+rm -f ~/.config/systemd/user/orion*.service ~/.config/systemd/user/orion.socket
+cargo uninstall orion                       # or: sudo rm /usr/local/bin/orion
+```
+
+That leaves your data. To remove it too:
+
+| Path | What |
+|---|---|
+| `~/.config/orion/` | the policy and the `env` file |
+| `~/.local/state/orion/` | conversations, memory, voiceprints, the audit log, chat history, the shell's address |
+| `~/.local/share/orion/` | the neural speaker model |
+| `~/orion-workspace/` | files the AI wrote (the default write root) |
+| `/etc/sudoers.d/orion` | the sudoers rule, if you made one |
+| `/etc/systemd/system/*.d/50-orion-gpu.conf` | GPU pins made by `gpu_assign`; remove them with `gpu_assign` and an empty list first |
+
+Packages Orion installed, firewall rules it added (commented "added by Orion" in ufw) and Wi-Fi networks it joined stay as they are.

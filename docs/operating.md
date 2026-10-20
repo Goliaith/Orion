@@ -1,0 +1,481 @@
+# Operating Orion
+
+How to use Orion day to day, keep it in check, and fix it when something goes wrong. [Installing Orion](install.md) gets it running first. The [README](../README.md) describes each feature in depth.
+
+- [How Orion works](#how-orion-works)
+- [Ways to use it](#ways-to-use-it)
+- [Approvals](#approvals)
+- [Tuning the policy](#tuning-the-policy)
+- [Looking after the machine](#looking-after-the-machine)
+- [The audit log](#the-audit-log)
+- [Conversations and memory](#conversations-and-memory)
+- [Voice](#voice)
+- [The daemon](#the-daemon)
+- [Files and settings](#files-and-settings)
+- [Troubleshooting](#troubleshooting)
+- [Security checklist](#security-checklist)
+
+## How Orion works
+
+A model never touches the machine directly. It asks `orion` to call a tool, such as `disk_list` or `update_apply`, and every call goes through the same four steps:
+
+1. **The policy decides:** `allow` (run it), `ask` (stop and ask you) or `deny` (the tool isn't even offered). Decisions are per risk level (`read`, `write`, `execute`) with per-tool overrides.
+2. **Hard checks run first.** Some things no approval can override: files outside the writable roots, protected services and packages, the system's own mounts, firewall rules that would lock out SSH. Those calls fail before you're asked.
+3. **The tool runs.** Programs the AI asks for (`proc_run`) run in the sandbox. The machine tools run fixed commands with checked arguments, as root where they need it.
+4. **The call is logged**, with its arguments (secrets blanked), the decision, your answer and the result.
+
+Out of the box the AI can look at anything readable and change nothing without asking.
+
+## Ways to use it
+
+| Command | What it is | Approvals |
+|---|---|---|
+| `orion chat` | The chat, full screen in a terminal (`--plain` for line by line) | asked in the conversation |
+| `orion shell` | The same chat as a local web page, for a browser or a kiosk | approval cards |
+| `orion listen` | Voice only: "Orion, …", answered aloud | spoken, if `wake_approvals = true`; otherwise declined |
+| `orion serve` | The tools over MCP, for other AI agents | none: `ask` acts as `deny` |
+| `orion call <tool> '<json>'` | One tool call by hand, as the AI would make it | asked in the terminal |
+
+`orion chat`, `orion shell` and `orion listen` all take `--auto` (the default), `--claude` or `--local`, `--model <id>` and `--resume [id]`.
+
+### In the chat
+
+Type what you want in plain words: "what's using my disk?", "are there security updates?", "mount the USB drive". The AI picks the tools, and you see each call and its result as it happens.
+
+| Command | |
+|---|---|
+| `@claude …`, `@local …` | send one message to that model |
+| `/use auto\|claude\|local` | route automatically, or pin a model |
+| `/route <text>` | show where a message would go |
+| `/model [claude\|local] [id]`, `/models` | show or switch models; list the local server's |
+| `/effort <level>` | Claude's effort: low, medium, high, xhigh, max |
+| `/tools` | what the AI can do, and what needs your approval |
+| `/usage` | tokens used this session |
+| `/new`, `/history`, `/resume <n\|id>`, `/title <text>` | conversations |
+| `/memory [forget <id>\|clear]` | what the AI remembers about this person |
+| `/voice [speak on\|off\|test]`, `/voice wake on\|off` | voice |
+| `/keys`, `/exit` | the hotkeys; leave |
+
+| Key | |
+|---|---|
+| Ctrl-C | stop the AI mid-turn (twice at the prompt: quit) |
+| Shift-Tab | cycle routing: auto, claude, local |
+| Ctrl-T | talk; your words land in the message box |
+| Alt-W | wake-word listening on or off |
+| Ctrl-O | show or hide reasoning |
+| Ctrl-B | the machine panel (full screen) |
+| Alt-Enter, Ctrl-J | new line |
+| PgUp, PgDn, End | scroll; jump to the latest |
+| Ctrl-R, ↑ ↓ | search and browse earlier messages |
+| Ctrl-D | quit |
+
+### Routing between Claude and the local model
+
+In `auto`, each message goes to one model, and Orion shows which and why:
+
+1. **Private messages stay local:** passwords, banking, health, keys and tokens, and anything mentioning a `private_paths` entry (`~/.ssh`, `~/.gnupg`, …). With no local model, Orion asks before sending one to Claude.
+2. **Short follow-ups** ("yes, go ahead") stay with the model that answered last.
+3. **The local model judges the rest** for difficulty; keyword rules decide if it can't.
+4. **If the chosen model fails, the other answers**, except that private messages never go to Claude.
+
+Claude's tool calls that touch a private path are refused, whatever the policy allows.
+
+## Approvals
+
+When a call needs approval, Orion shows the tool and its full arguments:
+
+```
+  ? Approve update_apply?
+    { "security_only": true }
+  [y]es / [n]o / [a]lways for this session › y
+```
+
+- **`y`** runs this call; **`n`** declines it, and the AI is told; **`a`** approves this tool for the rest of the session.
+- **Ctrl-C** at the prompt counts as no.
+- **Hard checks come first**, so you're never asked about a call that would be refused anyway.
+- **Read the arguments.** A `proc_run` shows the exact program and arguments; an `fs_write` the path and content; a `pkg_install` the package names. Unknown packages and impossible updates fail before the prompt.
+
+To stop being asked about something routine, pre-approve it in the policy rather than answering `a` each session.
+
+## Tuning the policy
+
+The policy is `~/.config/orion/orion.toml`. Start from [`orion.example.toml`](../orion.example.toml), which lists every setting with its default. After an edit:
+
+```sh
+orion tools        # every tool and its decision, and the sandbox
+```
+
+The daemon picks up edits within two seconds; `orion chat` and `orion shell` read the policy when they start.
+
+### Ready-made policies
+
+Each of these is a complete file. Combine them as you like.
+
+**Look, don't touch.** The AI can only read:
+
+```toml
+[defaults]
+read = "allow"
+write = "deny"
+execute = "deny"
+```
+
+**A trusted helper.** Routine work runs without asking, everything else asks:
+
+```toml
+[proc]
+allowed_commands = ["df", "free", "uname", "uptime", "lsblk", "nvidia-smi", "git", "journalctl"]
+
+[services]
+allowed = ["ollama.service", "llama-server.service"]   # svc_control may restart these without asking
+
+[packages]
+allowed = ["python3-*", "jq", "htop"]   # pkg_install without asking
+updates = "security"                    # security updates without asking
+
+[tools]
+fs_write = "allow"                      # still only inside [fs] write_roots
+```
+
+**A shared workspace.** Let the AI read and write one project, and nothing else of yours:
+
+```toml
+[fs]
+read_roots = ["~/projects/website"]
+write_roots = ["~/projects/website"]
+```
+
+**An unattended agent over MCP.** With no human present, `ask` means no, and an MCP client is offered only the tools set to `allow`. Allow exactly what it should do:
+
+```toml
+[tools]
+svc_control = "deny"        # look at services, never change them
+fs_write = "allow"          # still only inside [fs] write_roots
+proc_run = "allow"          # only the commands below
+
+[proc]
+allowed_commands = ["git", "make", "cargo"]
+```
+
+Be careful with `allow` on the machine tools. `pkg_install` on `allow` installs only what `[packages] allowed` lists, but `update_apply` on `allow` runs any update the agent asks for, including `full: true`; `[packages] updates` only skips the prompt, it doesn't limit an allowed tool. For unattended security updates, use [a scheduled job](#scheduled-security-updates) instead.
+
+**Strict sandbox.** Programs get no network and no GPU (the default), and nothing runs without bubblewrap or Landlock:
+
+```toml
+[sandbox]
+require = true
+memory_mb = 4096
+cpu_secs = 120
+```
+
+**A child's voice.** Someone enrolled as `kid` may ask questions and have the AI look things up, but not change anything or answer approvals:
+
+```toml
+[voice.people.kid]
+tools = "read"
+approve = false
+```
+
+### What no policy can change
+
+- Files outside `[fs] write_roots` can't be written, and outside the readable roots can't be read. Paths are resolved first, so `..` and symlinks don't escape.
+- Protected services (`[services] protected`: ssh, networking, the display manager, systemd itself, Orion) can't be controlled.
+- Protected and essential packages can't be removed, by `pkg_remove` or by an update.
+- The system's mounts (`/`, `/boot`, `/home`, …) can't be unmounted.
+- Firewall changes that would cut off an SSH session into the machine are refused, and so is taking down the connection one runs over.
+- Programs started by `proc_run` can't see your keys, Orion's state or its policy.
+
+You can extend the protected lists in the policy. Shortening them is possible, so do it with care.
+
+## Looking after the machine
+
+You can ask for all of this in the chat; the calls below show the tools directly. Each `orion call` here is also exactly what the AI runs.
+
+### Updates
+
+```sh
+orion call update_check                                   # pending updates, security fixes first, reboot needed?
+orion call update_apply '{"security_only": true}'         # only security fixes
+orion call update_apply '{"packages": ["openssl"]}'       # only these packages
+orion call update_apply                                   # everything that removes nothing
+orion call update_apply '{"full": true}'                  # also updates that remove or replace packages
+```
+
+- **Nothing is removed unless you say `full`.** On apt such updates are held back and listed under `kept_back`. On dnf, zypper and pacman the update is refused and names what it would remove.
+- **After an update**, the result lists services still running replaced code (`restart_services`), other processes (`restart_processes`) and whether to reboot, and why (`reboot_reasons`). Restart services with `svc_control`; Orion never reboots the machine.
+- **Arch** upgrades everything or nothing, and has no security labels.
+- **openSUSE Tumbleweed** is upgraded with `zypper dist-upgrade`.
+
+A routine that works well: security fixes install on a schedule (below); you ask "check for updates" now and then and review the rest.
+
+#### Scheduled security updates
+
+With `[packages] updates = "security"` and `update_apply` left at `ask`, a security-only update needs no approval, and any other update still does. With nobody to ask, "any other" means refused. That makes a timer safe: it can install security fixes and nothing else.
+
+As root, write a policy for it, `/etc/orion/updates.toml`:
+
+```toml
+[packages]
+updates = "security"
+
+[audit]
+path = "/var/log/orion-updates.jsonl"
+```
+
+Then `/etc/systemd/system/orion-updates.service`:
+
+```ini
+[Unit]
+Description=Orion: install security updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/orion call --config /etc/orion/updates.toml update_check
+ExecStart=/usr/local/bin/orion call --config /etc/orion/updates.toml update_apply '{"security_only": true}'
+```
+
+And `/etc/systemd/system/orion-updates.timer`:
+
+```ini
+[Unit]
+Description=Orion: security updates every morning
+
+[Timer]
+OnCalendar=*-*-* 06:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now orion-updates.timer
+sudo systemctl start orion-updates.service     # once now, to check it
+journalctl -u orion-updates                    # what was checked and installed, and what to restart
+```
+
+This needs the binary in `/usr/local/bin` ([installing for every user](install.md#1-build-and-install)). It runs as root, so it needs no sudo rule. The first step refreshes the package lists; the second installs only security fixes, never removes a package, and says which services to restart and whether to reboot. Orion never restarts or reboots on its own.
+
+`orion call` fails, and so does the service, when a call is refused or can't start. When the package manager itself fails partway, the result says `"ok": false` with the error, but the command still exits 0, so look at the journal. Arch has no security labels, so this does nothing there.
+
+### Services
+
+```sh
+orion call svc_list '{"state": "failed"}'
+orion call svc_status '{"unit": "ollama"}'               # state, last result, memory, the last log lines
+orion call svc_control '{"unit": "ollama", "action": "restart"}'
+```
+
+Add `"scope": "user"` for your own user services.
+
+### Packages
+
+```sh
+orion call pkg_search '{"query": "ripgrep"}'
+orion call pkg_info '{"name": "ripgrep"}'
+orion call pkg_install '{"packages": ["ripgrep"]}'
+orion call pkg_remove '{"packages": ["ripgrep"]}'
+```
+
+### Disks
+
+```sh
+orion call disk_list                                      # disks, partitions, mounts, how full
+orion call disk_usage '{"path": "~"}'                     # what is filling a folder
+orion call disk_mount '{"device": "LABEL=BACKUP"}'
+orion call disk_unmount '{"target": "/media/you/BACKUP", "eject": true}'
+```
+
+### Network and firewall
+
+```sh
+orion call net_info
+orion call wifi_scan
+orion call fw_status
+orion call fw_rule '{"action": "allow", "port": "8080", "proto": "tcp", "from": "192.168.1.0/24"}'
+```
+
+### GPUs and local models
+
+```sh
+orion call gpu_info                                       # every GPU, what runs on each, down to the model
+orion call model_status                                   # inference servers, loaded models, the VRAM budget
+orion call model_load '{"model": "qwen3:32b", "evict": true}'
+orion call gpu_assign '{"unit": "ollama", "gpus": [1]}'   # pin Ollama to GPU 1
+```
+
+The argument names above are the common ones; `orion tools` and each tool's schema (the AI sees it, and errors name a wrong argument) have the rest.
+
+## The audit log
+
+Every tool call, by any model, agent or person, is one JSON line in `~/.local/state/orion/audit.jsonl`:
+
+```json
+{"approved":true,"args":{"security_only":true},"caller":null,"decision":"ask","duration_ms":2457,"error":null,"ok":true,"tool":"update_apply","ts_ms":1792465136288}
+```
+
+| Field | |
+|---|---|
+| `tool`, `args` | what was called, with secrets blanked (Wi-Fi passwords show as `••••••`) |
+| `decision` | `allow`, `ask` or `deny` |
+| `approved` | your answer to an `ask`, or `null` when nobody was asked |
+| `caller` | who asked: an MCP client and its pid (`"claude-code (pid 5312)"`), or a person by voice (`"ana (by voice)"`) |
+| `ok`, `error`, `duration_ms` | how it went |
+| `ts_ms` | when, in milliseconds since 1970 |
+
+```sh
+orion audit -n 50                                          # the last 50 calls
+orion audit -n 1000 | jq -c 'select(.ok == false)'          # failures
+orion audit -n 1000 | jq -c 'select(.decision == "ask") | {tool, approved, args}'
+orion audit -n 1000 | jq -r '.tool' | sort | uniq -c | sort -rn   # which tools get used
+```
+
+The log only grows. Rotate it with logrotate, or move it aside when Orion isn't running. `[audit] enabled = false` turns it off, which isn't recommended.
+
+## Conversations and memory
+
+Conversations are saved after every message:
+
+```sh
+orion chat --resume                # the most recent
+orion conversations                # all of them: id, last active, length, title
+orion conversations show <id>
+orion conversations delete <id>
+```
+
+Each person has their own conversations and memory. The AI saves lasting facts with its `memory_save` tool ("Prefers metric units") and is reminded of them in each new conversation.
+
+```sh
+orion memory                       # what is remembered about you
+orion memory --person ana
+orion memory forget 3
+orion memory clear
+```
+
+Things that look like secrets are never saved. Notes the router considers private are shown only to the local model. `[chat] save_conversations = false` and `memory = false` turn these off.
+
+## Voice
+
+- **Push to talk:** Ctrl-T in the chat, or the mic button in the shell. Your words land in the message box to check before sending.
+- **Spoken replies:** `/voice speak on`.
+- **Hands-free:** Alt-W, or `wake = true` under `[voice]`, then "Orion, what's using the GPU?". A bare "Orion" chimes and waits for the request. "Orion, stop" interrupts.
+- **Only enrolled voices** wake Orion once someone is enrolled (`orion voice enroll`). `orion voice status` lists who, and `orion voice test` shows who Orion takes you for.
+- **Spoken approval** ("Orion, yes") is off unless `wake_approvals = true`, since anything playing audio nearby could say it. "No" always declines.
+- **Headless:** `orion listen`, or the `orion-voice` user service. `journalctl --user -u orion-voice -f` shows what it heard and said.
+
+Run only one listener at a time: wake listening in a chat or shell, or `orion listen`, not both.
+
+## The daemon
+
+With the daemon running, every agent shares one policy, audit log and sandbox, and policy edits apply live.
+
+```sh
+systemctl --user status orion.socket orion.service
+orion status                        # running? socket, policy, tool counts, sandbox, agents, calls
+journalctl --user -u orion -f       # its log
+systemctl --user restart orion      # after upgrading Orion
+```
+
+`orion status` exits 1 when the daemon isn't running, so scripts can check it. A policy edit with a mistake is reported in `orion status`, and the previous policy stays in force until it's fixed.
+
+`orion serve` connects to the daemon when it runs. `orion serve --direct` serves in-process anyway.
+
+## Files and settings
+
+| Path | What |
+|---|---|
+| `~/.config/orion/orion.toml` | the policy (`ORION_CONFIG` or `--config` override it) |
+| `~/.config/orion/env` | variables for the systemd services, such as `ANTHROPIC_API_KEY` |
+| `~/.local/state/orion/audit.jsonl` | the audit log |
+| `~/.local/state/orion/conversations/` | saved conversations |
+| `~/.local/state/orion/memory/` | what the AI remembers, one file per person |
+| `~/.local/state/orion/voices/` | voiceprints, one file per person |
+| `~/.local/state/orion/chat_history` | your typed message history |
+| `~/.local/state/orion/shell-url` | the running shell's address and token |
+| `~/.local/state/orion/pacman-db/` | Arch: the private copy of the package lists |
+| `~/.local/share/orion/models/` | the neural speaker model |
+| `~/orion-workspace/` | where the AI writes, by default |
+| `$XDG_RUNTIME_DIR/orion/orion.sock` | the daemon's socket |
+
+`XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` move these as usual. The state directory is readable only by you and hidden from sandboxed programs.
+
+| Variable | |
+|---|---|
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | Claude credentials |
+| `ANTHROPIC_BASE_URL` | a different Claude endpoint |
+| `ORION_CONFIG` | the policy file |
+| `ORION_LOG` | log detail for Orion's own messages, e.g. `ORION_LOG=debug` (default `info`) |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` | a proxy for Claude and downloads; servers on `localhost` or `127.*`, and hosts in `NO_PROXY`, are reached directly |
+
+## Troubleshooting
+
+Start with these three; they answer most questions:
+
+```sh
+orion tools            # what the policy allows, and the sandbox in use
+orion status           # the daemon
+orion audit -n 20      # what was called, and how it went
+```
+
+**`no Claude credentials: set ANTHROPIC_API_KEY …`.** Export the key in this shell, or put it in `~/.config/orion/env` for the services. Or use `orion chat --local`.
+
+**`cannot connect to http://127.0.0.1:11434/v1: is the server running?`.** The local model server isn't up: `systemctl status ollama`, or start yours. If it runs elsewhere, set `[chat.local] base_url`.
+
+**`… has no models; install one first`.** `ollama pull qwen3:8b`.
+
+**The local model doesn't use tools, or forgets what it did.** Use a tool-calling model (Qwen3, Llama 3.1+, Mistral Small 3, gpt-oss) of at least about 7B, and raise the context length (`OLLAMA_CONTEXT_LENGTH=32768`).
+
+**`tool X needs interactive approval, which is not available here`.** The tool is `ask` and nobody can be asked (`orion call` without a terminal, `orion serve`, a script). Run it from `orion chat`, or set it to `allow` under `[tools]`.
+
+**`"X" is not in packages.allowed`** (or a similar refusal with the tool set to `allow`). With a tool on `allow`, its pre-approval list is a hard limit. Add the package to `[packages] allowed`, or set the tool back to `ask`.
+
+**`sudo: a password is required (sudo needs a password here; see [admin] elevate …)`.** Orion uses `sudo -n` and never prompts for a password. Add the sudoers rule from [the install guide](install.md#6-root-access-for-the-machine-tools), set `[admin] elevate = "pkexec"` on a desktop, or do that task yourself.
+
+**`sudo: The "no new privileges" flag is set …` in the daemon's tools.** The hardened `orion.service` blocks sudo. Remove `NoNewPrivileges=yes` from `~/.config/systemd/user/orion.service`, then `systemctl --user daemon-reload` and `systemctl --user restart orion`.
+
+**`… is outside the writable roots`.** The AI tried to write somewhere it may not. Widen `[fs] write_roots` if it should be allowed; approving can't override this.
+
+**`this update would remove X (replaced or obsoleted); set full to allow that`.** The update replaces or removes a package. Check what X is, then run it with `full: true` if that's fine (`update_apply '{"full": true}'`), or update only the other packages by name.
+
+**`… is protected` / `… is essential`.** By design: no approval removes or stops it. Edit the protected list in the policy if you really mean it.
+
+**`orion tools` says Landlock or limits only, though bubblewrap is installed.** bubblewrap couldn't create a sandbox here, which usually means unprivileged user namespaces are restricted. Check `sysctl kernel.unprivileged_userns_clone` (Debian) and `sysctl kernel.apparmor_restrict_unprivileged_userns` (Ubuntu 23.10+); inside containers they're often unavailable. Landlock still confines files and TCP. `[sandbox] mode = "bubblewrap"` turns the fallback into an error (`sandbox.mode is bubblewrap, but bwrap is missing or can't create a sandbox here`).
+
+**The policy doesn't load.** The error points at the line, and for a misspelled key lists the valid ones:
+
+```
+TOML parse error at line 2, column 1
+  |
+2 | update = "all"
+  | ^^^^^^
+unknown field `update`, expected one of `manager`, `allowed`, `protected`, `updates`, `timeout_secs`
+```
+
+**The shell's address stopped working.** Each run of `orion shell` makes a new token. Use the address it printed, or the one in `~/.local/state/orion/shell-url`. The shell listens on `127.0.0.1` only; from another machine, use an SSH tunnel: `ssh -L 7310:127.0.0.1:7310 you@host`.
+
+**`an Orion daemon is already running on …`.** One is enough: `orion status`. With the socket unit enabled, systemd starts it for you.
+
+**Voice: `set voice.transcribe_url or voice.transcribe_command`, or nothing is heard.** Run `/voice` in the chat: it lists the microphone, transcriber and speech it found. `the recording is empty: is a microphone connected?` means the recorder got no audio: check the input device in your sound settings, or set `[voice] record_command`.
+
+**Wake listening won't start with a remote transcriber.** It would send everything said near the microphone off the machine. Run the transcriber locally, or set `wake_allow_remote = true` if that's what you want.
+
+**`… is from another version of Orion; enroll again`.** Run `orion voice enroll` (with `--name` for others) again.
+
+**Arch: `update_check` shows `refresh_error`.** The private refresh needs root, or `fakeroot` installed when Orion runs as a normal user.
+
+**Still stuck?** `ORION_LOG=debug orion chat 2> ~/orion-debug.log` writes more detail to a file (Orion logs to standard error).
+
+## Security checklist
+
+- **Keep `write_roots` small.** The default, `~/orion-workspace`, is a good start.
+- **Pre-approve narrowly.** `allowed_commands`, `services.allowed` and `packages.allowed` are better than turning whole tools to `allow`.
+- **Install bubblewrap** and consider `[sandbox] require = true`.
+- **Grant root deliberately.** A passwordless sudo rule lets anything running as you use it, not only Orion. On a shared machine, prefer `pkexec` or none.
+- **Leave `wake_approvals` off** unless only trusted people can be heard, and enroll voices so others can't wake Orion.
+- **Keep private things private:** add your own sensitive folders to `chat.router.private_paths` (Claude never sees them) and `[sandbox] hide` (programs never see them).
+- **Read the audit log** now and then, especially after letting an agent run unattended.
+- **Protect `~/.config/orion/env`** (`chmod 600`): it holds your API key.

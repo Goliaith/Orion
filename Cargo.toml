@@ -2,6 +2,7 @@
 name = "orion"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 description = "Orion: the AI interface layer of an AI-first Linux system, exposed over MCP"
 publish = false
 

@@ -24,6 +24,8 @@ This repository holds the first pieces:
 
 It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the same interface works for hosted models, local models and future in-house agents. Nothing in it is tied to one vendor.
 
+**Guides:** [Installing Orion](docs/install.md) (building, models, optional parts, root access, services) and [Operating Orion](docs/operating.md) (day-to-day use, the policy, updates, the audit log, troubleshooting). This README describes each feature in depth.
+
 ## Tools
 
 | Tool           | Risk    | Default | What it does |
@@ -65,14 +67,19 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 
 Out of the box the AI can look at the machine freely. Changing it (writing files, running programs, managing services, packages and models) needs your approval each time. With no human present (`orion serve`), "ask" means no.
 
-## Build
+## Install
+
+Linux only, because the tools read `/proc` and `/sys` directly. You need Rust 1.95 or newer ([rustup](https://rustup.rs)) and a C compiler.
 
 ```sh
-cargo build --release      # binary: target/release/orion
-cargo test
+git clone https://github.com/Goliaith/Orion.git && cd Orion
+cargo install --path .              # installs ~/.cargo/bin/orion
+orion tools                         # every tool and what the policy decides
+export ANTHROPIC_API_KEY=sk-ant-... # and/or run a local model with Ollama
+orion chat
 ```
 
-Linux only, because the tools read `/proc` and `/sys` directly.
+[Installing Orion](docs/install.md) covers each step in full, plus local models, the sandbox, voice, root access for the machine tools, and running Orion as a service. `cargo test` runs the tests.
 
 ## Chat
 
@@ -527,7 +534,7 @@ Beyond files and processes, the AI sees and manages the parts of the machine an 
 - **Nothing runs on a bad request.** Names that could be read as options are refused. Every change is dry-run with the package manager itself before you are asked (`apt-get -s`, `dnf --assumeno`, `zypper --dry-run`, `pacman -p`), so unknown packages fail first, and the result lists every package that changed, dependencies included.
 - **Removal is guarded.** A removal is refused, before you are asked, if it would take away a package the system marks essential or required, or one in `[packages] protected` (the kernel, systemd, sudo, ssh, libc, the package manager, bubblewrap, …). That holds even when the package would only go as a dependent of what you named, or be replaced by one you install.
 - **`[packages] allowed`** pre-approves installs by name (wildcards work), e.g. `["python3-*"]`.
-- **Installs run as root and outside the sandbox,** because package scripts need that. That is why both tools are `execute`. As a normal user Orion uses `sudo -n`, which needs a `NOPASSWD` rule for the package manager, or set `[admin] elevate = "pkexec"` for a graphical password prompt.
+- **Installs run as root and outside the sandbox,** because package scripts need that. That is why both tools are `execute`. As a normal user Orion uses `sudo -n`, which needs a `NOPASSWD` rule for the package manager, or set `[admin] elevate = "pkexec"` for a graphical password prompt ([sudoers examples](docs/install.md#6-root-access-for-the-machine-tools)).
 
 ### System updates
 
@@ -727,6 +734,7 @@ src/
                 the wake word (wake.rs), speaker verification (speaker.rs), the
                 neural speaker encoder (neural.rs), reading PyTorch weights
                 (torch.rs) and enrolling a voice (enroll.rs)
+docs/           install.md and operating.md: the installation and operating guides
 contrib/        orion.socket and orion.service (the daemon), orion-voice.service
                 (headless voice), orion-kiosk (boot into the shell), orion-shell.service
 tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
