@@ -463,6 +463,11 @@ mod tests {
         assert!(refused(json!({})).contains("either pid or name"));
         let strict = Policy::from_toml("[proc]\nprotected = [\"sle*\"]\n").unwrap();
         let mut guarded = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        // Until the exec is done, the child still has this test's name.
+        let until = Instant::now() + Duration::from_secs(5);
+        while read_proc(guarded.id()).is_none_or(|p| p.name != "sleep") && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(ProcSignal.precheck(&strict, &json!({ "pid": guarded.id() })).unwrap_err().to_string().contains("protected"));
         guarded.kill().unwrap();
         guarded.wait().unwrap();
