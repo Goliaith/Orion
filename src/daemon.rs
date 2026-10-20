@@ -72,7 +72,7 @@ fn prepare_dir(dir: &Path) -> Result<()> {
 }
 
 /// The listening socket passed by systemd socket activation, if any.
-fn systemd_listener() -> Option<UnixListener> {
+pub(crate) fn systemd_listener() -> Option<UnixListener> {
     let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
     let fds: i32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
     if pid != std::process::id() || fds < 1 {

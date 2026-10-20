@@ -37,8 +37,8 @@ max_output_bytes = 65536   # per stream
 
 # How Orion gets root for system services and packages: "auto" (nothing when
 # Orion runs as root; otherwise services are tried directly, which polkit may
-# allow, then with `sudo -n`, and packages use `sudo -n`), "sudo", "pkexec"
-# (a graphical password prompt), or "none".
+# allow, then through the privileged helper if it runs, else `sudo -n`),
+# "helper", "sudo", "pkexec" (a graphical password prompt), or "none".
 [admin]
 elevate = "auto"
 
@@ -47,9 +47,11 @@ elevate = "auto"
 allowed = []                    # units svc_control may act on without asking, e.g.
                                 # ["ollama.service", "llama-server.service"]
 # Units no approval can touch. `*` is a wildcard.
-protected = ["orion.*", "ssh.service", "sshd.service", "systemd-*", "dbus*", "polkit.service",
+protected = ["orion.*", "orion-*", "ssh.service", "sshd.service", "systemd-*", "dbus*", "polkit.service",
              "NetworkManager.service", "systemd-networkd.service", "display-manager.service", "gdm*.service",
-             "sddm.service", "lightdm.service", "getty@*", "user@*", "user-runtime-dir@*", "*.target"]
+             "sddm.service", "lightdm.service", "getty@*", "user@*", "user-runtime-dir@*", "*.target",
+             "debug-shell.service", "emergency.service", "rescue.service", "serial-getty@*", "container-getty@*",
+             "autovt@*", "console-getty.service"]
 
 # The package manager (pkg_list, pkg_search, pkg_info, pkg_install, pkg_remove).
 [packages]
@@ -217,3 +219,12 @@ hide = ["~/.ssh", "~/.gnupg", "~/.password-store", "~/.aws", "~/.netrc", "~/.con
 # serve` connects to it when it is running.
 [daemon]
 socket = ""                     # empty: $XDG_RUNTIME_DIR/orion/orion.sock
+
+# The privileged helper (`orion helper`, contrib/orion-helper.socket): a root
+# service that does Orion's root work, and only that. It reads these settings
+# from its own file, /etc/orion/helper.toml, which only root may change;
+# Orion reads `socket` from yours.
+[helper]
+socket = "/run/orion/helper.sock"
+group = "orion"                 # members may use it
+users = []                      # and these login names

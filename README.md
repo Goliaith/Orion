@@ -659,6 +659,18 @@ systemctl --user enable --now orion.socket
 
 The service reads `ANTHROPIC_API_KEY` and other variables from `~/.config/orion/env`, caps everything Orion runs at 8 GiB of memory and 1024 tasks through its cgroup, and hardens the daemon itself (`NoNewPrivileges`, `ProtectKernel*`, `RestrictSUIDSGID`, …). `journalctl --user -u orion` shows its log.
 
+### The privileged helper
+
+`orion helper` does the machine tools' root work, so Orion needs no sudo rule. It is a root service on a socket only root and the `orion` group can open (`contrib/orion-helper.socket`). It runs a command only if it is one Orion's tools build, checked again on its side against its own policy, `/etc/orion/helper.toml`, which only root may change:
+
+- package manager commands on plain package names, whose dry run (as root) removes no protected or essential package;
+- `systemctl` actions on units that aren't protected, including those that give a console root shell;
+- GPU drop-ins holding only GPU variables;
+- `nosuid,nodev` mounts under the mount roots, of disks the system doesn't run from;
+- NetworkManager's Wi-Fi and connection commands, and firewall rules that keep SSH open.
+
+Anything else is refused. Commands run with a clean environment and a fixed `PATH`, are logged with who asked (`journalctl -u orion-helper`), and stop if the asker hangs up. With `[admin] elevate = "auto"`, Orion uses the helper whenever its socket exists, and `orion tools` and `orion status` say how Orion gets root. [Installing Orion](docs/install.md#the-privileged-helper-recommended) sets it up; `tests/helper/run.sh` checks it end to end.
+
 ## Sandbox
 
 Every program the AI starts with `proc_run` runs in a sandbox, whatever the policy allows it to run. `orion tools` and `orion status` show which one, and the model is told, so it reports a refusal instead of trying to get around it. (The machine tools' own fixed commands, such as `systemctl` and the package manager, run outside it. Those tools take checked arguments, not programs, and have their own rules and protected lists.)
@@ -704,6 +716,8 @@ src/
   audit.rs      JSONL audit log
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
   daemon.rs     the system service: socket, peer checks, live reload, the stdio bridge
+  helper.rs     the privileged helper: the root service, its client, who may use it;
+                each tool module checks its own commands (helper_check)
   sandbox.rs    sandboxing for proc_run: bubblewrap, Landlock, resource limits
   tools/        built-in tools: system, fs, process, network, services
                 (systemd), packages, models (inference servers, VRAM budget), gpu
@@ -736,11 +750,15 @@ src/
                 neural speaker encoder (neural.rs), reading PyTorch weights
                 (torch.rs) and enrolling a voice (enroll.rs)
 docs/           install.md and operating.md: the installation and operating guides
-contrib/        orion.socket and orion.service (the daemon), orion-voice.service
+contrib/        orion.socket and orion.service (the daemon), orion-helper.socket and
+                orion-helper.service (the privileged helper), orion-voice.service
                 (headless voice), orion-kiosk (boot into the shell), orion-shell.service
 tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
                 (daemon plus bridge), distros/ (package and update tools on
-                Fedora, openSUSE and Arch, in Docker)
+                Fedora, openSUSE and Arch, in Docker), helper/ (the privileged
+                helper, as root)
+.github/        CI: lint, tests, the oldest supported Rust, distros/ and helper/,
+                on every push and nightly
 ```
 
 To add a capability, implement `Tool` in `src/tools/` and register it in `tools::builtin()`. Pick its `Risk` honestly, because that is what the policy defaults key off. Put checks that no approval should override in `precheck`, and argument-dependent pre-approval (like `proc_run`'s command list) in `preapproval`.
@@ -749,6 +767,6 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
-3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
+3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits, and ~~a privileged helper~~ (`orion helper`) for root work in place of sudo rules. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots), on apt, dnf, zypper and pacman. Next: scheduled unattended updates, and a status-bar badge for pending security fixes.
 5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

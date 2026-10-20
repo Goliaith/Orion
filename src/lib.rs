@@ -10,6 +10,7 @@
 pub mod audit;
 pub mod chat;
 pub mod daemon;
+pub mod helper;
 pub mod interrupt;
 pub mod mcp;
 pub mod policy;

@@ -181,6 +181,14 @@ enum Cmd {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// The privileged helper: run as root, it does Orion's root work and
+    /// only that, for members of its group (see contrib/orion-helper.service).
+    /// Its policy is /etc/orion/helper.toml, or --config.
+    Helper {
+        /// Listen here instead of [helper] socket (/run/orion/helper.sock).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Show whether the daemon is running, and what it is doing.
     Status,
     /// Show every tool, its risk level, and what the policy decides for it.
@@ -207,6 +215,10 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // The helper has a policy of its own, which only root may change.
+    if let Cmd::Helper { socket } = &cli.command {
+        return orion::helper::main(cli.config.as_deref(), socket.as_deref());
+    }
     let (policy, source) = Policy::load(cli.config.as_deref())?;
     match &source {
         Some(path) => tracing::debug!("policy: {}", path.display()),
@@ -264,6 +276,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Daemon { socket } => daemon::run(policy, source, socket),
+        Cmd::Helper { .. } => unreachable!("handled before loading the policy"),
         Cmd::Status => {
             let path = daemon::socket_path(&policy.daemon);
             let st = match daemon::status(&policy.daemon) {
@@ -271,6 +284,7 @@ fn main() -> Result<()> {
                 Err(_) => {
                     println!("Orion daemon: not running ({})", path.display());
                     println!("sandbox:      {}", orion::sandbox::describe(&policy));
+                    println!("root access:  {}", orion::tools::root_access(&policy));
                     std::process::exit(1);
                 }
             };
@@ -326,6 +340,7 @@ fn main() -> Result<()> {
                 println!("{:<12} {:<8} {:<6} {summary}", tool.name(), tool.risk().as_str(), decision.as_str());
             }
             println!("\nprograms run sandboxed: {}", orion::sandbox::describe(orion.policy()));
+            println!("root access for the machine tools: {}", orion::tools::root_access(orion.policy()));
             Ok(())
         }
         Cmd::Call { name, args } => {

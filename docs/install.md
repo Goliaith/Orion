@@ -241,11 +241,53 @@ Tools whose program is missing report that when called. The others still work.
 
 ## 6. Root access for the machine tools
 
-Installing packages and updates, controlling system services, changing the network or firewall, mounting disks and pinning GPUs need root. Orion never asks for your password itself. It gets root one of four ways, set by `[admin] elevate`:
+Installing packages and updates, controlling system services, changing the network or firewall, mounting disks and pinning GPUs need root. Orion never asks for your password itself. The recommended way is **the privileged helper**; sudo and pkexec also work.
+
+### The privileged helper (recommended)
+
+`orion helper` is a small root service that does Orion's root work and nothing else. Orion sends it each command on a Unix socket that only root and the `orion` group can open. The helper runs the command only if it is one Orion's own tools build, and checks it again on its own side, against its own policy:
+
+- **Packages and updates:** only the package manager commands Orion makes, on plain package names (no files, no options that run commands), and only if the helper's own dry run, as root, removes no protected or essential package.
+- **Services:** `systemctl` start, stop, restart, reload, enable and disable of units that aren't protected. That includes the units that give a root shell on a console, such as `debug-shell.service`.
+- **GPU pins:** only Orion's `50-orion-gpu.conf` drop-in, holding only the GPU variables. A drop-in with `ExecStart=` would run anything as root.
+- **Disks:** mounts only under the mount roots, always `nosuid,nodev`, of disks the system doesn't run from; unmounts of anything but the system's own mounts.
+- **Network:** NetworkManager's Wi-Fi and connection commands as Orion makes them (no VPN imports, which can run scripts), and firewall rules that keep SSH open.
+
+Its protected lists come from `/etc/orion/helper.toml`, which only root may change, so code running as you can't loosen them. Everything else is refused, and every command it ran or refused is logged with who asked. Compared with a sudo rule, code running as you gets Orion's operations, not a root shell.
+
+Set it up once, as root:
+
+```sh
+sudo install -m 755 ~/.cargo/bin/orion /usr/local/bin/orion   # the helper runs from /usr/local/bin
+sudo groupadd --system orion
+sudo usermod -aG orion "$USER"                                 # then log out and back in
+sudo cp contrib/orion-helper.socket contrib/orion-helper.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now orion-helper.socket
+```
+
+Check it:
+
+```sh
+orion tools | tail -1
+# root access for the machine tools: the Orion helper at /run/orion/helper.sock
+journalctl -u orion-helper -f       # what it runs and refuses, and who asked
+```
+
+With `[admin] elevate = "auto"` (the default), Orion uses the helper whenever its socket exists, so nothing else needs changing. Set `elevate = "helper"` to use only the helper, never sudo.
+
+To give the helper its own protected lists or another group, copy the sections you want to change from `orion.example.toml` (`[packages]`, `[services]`, `[disks]`, `[helper]`) into `/etc/orion/helper.toml`. A list there replaces the default list, so copy the whole list and add to it. The file must belong to root and be writable only by root, or the helper won't start.
+
+`tests/helper/run.sh` (as root) checks all of this end to end: a normal user installing and removing a package through the helper, and the helper refusing a shell, an apt hook, a protected package, a unit that runs a command, a console root shell, a weak mount and an outsider.
+
+### Other ways
+
+`[admin] elevate` chooses:
 
 | `elevate` | How |
 |---|---|
-| `"auto"` (default) | Nothing extra when Orion runs as root. Otherwise system services and NetworkManager are tried directly first (polkit may allow them), and the rest use `sudo -n`. |
+| `"auto"` (default) | Nothing extra when Orion runs as root. Otherwise system services and NetworkManager are tried directly first (polkit may allow them), then the helper if its socket exists, else `sudo -n`. |
+| `"helper"` | Only the helper. |
 | `"sudo"` | Always `sudo -n`: it works only with a passwordless sudoers rule, and fails at once without one. |
 | `"pkexec"` | polkit's password dialog, for a desktop session. |
 | `"none"` | Never. Those tools then fail unless Orion runs as root. |
@@ -267,9 +309,9 @@ you ALL=(root) NOPASSWD: /usr/bin/mkdir -p -- /mnt/*, /usr/bin/mkdir -p -- /medi
 
 Check the paths on your system with `command -v apt-get systemctl nmcli ufw`.
 
-**Know what this grants.** Orion checks every request against its policy and protected lists before it runs anything. But a passwordless rule for a package manager or `systemctl` lets *anything running as your user* become root, not only Orion: a package manager can run any script, and `systemctl` can start any unit. On a shared or exposed machine, prefer `"pkexec"`, narrow polkit rules, or no root access at all.
+**Know what this grants.** Orion checks every request against its policy and protected lists before it runs anything. But a passwordless rule for a package manager or `systemctl` lets *anything running as your user* become root, not only Orion: a package manager can run any script, and `systemctl` can start any unit. That is why the helper is recommended.
 
-**Running the daemon with the hardened service unit?** `contrib/orion.service` sets `NoNewPrivileges=yes`, which stops sudo and pkexec from working inside it. Remove that line if you want the daemon's tools to use sudo; see [step 7](#7-run-it-as-a-service).
+**Running the daemon with the hardened service unit?** `contrib/orion.service` sets `NoNewPrivileges=yes`, which stops sudo and pkexec from working inside it. The helper isn't affected: the daemon only connects to its socket. With sudo, remove that line; see [step 7](#7-run-it-as-a-service).
 
 ## 7. Run it as a service
 
@@ -356,6 +398,7 @@ That leaves your data. To remove it too:
 | `~/.local/share/orion/` | the neural speaker model |
 | `~/orion-workspace/` | files the AI wrote (the default write root) |
 | `/etc/sudoers.d/orion` | the sudoers rule, if you made one |
+| `/etc/systemd/system/orion-helper.*`, `/etc/orion/`, `/usr/local/bin/orion` | the privileged helper: `sudo systemctl disable --now orion-helper.socket orion-helper.service` first, then `sudo groupdel orion` |
 | `/etc/systemd/system/*.d/50-orion-gpu.conf` | GPU pins made by `gpu_assign`; remove them with `gpu_assign` and an empty list first |
 
 Packages Orion installed, firewall rules it added (commented "added by Orion" in ufw) and Wi-Fi networks it joined stay as they are.

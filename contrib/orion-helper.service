@@ -1,0 +1,25 @@
+# The Orion helper (`orion helper`): runs as root, and does the root work of
+# Orion's machine tools (packages and updates, system services, GPU pins,
+# mounts, the network and firewall) and only that, checking each command
+# against its own policy, /etc/orion/helper.toml, which only root may change.
+# Started by orion-helper.socket. `journalctl -u orion-helper` shows every
+# command it ran or refused, and who asked.
+[Unit]
+Description=Orion helper: Orion's root work, and only that
+Requires=orion-helper.socket
+After=orion-helper.socket
+
+[Service]
+ExecStart=/usr/local/bin/orion helper
+Restart=on-failure
+
+# Light hardening only: package scripts, kernel module builds (DKMS) and
+# SELinux transitions (dnf on Fedora) need the rest of the system as is,
+# so no NoNewPrivileges, ProtectSystem or ProtectKernel*.
+ProtectHome=read-only
+PrivateTmp=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+Also=orion-helper.socket

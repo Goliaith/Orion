@@ -1,0 +1,21 @@
+# The Orion helper's socket (system units, as root):
+#
+#     sudo groupadd --system orion && sudo usermod -aG orion "$USER"
+#     sudo install -m 755 target/release/orion /usr/local/bin/orion
+#     sudo cp contrib/orion-helper.socket contrib/orion-helper.service /etc/systemd/system/
+#     sudo systemctl daemon-reload && sudo systemctl enable --now orion-helper.socket
+#
+# Only root and the orion group can connect. systemd starts the helper on
+# the first connection.
+[Unit]
+Description=Orion helper socket: Orion's root work, for the orion group
+
+[Socket]
+ListenStream=/run/orion/helper.sock
+SocketUser=root
+SocketGroup=orion
+SocketMode=0660
+DirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target

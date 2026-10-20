@@ -8,7 +8,11 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
+
+use crate::policy::Policy;
 
 pub struct Finished {
     pub status: ExitStatus,
@@ -46,7 +50,13 @@ impl Finished {
 /// Run `cmd` (in its own process group) until it exits or `timeout` passes,
 /// keeping the first `cap` bytes of each output stream. Afterwards the whole
 /// group is killed, so background children cannot linger.
-pub fn run(mut cmd: Command, stdin: Option<String>, timeout: Duration, cap: usize) -> Result<Finished> {
+pub fn run(cmd: Command, stdin: Option<String>, timeout: Duration, cap: usize) -> Result<Finished> {
+    run_until(cmd, stdin, timeout, cap, || false)
+}
+
+/// [`run`], also stopping (as if interrupted) once `stop` says so; the
+/// privileged helper stops a run when whoever asked for it hangs up.
+pub fn run_until(mut cmd: Command, stdin: Option<String>, timeout: Duration, cap: usize, stop: impl Fn() -> bool) -> Result<Finished> {
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -69,8 +79,9 @@ pub fn run(mut cmd: Command, stdin: Option<String>, timeout: Duration, cap: usiz
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if started.elapsed() >= timeout || crate::interrupt::requested() {
-            timed_out = !crate::interrupt::requested();
+        let stopped = crate::interrupt::requested() || stop();
+        if started.elapsed() >= timeout || stopped {
+            timed_out = !stopped;
             interrupted = !timed_out;
             kill_group(pgid);
             break child.wait()?;
@@ -98,20 +109,41 @@ pub fn output(program: &str, args: &[&str]) -> Result<String> {
     Ok(done.stdout)
 }
 
+/// How Orion gets root for a command.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Elevation {
+    /// The privileged helper, at this socket: it checks each command itself.
+    Helper(PathBuf),
+    /// A program to put in front: `sudo -n --` or `pkexec --`.
+    Prefix(Vec<&'static str>),
+}
+
 /// How to run a program as root under `[admin] elevate`. `None` means run
-/// it directly.
-pub fn elevation(mode: &str) -> Result<Option<Vec<&'static str>>> {
+/// it directly (Orion is root, or may not elevate).
+pub fn elevation(policy: &Policy) -> Result<Option<Elevation>> {
     // SAFETY: geteuid has no preconditions.
     let root = unsafe { libc::geteuid() } == 0;
-    Ok(match mode {
+    let helper = || Elevation::Helper(PathBuf::from(&policy.helper.socket));
+    Ok(match policy.admin.elevate.as_str() {
         "none" => None,
-        "auto" if root => None,
-        "auto" if installed("sudo") => Some(vec!["sudo", "-n", "--"]),
+        "auto" | "helper" | "sudo" | "pkexec" if root => None,
+        "auto" if Path::new(&policy.helper.socket).exists() => Some(helper()),
+        "auto" if installed("sudo") => Some(Elevation::Prefix(vec!["sudo", "-n", "--"])),
         "auto" => None,
-        "sudo" => Some(vec!["sudo", "-n", "--"]),
-        "pkexec" => Some(vec!["pkexec", "--"]),
-        other => anyhow::bail!("admin.elevate must be auto, sudo, pkexec or none, not {other:?}"),
+        "helper" => Some(helper()),
+        "sudo" => Some(Elevation::Prefix(vec!["sudo", "-n", "--"])),
+        "pkexec" => Some(Elevation::Prefix(vec!["pkexec", "--"])),
+        other => anyhow::bail!("admin.elevate must be auto, helper, sudo, pkexec or none, not {other:?}"),
     })
+}
+
+/// Run `program args…` as root through `how`, or directly with `None`.
+pub fn run_as(how: Option<&Elevation>, program: &str, args: &[String], stdin: Option<String>, timeout: Duration, cap: usize) -> Result<Finished> {
+    match how {
+        Some(Elevation::Helper(socket)) => crate::helper::run(socket, program, args, stdin, timeout),
+        Some(Elevation::Prefix(prefix)) => run(command_as(Some(prefix), program, args), stdin, timeout, cap),
+        None => run(command_as(None, program, args), stdin, timeout, cap),
+    }
 }
 
 /// `program args…`, behind the elevation prefix if there is one.

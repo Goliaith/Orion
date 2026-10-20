@@ -701,7 +701,40 @@ pub fn drop_in(env: &BTreeMap<&'static str, String>, gpus: &[&Gpu]) -> String {
     )
 }
 
-const DROP_IN: &str = "50-orion-gpu.conf";
+pub(super) const DROP_IN: &str = "50-orion-gpu.conf";
+
+/// Whether `content` is a drop-in [`drop_in`] could have written: comments,
+/// `[Service]`, and `Environment=` with only the GPU variables. Anything
+/// else in a unit (an `ExecStart=`, another `Environment=`) would run as
+/// root, so the privileged helper writes nothing else.
+pub(super) fn check_drop_in(content: &str) -> Result<()> {
+    const VARS: [&str; 3] = ["CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "ONEAPI_DEVICE_SELECTOR"];
+    ensure!(content.len() <= 4096, "a GPU drop-in is short");
+    let mut section = false;
+    for line in content.lines() {
+        // A trailing backslash continues a line in a unit file.
+        ensure!(!line.ends_with('\\'), "a GPU drop-in has no continued lines");
+        match line {
+            "" => {}
+            l if l.starts_with('#') => {}
+            "[Service]" if !section => section = true,
+            l if section && l.starts_with("Environment=") => {
+                for token in l["Environment=".len()..].split(' ') {
+                    let var = token.strip_prefix('"').and_then(|t| t.strip_suffix('"')).context("each variable is quoted")?;
+                    let (k, v) = var.split_once('=').context("VAR=value")?;
+                    ensure!(VARS.contains(&k), "{k} isn't a GPU variable");
+                    ensure!(
+                        v.chars().all(|c| c.is_ascii_alphanumeric() || ",:;._-".contains(c)),
+                        "{k} holds characters a GPU list doesn't"
+                    );
+                }
+            }
+            l => bail!("a GPU drop-in can't contain {l:?}"),
+        }
+    }
+    ensure!(section, "a GPU drop-in has a [Service] section");
+    Ok(())
+}
 
 impl Tool for GpuAssign {
     fn name(&self) -> &'static str {
@@ -784,6 +817,25 @@ pub(crate) mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    #[test]
+    fn drop_ins_hold_only_gpu_variables() {
+        let env = BTreeMap::from([("CUDA_VISIBLE_DEVICES", "GPU-8c1f0d2e,1".to_string()), ("ONEAPI_DEVICE_SELECTOR", "level_zero:0;level_zero:1".to_string())]);
+        assert!(check_drop_in(&drop_in(&env, &[])).is_ok());
+        for bad in [
+            "[Service]\nExecStart=\n",
+            "[Service]\nExecStartPre=/bin/sh -c id\n",
+            "[Service]\nEnvironment=\"CUDA_VISIBLE_DEVICES=0\" \"LD_PRELOAD=/tmp/x.so\"\n",
+            "[Service]\nEnvironment=\"CUDA_VISIBLE_DEVICES=0 1\"\n",
+            "[Service]\nEnvironment=CUDA_VISIBLE_DEVICES=0\n",
+            "# a comment \\\nExecStart=/bin/sh\n[Service]\n",
+            "[Service]\n[Unit]\nRequires=debug-shell.service\n",
+            "[Unit]\nEnvironment=\"CUDA_VISIBLE_DEVICES=0\"\n",
+            "",
+        ] {
+            assert!(check_drop_in(bad).is_err(), "{bad:?}");
+        }
+    }
 
     /// A fake /sys/class/drm with real layouts: an RTX 4090, a Radeon RX
     /// 7900 XTX (amdgpu files and hwmon), and Intel graphics on the CPU.

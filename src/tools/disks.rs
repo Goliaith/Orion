@@ -307,9 +307,7 @@ fn statvfs(p: &Path) -> Option<(u64, u64)> {
 }
 
 fn elevated(policy: &Policy, program: &str, args: &[String]) -> Result<exec::Finished> {
-    // SAFETY: geteuid has no preconditions.
-    let prefix = if unsafe { libc::geteuid() } == 0 { None } else { exec::elevation(&policy.admin.elevate)? };
-    exec::run(exec::command_as(prefix.as_deref(), program, args), None, Duration::from_secs(120), 64 << 10)
+    exec::run_as(exec::elevation(policy)?.as_ref(), program, args, None, Duration::from_secs(120), 64 << 10)
 }
 
 #[derive(Deserialize)]
@@ -325,6 +323,13 @@ struct MountArgs {
 fn check_target(policy: &Policy, at: &Path) -> Result<()> {
     ensure!(at.is_absolute(), "mount at an absolute path");
     let at_s = at.display().to_string();
+    // "/mnt/../var/empty" starts with /mnt, component by component.
+    let plain = at.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
+    ensure!(plain, "{at_s} must be a plain path, without . or ..");
+    // Nor may a symlink on the way lead somewhere else.
+    if let Some(real) = at.ancestors().find(|a| a.exists()) {
+        ensure!(std::fs::canonicalize(real).is_ok_and(|r| r == real), "{at_s} goes through a symlink");
+    }
     ensure!(!is_protected(&at_s, &policy.disks.protected), "{at_s} is one of the system's own mount points");
     let ok_root = policy.disks.mount_roots.iter().map(|r| crate::policy::expand_home(r)).chain(policy.fs.write_roots.iter().cloned()).any(|r| at.starts_with(&r) && at != r);
     ensure!(ok_root, "mount points go under {} or a writable root", policy.disks.mount_roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", "));
@@ -355,6 +360,42 @@ fn check_mount(policy: &Policy, a: &MountArgs) -> Result<(Device, Option<PathBuf
         check_target(policy, at)?;
     }
     Ok((d, at))
+}
+
+/// The privileged helper's check of the commands this module runs as root:
+/// a mount only of a disk Orion would mount, where it would, with its
+/// options (`nosuid,nodev`, the asker's uid and gid); an unmount only of
+/// what isn't the system's.
+pub(super) fn helper_check(policy: &Policy, uid: u32, gid: u32, program: &str, args: &[String]) -> Result<()> {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    match (program, a.as_slice()) {
+        ("mkdir", ["-p", "--", at]) => check_target(policy, Path::new(at)),
+        ("mount", ["-o", options, "--", device, at]) => {
+            let read_only = options.split(',').any(|o| o == "ro");
+            let ask = MountArgs { device: device.to_string(), at: Some(at.to_string()), read_only };
+            let (d, target) = check_mount(policy, &ask)?;
+            ensure!(d.path == *device && target.as_deref() == Some(Path::new(at)), "name the device and mount point in full");
+            let want = mount_options(d.fstype.as_deref().unwrap_or_default(), read_only, uid, gid);
+            ensure!(*options == want, "the mount options for {device} are {want}");
+            Ok(())
+        }
+        ("umount", ["--", at]) => {
+            let (_, mounted) = check_unmount(policy, &UnmountArgs { target: at.to_string(), eject: false })?;
+            ensure!(mounted == *at, "{at} isn't a mount point");
+            Ok(())
+        }
+        ("eject", ["--", disk]) => {
+            let all = devices(policy)?;
+            ensure!(all.iter().any(|d| d.disk == *disk && d.removable && !d.system), "{disk} isn't a removable drive");
+            Ok(())
+        }
+        // Who is using a mount, when it is busy.
+        ("fuser", ["-vm", "--", at]) => {
+            ensure!(devices(policy)?.iter().any(|d| d.mountpoints.iter().any(|m| m == at)), "{at} isn't a mount point");
+            Ok(())
+        }
+        _ => bail!("that isn't a {program} command Orion makes"),
+    }
 }
 
 /// Mount options: never setuid programs or device files from a mounted
@@ -578,6 +619,21 @@ mod tests {
     }
 
     #[test]
+    fn mount_targets_are_plain_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mnt");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink("/etc", root.join("link")).unwrap();
+        let policy = Policy::from_toml(&format!("[disks]\nmount_roots = [{:?}]\n", root.display().to_string())).unwrap();
+        assert!(check_target(&policy, &root.join("photos")).is_ok());
+        assert!(check_target(&policy, &root.join("new/photos")).is_ok());
+        // Under the root by its components, but not really.
+        assert!(check_target(&policy, &root.join("../../../var/empty")).is_err());
+        assert!(check_target(&policy, &root.join("link/x")).is_err());
+        assert!(check_target(&policy, &root).is_err());
+    }
+
+    #[test]
     fn guards_the_system_s_own_mounts() {
         let p = protected();
         for m in ["/", "/boot", "/boot/efi", "/home", "/usr/", "/var", "/snap/core22/1380"] {
@@ -623,6 +679,20 @@ mod tests {
         let policy = Policy::from_toml(&format!("[disks]\nmount_roots = [{:?}]\n", root.display().to_string())).unwrap();
         let at = root.join("t");
         let _cleanup = Loop(dev.clone(), at.clone());
+        // The helper's check, for a user with uid and gid 1000: Orion's own
+        // mount passes; weaker options, other targets and devices don't.
+        let v = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let at_s = at.display().to_string();
+        let helper = |program: &str, a: &[&str]| helper_check(&policy, 1000, 1000, program, &v(a));
+        assert!(helper("mkdir", &["-p", "--", &at_s]).is_ok());
+        assert!(helper("mount", &["-o", "nosuid,nodev", "--", &dev, &at_s]).is_ok());
+        assert!(helper("mount", &["-o", "nosuid,nodev,ro", "--", &dev, &at_s]).is_ok());
+        for bad in ["nodev", "nosuid,nodev,suid", "nosuid,nodev,uid=0", "nosuid,nodev,exec,dev"] {
+            assert!(helper("mount", &["-o", bad, "--", &dev, &at_s]).is_err(), "{bad}");
+        }
+        assert!(helper("mount", &["-o", "nosuid,nodev", "--", &dev, "/etc"]).is_err());
+        assert!(helper("mount", &["--bind", "/", &at_s]).is_err());
+        assert!(helper("mkdir", &["-p", "--", "/etc/cron.d/x"]).is_err());
         let r = DiskMount.call(&policy, json!({ "device": dev, "at": at })).unwrap();
         assert_eq!(r["mounted_at"][0], at.display().to_string(), "{r}");
         assert_eq!(r["filesystem"], "ext4");
@@ -630,6 +700,10 @@ mod tests {
         assert!(DiskMount.precheck(&policy, &json!({ "device": dev })).unwrap_err().to_string().contains("already mounted"));
         assert!(check_target(&policy, Path::new("/etc/x")).is_err());
         assert!(DiskUnmount.precheck(&policy, &json!({ "target": "/" })).unwrap_err().to_string().contains("system's own"));
+        assert!(helper("umount", &["--", &at_s]).is_ok());
+        assert!(helper("umount", &["--", "/"]).is_err());
+        assert!(helper("umount", &["-l", "--", &at_s]).is_err());
+        assert!(helper("eject", &["--", "/dev/sda"]).is_err());
         let u = DiskUnmount.call(&policy, json!({ "target": at })).unwrap();
         assert_eq!(u["unmounted"], at.display().to_string());
     }

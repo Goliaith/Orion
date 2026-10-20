@@ -394,7 +394,7 @@ pub(super) fn write_drop_in(policy: &Policy, path: &Path, content: Option<&str>,
         }
         return Ok(());
     }
-    let prefix = exec::elevation(&policy.admin.elevate)?;
+    let how = exec::elevation(policy)?;
     let p = path.display().to_string();
     let dir = path.parent().context("no directory")?.display().to_string();
     let steps: Vec<(Vec<String>, Option<String>)> = match content {
@@ -406,24 +406,65 @@ pub(super) fn write_drop_in(policy: &Policy, path: &Path, content: Option<&str>,
     };
     for (mut argv, stdin) in steps {
         let program = argv.remove(0);
-        let mut cmd = exec::command_as(prefix.as_deref(), &program, &argv);
-        cmd.stdout(std::process::Stdio::null());
-        let done = exec::run(cmd, stdin, Duration::from_secs(30), 16 << 10)?;
+        let done = exec::run_as(how.as_ref(), &program, &argv, stdin, Duration::from_secs(30), 16 << 10)?;
         ensure!(done.success(), "{program}: {}", done.complaint());
     }
     Ok(())
+}
+
+/// The privileged helper's check of the commands this module (and
+/// `gpu_assign`) run as root: `systemctl` actions on units the helper's
+/// policy doesn't protect, and Orion's GPU drop-ins, holding only GPU
+/// variables.
+pub(super) fn helper_check(policy: &Policy, program: &str, args: &[String], stdin: Option<&str>) -> Result<()> {
+    const ACTIONS: [&str; 6] = ["start", "stop", "restart", "reload", "enable", "disable"];
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    match (program, a.as_slice()) {
+        ("systemctl", ["--no-ask-password", "daemon-reload"]) => Ok(()),
+        // fw_enable, for firewalld.
+        ("systemctl", ["--no-ask-password", "enable" | "disable", "--now", "firewalld"]) => {
+            check_scoped(policy, "firewalld.service", Scope::System).map(drop)
+        }
+        ("systemctl", ["--no-ask-password", action, "--", unit]) if ACTIONS.contains(action) => {
+            let full = unit_name(unit)?;
+            ensure!(full == *unit, "name the unit in full ({full})");
+            check_scoped(policy, unit, Scope::System).map(drop)
+        }
+        ("mkdir", ["-p", "--", dir]) => drop_in_unit(policy, Path::new(dir)).map(drop),
+        ("tee", ["--", path]) | ("rm", ["-f", "--", path]) => {
+            let path = Path::new(path);
+            ensure!(path.file_name().is_some_and(|f| f == super::gpu::DROP_IN), "Orion only writes its own drop-in ({})", super::gpu::DROP_IN);
+            match (program, stdin) {
+                ("tee", Some(content)) => super::gpu::check_drop_in(content)?,
+                ("tee", None) => bail!("no content to write"),
+                _ => {}
+            }
+            drop_in_unit(policy, path.parent().context("no directory")?).map(drop)
+        }
+        _ => bail!("that isn't a {program} command Orion makes"),
+    }
+}
+
+/// `/etc/systemd/system/<unit>.d`, for a unit Orion may change.
+fn drop_in_unit(policy: &Policy, dir: &Path) -> Result<String> {
+    ensure!(dir.parent() == Some(Path::new("/etc/systemd/system")), "drop-ins go in /etc/systemd/system/<unit>.d");
+    let name = dir.file_name().and_then(|n| n.to_str()).context("no unit")?;
+    let unit = name.strip_suffix(".d").context("a drop-in folder ends in .d")?;
+    let full = unit_name(unit)?;
+    ensure!(full == unit, "name the unit in full ({full})");
+    check_scoped(policy, unit, Scope::System)
 }
 
 /// After a drop-in changed: reload systemd, and restart the unit if it is
 /// running. Whether it was restarted.
 pub(super) fn reload_and_restart(policy: &Policy, unit: &str, user: bool) -> Result<bool> {
     let scope = if user { Scope::User } else { Scope::System };
-    let prefix = if user { None } else { exec::elevation(&policy.admin.elevate)? };
+    let how = if user { None } else { exec::elevation(policy)? };
     let run = |args: &[&str]| -> Result<exec::Finished> {
         let mut argv: Vec<String> = scope.flag().map(String::from).into_iter().collect();
         argv.push("--no-ask-password".into());
         argv.extend(args.iter().map(|a| a.to_string()));
-        exec::run(exec::command_as(prefix.as_deref(), "systemctl", &argv), None, Duration::from_secs(120), 16 << 10)
+        exec::run_as(how.as_ref(), "systemctl", &argv, None, Duration::from_secs(120), 16 << 10)
     };
     let reload = run(&["daemon-reload"])?;
     ensure!(reload.success(), "systemctl daemon-reload: {}", reload.complaint());
@@ -476,9 +517,7 @@ impl Tool for SvcControl {
         let unit = check_control(policy, &a)?;
         let mut argv: Vec<String> = a.scope.flag().map(String::from).into_iter().collect();
         argv.extend(["--no-ask-password".into(), a.action.as_str().into(), "--".into(), unit.clone()]);
-        let attempt = |prefix: Option<&[&str]>| {
-            exec::run(exec::command_as(prefix, "systemctl", &argv), None, Duration::from_secs(120), 64 << 10)
-        };
+        let attempt = |how: Option<&exec::Elevation>| exec::run_as(how, "systemctl", &argv, None, Duration::from_secs(120), 64 << 10);
         let mut done = attempt(None)?;
         // System services as a normal user: polkit said no, so try root.
         let denied = |d: &exec::Finished| {
@@ -487,8 +526,8 @@ impl Tool for SvcControl {
         };
         let mut elevated = false;
         if !done.success() && a.scope == Scope::System && denied(&done) {
-            if let Some(prefix) = exec::elevation(&policy.admin.elevate)? {
-                done = attempt(Some(&prefix))?;
+            if let Some(how) = exec::elevation(policy)? {
+                done = attempt(Some(&how))?;
                 elevated = true;
             }
         }
@@ -518,6 +557,48 @@ mod tests {
         write_drop_in(&p, &path, None, true).unwrap();
         assert!(!path.exists());
         write_drop_in(&p, &path, None, true).unwrap();
+    }
+
+    #[test]
+    fn helper_takes_only_orions_systemd_commands() {
+        let p = Policy::from_toml("").unwrap();
+        let v = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Passed every check but the last, in a container without systemd.
+        let passes = |program: &str, a: &[&str], stdin: Option<&str>| match helper_check(&p, program, &v(a), stdin) {
+            Ok(()) => true,
+            Err(e) => format!("{e:#}").contains("systemd is not running"),
+        };
+        assert!(passes("systemctl", &["--no-ask-password", "restart", "--", "ollama.service"], None));
+        assert!(passes("systemctl", &["--no-ask-password", "daemon-reload"], None));
+        let pin = "# Written by Orion (gpu_assign): GPU 1 (RTX 4090).\n[Service]\nEnvironment=\"CUDA_VISIBLE_DEVICES=GPU-8c1f\"\n";
+        assert!(passes("tee", &["--", "/etc/systemd/system/ollama.service.d/50-orion-gpu.conf"], Some(pin)));
+        assert!(passes("rm", &["-f", "--", "/etc/systemd/system/ollama.service.d/50-orion-gpu.conf"], None));
+        assert!(passes("mkdir", &["-p", "--", "/etc/systemd/system/ollama.service.d"], None));
+
+        let refused: &[(&str, &[&str], Option<&str>)] = &[
+            // A root shell on a console, ssh, Orion itself.
+            ("systemctl", &["--no-ask-password", "start", "--", "debug-shell.service"], None),
+            ("systemctl", &["--no-ask-password", "enable", "--", "serial-getty@ttyS0.service"], None),
+            ("systemctl", &["--no-ask-password", "stop", "--", "ssh.service"], None),
+            ("systemctl", &["--no-ask-password", "stop", "--", "orion-helper.service"], None),
+            // Other verbs and shapes.
+            ("systemctl", &["--no-ask-password", "set-environment", "LD_PRELOAD=/tmp/x.so"], None),
+            ("systemctl", &["--no-ask-password", "link", "--", "/tmp/evil.service"], None),
+            ("systemctl", &["--user", "--no-ask-password", "start", "--", "x.service"], None),
+            ("systemctl", &["--no-ask-password", "start", "--", "ollama"], None),
+            // Drop-ins: only Orion's file, only GPU variables.
+            ("tee", &["--", "/etc/systemd/system/ollama.service.d/override.conf"], Some(pin)),
+            ("tee", &["--", "/etc/sudoers.d/50-orion-gpu.conf"], Some(pin)),
+            ("tee", &["--", "/etc/systemd/system/ollama.service.d/50-orion-gpu.conf"], Some("[Service]\nExecStart=/bin/sh -c id\n")),
+            ("tee", &["--", "/etc/systemd/system/ollama.service.d/50-orion-gpu.conf"], Some("[Service]\nEnvironment=\"LD_PRELOAD=/tmp/x.so\"\n")),
+            ("tee", &["--", "/etc/systemd/system/ollama.service.d/50-orion-gpu.conf"], None),
+            ("tee", &["--", "/etc/systemd/system/../sudoers.d/50-orion-gpu.conf"], Some(pin)),
+            ("rm", &["-rf", "--", "/etc/systemd/system/ollama.service.d"], None),
+            ("mkdir", &["-p", "--", "/etc/systemd/system/debug-shell.service.d"], None),
+        ];
+        for (program, args, stdin) in refused {
+            assert!(!passes(program, args, *stdin), "{program} {args:?}");
+        }
     }
 
     #[test]

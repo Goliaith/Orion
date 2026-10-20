@@ -86,8 +86,9 @@ impl Default for ProcPolicy {
 #[serde(default, deny_unknown_fields)]
 pub struct AdminPolicy {
     /// `auto`: nothing when Orion runs as root; otherwise system services
-    /// are tried directly (polkit may allow them) and then with `sudo -n`,
-    /// and packages use `sudo -n`. Or `sudo`, `pkexec`, or `none`.
+    /// are tried directly (polkit may allow them), then through the
+    /// privileged helper if it runs (`[helper] socket`), else `sudo -n`.
+    /// Or `helper`, `sudo`, `pkexec`, or `none`.
     pub elevate: String,
 }
 
@@ -112,9 +113,12 @@ pub struct ServicesPolicy {
 impl Default for ServicesPolicy {
     fn default() -> Self {
         let protected = [
-            "orion.*", "ssh.service", "sshd.service", "systemd-*", "dbus*", "polkit.service",
+            "orion.*", "orion-*", "ssh.service", "sshd.service", "systemd-*", "dbus*", "polkit.service",
             "NetworkManager.service", "systemd-networkd.service", "display-manager.service", "gdm*.service",
             "sddm.service", "lightdm.service", "getty@*", "user@*", "user-runtime-dir@*", "*.target",
+            // Each of these gives a root shell on a console.
+            "debug-shell.service", "emergency.service", "rescue.service", "serial-getty@*", "container-getty@*",
+            "autovt@*", "console-getty.service",
         ];
         Self { allowed: Vec::new(), protected: protected.map(String::from).to_vec() }
     }
@@ -245,6 +249,8 @@ pub struct Policy {
     pub sandbox: crate::sandbox::SandboxConfig,
     /// The background service (`orion daemon`).
     pub daemon: crate::daemon::DaemonConfig,
+    /// The privileged helper (`orion helper`) that does root work for Orion.
+    pub helper: crate::helper::HelperConfig,
 }
 
 impl Policy {

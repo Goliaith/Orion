@@ -404,6 +404,8 @@ systemctl --user restart orion      # after upgrading Orion
 | `~/.local/share/orion/models/` | the neural speaker model |
 | `~/orion-workspace/` | where the AI writes, by default |
 | `$XDG_RUNTIME_DIR/orion/orion.sock` | the daemon's socket |
+| `/run/orion/helper.sock` | the privileged helper's socket (root and the `orion` group) |
+| `/etc/orion/helper.toml` | the privileged helper's own policy, root's only |
 
 `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` move these as usual. The state directory is readable only by you and hidden from sandboxed programs.
 
@@ -421,7 +423,7 @@ Start with these three; they answer most questions:
 
 ```sh
 orion tools            # what the policy allows, and the sandbox in use
-orion status           # the daemon
+orion status           # the daemon, and how Orion gets root
 orion audit -n 20      # what was called, and how it went
 ```
 
@@ -440,6 +442,12 @@ orion audit -n 20      # what was called, and how it went
 **`an update with full may remove packages, so a person must approve it …`.** `update_apply` is on `allow`, where nobody is asked. Run that update from the chat with the tool on `ask`, or set `[packages] updates = "full"` if unattended updates may remove packages.
 
 **`orion call` printed a result, then `… failed: …`, and exited 1.** The tool ran, but what it drove failed partway, typically the package manager. The `error` in the result has its last lines; fix the cause (a broken package, a full disk, another package manager holding the lock) and run it again.
+
+**`the Orion helper isn't running at /run/orion/helper.sock …`.** `sudo systemctl enable --now orion-helper.socket`, or see [the install guide](install.md#the-privileged-helper-recommended).
+
+**`you may not use the Orion helper at …: join its group`.** `sudo usermod -aG orion "$USER"`, then log out and back in: group changes apply to new logins. `id` shows your groups.
+
+**`the Orion helper refused: …`.** The helper checked the command on its side and said no; the reason follows, and `journalctl -u orion-helper` has the details. A protected package, unit or mount is refused by the helper's own policy, `/etc/orion/helper.toml`, whatever yours allows.
 
 **`sudo: a password is required (sudo needs a password here; see [admin] elevate …)`.** Orion uses `sudo -n` and never prompts for a password. Add the sudoers rule from [the install guide](install.md#6-root-access-for-the-machine-tools), set `[admin] elevate = "pkexec"` on a desktop, or do that task yourself.
 
@@ -482,7 +490,7 @@ unknown field `update`, expected one of `manager`, `allowed`, `protected`, `upda
 - **Keep `write_roots` small.** The default, `~/orion-workspace`, is a good start.
 - **Pre-approve narrowly.** `allowed_commands`, `services.allowed` and `packages.allowed` are better than turning whole tools to `allow`.
 - **Install bubblewrap** and consider `[sandbox] require = true`.
-- **Grant root deliberately.** A passwordless sudo rule lets anything running as you use it, not only Orion. On a shared machine, prefer `pkexec` or none.
+- **Grant root through the helper.** It does only Orion's operations, checked against a policy only root can change. A passwordless sudo rule lets anything running as you become root, not only Orion.
 - **Leave `wake_approvals` off** unless only trusted people can be heard, and enroll voices so others can't wake Orion.
 - **Keep private things private:** add your own sensitive folders to `chat.router.private_paths` (Claude never sees them) and `[sandbox] hide` (programs never see them).
 - **Read the audit log** now and then, especially after letting an agent run unattended.

@@ -7,6 +7,7 @@
 //! SSH allowed. Wi-Fi passwords never reach the audit log, approval
 //! prompts, results, or another process's command line.
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -40,9 +41,7 @@ pub fn nm_fields(line: &str) -> Vec<String> {
 /// directly first (polkit may allow it, as for nmcli), then elevated if
 /// that was refused for lack of permission.
 fn admin(policy: &Policy, program: &str, args: &[String], stdin: Option<String>) -> Result<exec::Finished> {
-    let go = |prefix: Option<&[&str]>| {
-        exec::run(exec::command_as(prefix, program, args), stdin.clone(), Duration::from_secs(90), 256 << 10)
-    };
+    let go = |how: Option<&exec::Elevation>| exec::run_as(how, program, args, stdin.clone(), Duration::from_secs(90), 256 << 10);
     let done = go(None)?;
     let refused = |d: &exec::Finished| {
         let e = format!("{} {}", d.stderr, d.stdout).to_lowercase();
@@ -53,8 +52,8 @@ fn admin(policy: &Policy, program: &str, args: &[String], stdin: Option<String>)
     if done.success() || !refused(&done) {
         return Ok(done);
     }
-    match exec::elevation(&policy.admin.elevate)? {
-        Some(prefix) => go(Some(&prefix)),
+    match exec::elevation(policy)? {
+        Some(how) => go(Some(&how)),
         None => Ok(done),
     }
 }
@@ -344,6 +343,116 @@ impl Drop for SecretFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// The privileged helper's check of the commands this module runs as root:
+/// NetworkManager's Wi-Fi and connection commands as Orion builds them,
+/// and firewall rules as `ufw_args` and `firewalld_args` build them, still
+/// keeping SSH open. A Wi-Fi password file is copied into one of the
+/// helper's own, so a path can't make it read a file the asker couldn't.
+pub(super) fn helper_check(policy: &Policy, uid: u32, program: &str, args: &[String]) -> Result<crate::helper::Checked> {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    let fine = || Ok(crate::helper::Checked::as_is(args, None));
+    match program {
+        "nmcli" => {
+            let fields = |f: &str| !f.is_empty() && f.chars().all(|c| c.is_ascii_uppercase() || c == ',' || c == '-');
+            let ssid = |s: &str| !s.starts_with('-') && check_wifi(&WifiArgs { ssid: s.into(), password: None }).is_ok();
+            let uuid = |u: &str| u.len() == 36 && u.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+            match a.as_slice() {
+                ["-t", "-e", "yes", "-f", f, rest @ ..] | ["-t", "-f", f, rest @ ..] if fields(f) => match rest {
+                    ["device", "wifi", "list", "--rescan", "auto"] | ["connection", "show"] | ["device", "status"] | ["general"] => fine(),
+                    _ => bail!("that isn't an nmcli query Orion makes"),
+                },
+                ["connection", "up", "id", s] | ["device", "wifi", "connect", s] if ssid(s) => fine(),
+                ["connection", "up", "id", s, "passwd-file", file] if ssid(s) => {
+                    let content = read_secret(Path::new(file), uid)?;
+                    let own = SecretFile::new(&content)?;
+                    let mut args = args.to_vec();
+                    args[5] = own.0.display().to_string();
+                    Ok(crate::helper::Checked { args, stdin: None, keep: vec![Box::new(own)] })
+                }
+                ["connection", "add", "type", "wifi", "con-name", n, "ifname", "*", "ssid", s, "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk-flags", "0"]
+                    if n == s && ssid(n) => fine(),
+                ["connection", "up" | "down" | "delete", "uuid", u] | ["connection", "modify", "uuid", u, "connection.autoconnect", "yes" | "no"]
+                    if uuid(u) => fine(),
+                _ => bail!("that isn't an nmcli command Orion makes"),
+            }
+        }
+        "ufw" => match a.as_slice() {
+            ["status", "verbose"] | ["show", "added"] | ["disable"] => fine(),
+            ["--force", "enable"] => check_enable(policy, true).and_then(|()| fine()),
+            _ => {
+                let remove = a.first() == Some(&"delete");
+                let r = if remove { &a[1..] } else { &a[..] };
+                let [action, "proto", proto, "from", from, "to", "any", "port", port, ..] = r else {
+                    bail!("that isn't a ufw command Orion makes")
+                };
+                let rule = rule_args(action, port, proto, (*from != "any").then_some(*from), remove)?;
+                let (lo, hi) = check_rule(&rule, &super::network::ssh_ports())?;
+                ensure!(ufw_args(action, proto, rule.from.as_deref(), lo, hi, remove) == args, "that isn't a ufw rule Orion makes");
+                fine()
+            }
+        },
+        "firewall-cmd" => match a.as_slice() {
+            ["--state"] | ["--list-all"] | ["--reload"] | ["--permanent", "--list-services"] | ["--permanent", "--list-ports"] => fine(),
+            ["--permanent", rule] => {
+                let (remove, body) = match (rule.strip_prefix("--add-"), rule.strip_prefix("--remove-")) {
+                    (Some(b), _) => (false, b),
+                    (_, Some(b)) => (true, b),
+                    _ => bail!("that isn't a firewall-cmd command Orion makes"),
+                };
+                // "port=8080/tcp", or a rich rule: pull out what it says, then
+                // build it again and compare.
+                let between = |s: &str, start: &str| s.split_once(start).and_then(|(_, r)| r.split_once('"')).map(|(v, _)| v.to_string());
+                let (action, port, proto, from) = if let Some(pp) = body.strip_prefix("port=") {
+                    let (port, proto) = pp.split_once('/').context("port/protocol")?;
+                    ("allow", port.to_string(), proto.to_string(), None)
+                } else if let Some(rr) = body.strip_prefix("rich-rule=") {
+                    let action = if rr.ends_with(" accept") { "allow" } else { "deny" };
+                    (action, between(rr, "port port=\"").context("a port")?, between(rr, "protocol=\"").context("a protocol")?, between(rr, "source address=\""))
+                } else {
+                    bail!("that isn't a firewall-cmd rule Orion makes")
+                };
+                let rule = rule_args(action, &port, &proto, from.as_deref(), remove)?;
+                let (lo, hi) = check_rule(&rule, &super::network::ssh_ports())?;
+                ensure!(
+                    firewalld_args(action, &proto, rule.from.as_deref(), lo, hi, remove) == args,
+                    "that isn't a firewall-cmd rule Orion makes"
+                );
+                fine()
+            }
+            _ => bail!("that isn't a firewall-cmd command Orion makes"),
+        },
+        _ => bail!("{program} isn't a network program Orion drives"),
+    }
+}
+
+fn rule_args(action: &str, port: &str, proto: &str, from: Option<&str>, remove: bool) -> Result<RuleArgs> {
+    let action = match action {
+        "allow" => RuleAction::Allow,
+        "deny" => RuleAction::Deny,
+        other => bail!("{other:?} isn't allow or deny"),
+    };
+    Ok(RuleArgs { action, port: port.into(), proto: proto.into(), from: from.map(String::from), remove })
+}
+
+/// A Wi-Fi password file the asker wrote: a regular file of theirs (not a
+/// symlink), holding one `802-11-wireless-security.psk:` line.
+fn read_secret(path: &Path, uid: u32) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let meta = f.metadata()?;
+    ensure!(meta.is_file() && meta.uid() == uid && meta.len() <= 4096, "{} isn't a password file of yours", path.display());
+    let mut content = String::new();
+    f.read_to_string(&mut content)?;
+    let one_line = content.lines().count() == 1 && content.starts_with("802-11-wireless-security.psk:");
+    ensure!(one_line, "{} isn't a Wi-Fi password file", path.display());
+    Ok(content)
 }
 
 pub struct NetConnection;
@@ -768,6 +877,64 @@ impl Tool for FwEnable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_takes_only_orions_network_commands() {
+        let p = Policy::from_toml("").unwrap();
+        let v = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let ok = |program: &str, a: &[&str]| helper_check(&p, 1000, program, &v(a)).is_ok();
+        let uuid = "6f5c3a1e-2b4d-4c8e-9a7f-0123456789ab";
+        assert!(ok("nmcli", &["-t", "-e", "yes", "-f", "NAME,UUID,TYPE,DEVICE,ACTIVE,AUTOCONNECT", "connection", "show"]));
+        assert!(ok("nmcli", &["connection", "up", "id", "Home Wi-Fi"]));
+        assert!(ok("nmcli", &["connection", "modify", "uuid", uuid, "connection.autoconnect", "no"]));
+        let add = ["connection", "add", "type", "wifi", "con-name", "Cafe", "ifname", "*", "ssid", "Cafe", "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk-flags", "0"];
+        assert!(ok("nmcli", &add));
+        for bad in [
+            &["connection", "import", "type", "openvpn", "file", "/tmp/evil.ovpn"][..],
+            &["connection", "add", "type", "vpn", "con-name", "x", "vpn-type", "openvpn"],
+            &["connection", "modify", "uuid", uuid, "ipv4.dns", "1.2.3.4"],
+            &["connection", "up", "id", "--help"],
+            &["general", "hostname", "evil"],
+            &["-t", "-f", "x;y", "general"],
+        ] {
+            assert!(!ok("nmcli", bad), "{bad:?}");
+        }
+
+        // A password file: copied into the helper's own, never read from
+        // somewhere that isn't the asker's.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("psk");
+        std::fs::write(&file, "802-11-wireless-security.psk:hunter2hunter2\n").unwrap();
+        let mine = unsafe { libc::getuid() };
+        let args = v(&["connection", "up", "id", "Cafe", "passwd-file", file.to_str().unwrap()]);
+        let checked = helper_check(&p, mine, "nmcli", &args).unwrap();
+        assert_ne!(checked.args[5], args[5]);
+        assert_eq!(std::fs::read_to_string(&checked.args[5]).unwrap(), "802-11-wireless-security.psk:hunter2hunter2\n");
+        assert!(helper_check(&p, mine + 1, "nmcli", &args).is_err(), "someone else's file");
+        std::os::unix::fs::symlink("/etc/hostname", dir.path().join("link")).unwrap();
+        let link = v(&["connection", "up", "id", "Cafe", "passwd-file", dir.path().join("link").to_str().unwrap()]);
+        assert!(helper_check(&p, mine, "nmcli", &link).is_err(), "a symlink");
+        std::fs::write(&file, "root:x:0:0:root:/root:/bin/bash\n").unwrap();
+        assert!(helper_check(&p, mine, "nmcli", &args).is_err(), "not a password file");
+        let copy = checked.args[5].clone();
+        drop(checked);
+        assert!(!Path::new(&copy).exists(), "the helper's copy is removed");
+
+        // Firewall rules: exactly as Orion builds them, and never closing SSH.
+        let rule = ufw_args("allow", "tcp", Some("192.168.1.0/24"), 8080, 8081, false);
+        assert!(ok("ufw", &rule.iter().map(String::as_str).collect::<Vec<_>>()));
+        let deny_ssh = ufw_args("deny", "tcp", None, 22, 22, false);
+        assert!(!ok("ufw", &deny_ssh.iter().map(String::as_str).collect::<Vec<_>>()));
+        assert!(!ok("ufw", &["allow", "proto", "tcp", "from", "any", "to", "any", "port", "80", "comment", "x"]));
+        assert!(!ok("ufw", &["reset"]));
+        let rich = firewalld_args("deny", "udp", Some("10.0.0.0/8"), 5000, 5010, true);
+        assert!(ok("firewall-cmd", &rich.iter().map(String::as_str).collect::<Vec<_>>()));
+        let port = firewalld_args("allow", "tcp", None, 443, 443, false);
+        assert!(ok("firewall-cmd", &port.iter().map(String::as_str).collect::<Vec<_>>()));
+        assert!(!ok("firewall-cmd", &["--permanent", "--add-rich-rule=rule family=\"ipv4\" port port=\"22\" protocol=\"tcp\" reject"]));
+        assert!(!ok("firewall-cmd", &["--permanent", "--set-default-zone=drop"]));
+        assert!(!ok("firewall-cmd", &["--panic-on"]));
+    }
 
     #[test]
     fn parses_nmcli() {

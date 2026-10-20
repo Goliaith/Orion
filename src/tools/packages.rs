@@ -493,10 +493,9 @@ fn change(policy: &Policy, args: Value, remove: bool) -> Result<Value> {
 /// carries it through sudo, which resets the environment.
 pub(super) fn run_as_root(policy: &Policy, m: Manager, mut argv: Vec<String>) -> Result<(exec::Finished, bool)> {
     let program = if m == Manager::Apt { "env".to_string() } else { argv.remove(0) };
-    let prefix = exec::elevation(&policy.admin.elevate)?;
-    let cmd = exec::command_as(prefix.as_deref(), &program, &argv);
-    let done = exec::run(cmd, None, Duration::from_secs(policy.packages.timeout_secs.max(30)), 256 << 10)?;
-    Ok((done, prefix.is_some()))
+    let how = exec::elevation(policy)?;
+    let done = exec::run_as(how.as_ref(), &program, &argv, None, Duration::from_secs(policy.packages.timeout_secs.max(30)), 256 << 10)?;
+    Ok((done, how.is_some()))
 }
 
 /// The last lines, each as it ended up (progress counters redraw with \r).
