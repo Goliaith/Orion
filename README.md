@@ -55,6 +55,8 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `pkg_info`     | read    | allow   | One package: installed and available versions, description, dependencies |
 | `pkg_install`  | execute | ask     | Install packages, as root and outside the sandbox |
 | `pkg_remove`   | execute | ask     | Remove packages, refused if the system or the policy needs them |
+| `update_check` | read    | allow   | Pending updates (security fixes and kernels marked), services to restart, reboot needed |
+| `update_apply` | execute | ask     | Install updates: all, security fixes only, or named packages |
 | `model_status` | read    | allow   | Local inference servers, their models (available and loaded), and the VRAM budget |
 | `model_load`   | write   | ask     | Load a model on Ollama, within the VRAM budget (optionally unloading others) |
 | `model_unload` | write   | ask     | Unload a model, freeing its VRAM |
@@ -518,6 +520,20 @@ Beyond files and processes, the AI sees and manages the parts of the machine an 
 - **`[packages] allowed`** pre-approves installs by name (wildcards work), e.g. `["python3-*"]`.
 - **Installs run as root and outside the sandbox,** because package scripts need that. That is why both tools are `execute`. As a normal user Orion uses `sudo -n`, which needs a `NOPASSWD` rule for the package manager, or set `[admin] elevate = "pkexec"` for a graphical password prompt.
 
+### System updates
+
+- **`update_check`** refreshes the package lists, then lists every package that can be upgraded, from and to which version, security fixes first. Security fixes come from the repositories' own labels (apt's `-security` suites, dnf's updateinfo). Arch publishes none, so there nothing is marked.
+- **`update_apply`** installs updates: everything, only the security fixes (`security_only`), or only the packages named.
+  - **Nothing is removed by default.** On apt, an upgrade that would remove or replace a package is kept back, and the result says which ones were. `full: true` allows those (`dist-upgrade`).
+  - **Removals stay guarded.** On apt the upgrade is simulated before you are asked. It is refused if it would remove a package the system needs or one in `[packages] protected`.
+  - **Configuration files you changed are kept** (`--force-confold`), and nothing waits on a prompt.
+  - **Arch:** partial upgrades break Arch, so there it is everything or nothing.
+- **After an update, both tools say what still runs old code.** Orion reads every process's memory maps for system files that were replaced, then sorts them:
+  - processes that belong to a systemd service: restart that service (`svc_control`);
+  - other processes: list them;
+  - the kernel, `/run/reboot-required`, or PID 1: say the machine needs a reboot, and why.
+- **Pre-approving updates:** set `[packages] updates = "security"` (security fixes need no approval) or `"all"`. An update with `full: true` always asks.
+
 ### Network
 
 `net_info` reports each interface (kind, state, MAC, addresses, traffic), the default IPv4 and IPv6 routes, the DNS servers (including systemd-resolved's real upstream servers), and every listening TCP and UDP port with the process behind it. As a normal user, owners show only for your own processes.
@@ -674,7 +690,8 @@ src/
   tools/        built-in tools: system, fs, process, network, services
                 (systemd), packages, models (inference servers, VRAM budget), gpu
                 (recognition, per-process use, placement, gpu_assign), netconf
-                (Wi-Fi, connections, firewall), disks (disks, usage, mounts);
+                (Wi-Fi, connections, firewall), disks (disks, usage, mounts), updates
+                (pending updates, upgrading, restarts and reboots);
                 exec.rs runs programs for them
   chat/
     mod.rs      config, the Backend and Ui traits
@@ -713,5 +730,5 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
-4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too. Next: system updates.
+4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots). Next: scheduled unattended updates, and a status-bar badge for pending security fixes.
 5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

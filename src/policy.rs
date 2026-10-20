@@ -131,6 +131,9 @@ pub struct PackagesPolicy {
     /// Packages no approval can remove. Packages the manager marks
     /// essential are protected as well.
     pub protected: Vec<String>,
+    /// Which `update_apply` runs need no approval: `ask` (none), `security`
+    /// (security-only updates) or `all`. Never one that removes packages.
+    pub updates: String,
     pub timeout_secs: u64,
 }
 
@@ -144,6 +147,7 @@ impl Default for PackagesPolicy {
             manager: "auto".into(),
             allowed: Vec::new(),
             protected: protected.map(String::from).to_vec(),
+            updates: "ask".into(),
             timeout_secs: 900,
         }
     }

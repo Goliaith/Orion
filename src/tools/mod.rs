@@ -11,6 +11,7 @@ mod packages;
 mod process;
 mod services;
 mod system;
+mod updates;
 
 use crate::tool::Tool;
 
@@ -49,6 +50,8 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(packages::PkgInfo),
         Box::new(packages::PkgInstall),
         Box::new(packages::PkgRemove),
+        Box::new(updates::UpdateCheck),
+        Box::new(updates::UpdateApply),
         Box::new(models::ModelStatus),
         Box::new(models::ModelLoad),
         Box::new(models::ModelUnload),

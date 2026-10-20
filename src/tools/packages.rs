@@ -17,14 +17,14 @@ use crate::policy::Policy;
 use crate::tool::{parse_args, Preapproval, Risk, Tool};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Manager {
+pub(super) enum Manager {
     Apt,
     Dnf,
     Pacman,
 }
 
 impl Manager {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Manager::Apt => "apt",
             Manager::Dnf => "dnf",
@@ -33,7 +33,7 @@ impl Manager {
     }
 }
 
-fn manager(policy: &Policy) -> Result<Manager> {
+pub(super) fn manager(policy: &Policy) -> Result<Manager> {
     Ok(match policy.packages.manager.as_str() {
         "apt" => Manager::Apt,
         "dnf" => Manager::Dnf,
@@ -48,7 +48,7 @@ fn manager(policy: &Policy) -> Result<Manager> {
 
 /// Package names as the managers write them. Anything that could be read
 /// as an option is refused.
-fn package_name(raw: &str) -> Result<&str> {
+pub(super) fn package_name(raw: &str) -> Result<&str> {
     let ok = !raw.is_empty()
         && raw.len() <= 200
         && raw.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
@@ -198,7 +198,7 @@ fn simulate(packages: &[String], remove: bool) -> Result<Plan> {
     }
 }
 
-fn essential(name: &str) -> bool {
+pub(super) fn essential(name: &str) -> bool {
     exec::output("dpkg-query", &["-W", "-f", "${Essential} ${Priority}", "--", name])
         .is_ok_and(|s| s.starts_with("yes") || s.ends_with("required"))
 }
@@ -469,16 +469,7 @@ fn change(policy: &Policy, args: Value, remove: bool) -> Result<Value> {
     };
     argv.push("--".into());
     argv.extend(packages.iter().cloned());
-    // `env` carries DEBIAN_FRONTEND through sudo, which resets the environment.
-    let program = if m == Manager::Apt { "env".to_string() } else { argv.remove(0) };
-    let prefix = exec::elevation(&policy.admin.elevate)?;
-    let cmd = exec::command_as(prefix.as_deref(), &program, &argv);
-    let done = exec::run(cmd, None, Duration::from_secs(policy.packages.timeout_secs.max(30)), 256 << 10)?;
-    // The last lines, each as it ended up (progress counters redraw with \r).
-    let tail = |s: &str| {
-        let lines: Vec<&str> = s.lines().map(|l| l.rsplit('\r').next().unwrap_or(l)).collect();
-        lines[lines.len().saturating_sub(20)..].join("\n")
-    };
+    let (done, elevated) = run_as_root(policy, m, argv)?;
     let changed = plan.map(|p| {
         let list = if remove { p.remove } else { p.install };
         list.into_iter().map(|(name, version)| json!({ "name": name, "version": version })).collect::<Vec<_>>()
@@ -488,18 +479,40 @@ fn change(policy: &Policy, args: Value, remove: bool) -> Result<Value> {
         "manager": m.name(),
         "requested": packages,
         if remove { "removed" } else { "installed" }: if done.success() { changed } else { None },
-        "elevated": prefix.is_some(),
+        "elevated": elevated,
         "duration_secs": done.duration.as_secs(),
         "output": tail(&done.stdout),
     });
     if !done.success() {
-        let mut why = done.complaint();
-        if why.contains("a password is required") {
-            why.push_str(" (sudo needs a password here; see [admin] elevate in the Orion policy)");
-        }
-        out["error"] = json!(tail(&why));
+        out["error"] = json!(complaint(&done));
     }
     Ok(out)
+}
+
+/// Run a package manager command line as root, within `timeout_secs`.
+/// For apt, `argv` starts with `DEBIAN_FRONTEND=noninteractive`: `env`
+/// carries it through sudo, which resets the environment.
+pub(super) fn run_as_root(policy: &Policy, m: Manager, mut argv: Vec<String>) -> Result<(exec::Finished, bool)> {
+    let program = if m == Manager::Apt { "env".to_string() } else { argv.remove(0) };
+    let prefix = exec::elevation(&policy.admin.elevate)?;
+    let cmd = exec::command_as(prefix.as_deref(), &program, &argv);
+    let done = exec::run(cmd, None, Duration::from_secs(policy.packages.timeout_secs.max(30)), 256 << 10)?;
+    Ok((done, prefix.is_some()))
+}
+
+/// The last lines, each as it ended up (progress counters redraw with \r).
+pub(super) fn tail(s: &str) -> String {
+    let lines: Vec<&str> = s.lines().map(|l| l.rsplit('\r').next().unwrap_or(l)).collect();
+    lines[lines.len().saturating_sub(20)..].join("\n")
+}
+
+/// Why a package manager run failed, with a hint when sudo wanted a password.
+pub(super) fn complaint(done: &exec::Finished) -> String {
+    let mut why = done.complaint();
+    if why.contains("a password is required") {
+        why.push_str(" (sudo needs a password here; see [admin] elevate in the Orion policy)");
+    }
+    tail(&why)
 }
 
 pub struct PkgInstall;

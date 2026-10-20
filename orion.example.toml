@@ -59,6 +59,9 @@ allowed = []                    # pkg_install without asking, e.g. ["python3-*",
 # marks essential or required are protected as well.
 protected = ["sudo", "systemd", "systemd-*", "openssh-server", "openssh", "linux", "linux-image-*", "kernel",
              "kernel-core", "bubblewrap", "apt", "dnf", "pacman", "dpkg", "rpm", "glibc", "libc6", "bash"]
+# update_apply runs that need no approval: "ask" (none), "security" (security-only
+# updates) or "all". An update that would remove packages always asks.
+updates = "ask"
 timeout_secs = 900
 
 # Local inference servers and the VRAM they share (model_status, model_load, ...).
