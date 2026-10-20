@@ -34,6 +34,11 @@ allowed_commands = []
 # allowed_commands = ["uname", "df", "free", "nvidia-smi", "git"]
 timeout_secs = 30
 max_output_bytes = 65536   # per stream
+# Processes proc_signal never stops, by name: the ones the session, the network
+# or the machine stand on. Orion itself and its parents are never stopped either.
+protected = ["systemd", "systemd-*", "init", "sshd", "sshd-*", "dbus-daemon", "dbus-broker*", "polkitd",
+             "NetworkManager", "Xorg", "Xwayland", "gnome-shell", "kwin_*", "plasmashell", "gdm*", "sddm*",
+             "lightdm*", "login", "agetty", "orion"]
 
 # How Orion gets root for system services and packages: "auto" (nothing when
 # Orion runs as root; otherwise services are tried directly, which polkit may

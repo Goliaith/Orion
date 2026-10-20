@@ -712,7 +712,7 @@ fn deleted_files(maps: &str, exe: Option<&str>) -> Vec<String> {
 
 /// `0::/system.slice/ssh.service` → ssh.service (system);
 /// `…/user@1000.service/app.slice/pipewire.service` → pipewire.service (user).
-fn unit_of(cgroup: &str) -> Option<(String, bool)> {
+pub(super) fn unit_of(cgroup: &str) -> Option<(String, bool)> {
     let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
     let unit = path.rsplit('/').find(|c| c.ends_with(".service") || c.ends_with(".scope"))?;
     if unit.ends_with(".scope") || unit.starts_with("user@") {

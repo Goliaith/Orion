@@ -73,11 +73,24 @@ pub struct ProcPolicy {
     pub timeout_secs: u64,
     /// Per stream (stdout and stderr are capped separately).
     pub max_output_bytes: usize,
+    /// Processes `proc_signal` never stops, by name (`*` wildcards): the
+    /// ones the session, the network or the machine stand on.
+    pub protected: Vec<String>,
 }
 
 impl Default for ProcPolicy {
     fn default() -> Self {
-        Self { allowed_commands: Vec::new(), timeout_secs: 30, max_output_bytes: 64 << 10 }
+        let protected = [
+            "systemd", "systemd-*", "init", "sshd", "sshd-*", "dbus-daemon", "dbus-broker*", "polkitd", "NetworkManager",
+            "Xorg", "Xwayland", "gnome-shell", "kwin_*", "plasmashell", "gdm*", "sddm*", "lightdm*", "login", "agetty",
+            "orion",
+        ];
+        Self {
+            allowed_commands: Vec::new(),
+            timeout_secs: 30,
+            max_output_bytes: 64 << 10,
+            protected: protected.map(String::from).to_vec(),
+        }
     }
 }
 

@@ -212,6 +212,8 @@ orion call update_apply '{"full": true}'                  # also updates that re
 
 A routine that works well: security fixes install on a schedule (below); you ask "check for updates" now and then and review the rest.
 
+With the [privileged helper](install.md#the-privileged-helper-recommended) set up, a timer of your own does it too, with no root unit: set `[packages] updates = "security"`, then `timer_create '{"name": "security-updates", "schedule": "daily", "tool": "update_apply", "args": {"security_only": true}}'`. The system timer below does the same as root, without the helper, and runs whether or not you're logged in.
+
 #### Scheduled security updates
 
 With `[packages] updates = "security"` and `update_apply` left at `ask`, a security-only update needs no approval, and any other update still does. With nobody to ask, "any other" means refused. That makes a timer safe: it can install security fixes and nothing else.
@@ -265,6 +267,50 @@ journalctl -u orion-updates                    # what was checked and installed,
 This needs the binary in `/usr/local/bin` ([installing for every user](install.md#1-build-and-install)). It runs as root, so it needs no sudo rule. The first step refreshes the package lists; the second installs only security fixes, never removes a package, and says which services to restart and whether to reboot. Orion never restarts or reboots on its own.
 
 `orion call` exits non-zero, so the service run shows as failed, when a call is refused, can't start, or the package manager fails partway. In that last case the result says `"ok": false` with the error, and the audit log records the failure. Arch has no security labels, so this does nothing there.
+
+### Files
+
+```sh
+orion call fs_find '{"path": "~", "name": "*.pdf"}'                 # by name, ignoring case
+orion call fs_find '{"path": "~/notes", "contains": "dentist"}'     # by text inside, with the line
+orion call fs_copy '{"from": "~/orion-workspace/report.md", "to": "~/orion-workspace/old"}'
+orion call fs_move '{"from": "~/orion-workspace/draft.md", "to": "~/orion-workspace/final.md"}'
+orion call fs_delete '{"path": "~/orion-workspace/old"}'           # to the Trash; "recursive" for a full folder
+```
+
+Changes stay inside `[fs] write_roots`. Symlinks are handled as links, never followed out of a root. A deleted file is in the Trash until you empty it; `"permanent": true` skips the Trash.
+
+### Processes
+
+```sh
+orion call proc_list '{"sort": "memory", "limit": 10}'
+orion call proc_signal '{"name": "firefox"}'                        # term, then wait up to 5 s
+orion call proc_signal '{"pid": 4242, "escalate": true}'            # and kill it if term isn't enough
+orion call proc_signal '{"name": "ffmpeg", "signal": "stop"}'       # pause; "cont" resumes
+```
+
+PID 1, kernel threads, Orion itself and what it runs under, protected services' processes and `[proc] protected` are never signalled. A process a service runs may come back; stop the service with `svc_control` instead.
+
+### The journal
+
+```sh
+orion call journal_read '{"priority": "err", "since": "today"}'     # errors and worse, today
+orion call journal_read '{"unit": "ollama", "since": "1h ago"}'
+orion call journal_read '{"boot": -1, "priority": "warning", "lines": 200}'   # why did the last boot go wrong?
+orion call journal_read '{"kernel": true, "grep": "usb"}'
+```
+
+Seeing other users' and the system's entries needs the `systemd-journal` (or `adm`) group: `sudo usermod -aG systemd-journal "$USER"`.
+
+### Timers
+
+```sh
+orion call timer_list
+orion call timer_create '{"name": "disk-report", "schedule": "Mon 09:00", "tool": "proc_run", "args": {"command": "df", "args": ["-h"]}}'
+orion call timer_remove '{"name": "disk-report"}'
+```
+
+A timer runs its tool call through the policy and audit log when it fires, with nobody there to approve it, so the call must be pre-approved. For the one above, `df` goes in `[proc] allowed_commands`; `timer_create` refuses until it is. Each run is in the audit log as `"caller": "timer disk-report"`, and in `journalctl --user -u orion-timer-disk-report`.
 
 ### Services
 

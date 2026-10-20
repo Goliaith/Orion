@@ -2,8 +2,10 @@
 
 mod disks;
 pub(crate) mod exec;
+mod fileops;
 mod fs;
 pub mod gpu;
+mod journal;
 mod models;
 mod netconf;
 mod network;
@@ -11,6 +13,7 @@ mod packages;
 mod process;
 mod services;
 mod system;
+mod timers;
 mod updates;
 
 use anyhow::{bail, ensure, Result};
@@ -79,11 +82,21 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(fs::FsList),
         Box::new(fs::FsRead),
         Box::new(fs::FsWrite),
+        Box::new(fileops::FsFind),
+        Box::new(fileops::FsMkdir),
+        Box::new(fileops::FsCopy),
+        Box::new(fileops::FsMove),
+        Box::new(fileops::FsDelete),
         Box::new(process::ProcList),
         Box::new(process::ProcRun),
+        Box::new(process::ProcSignal),
         Box::new(services::SvcList),
         Box::new(services::SvcStatus),
         Box::new(services::SvcControl),
+        Box::new(journal::JournalRead),
+        Box::new(timers::TimerList),
+        Box::new(timers::TimerCreate),
+        Box::new(timers::TimerRemove),
         Box::new(packages::PkgList),
         Box::new(packages::PkgSearch),
         Box::new(packages::PkgInfo),

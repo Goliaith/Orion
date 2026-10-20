@@ -47,11 +47,21 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `fs_list`      | read    | allow   | Directory listing inside the readable roots |
 | `fs_read`      | read    | allow   | Read a file, or a byte range of one, inside the readable roots |
 | `fs_write`     | write   | ask     | Write or append to a file inside the writable roots |
+| `fs_find`      | read    | allow   | Find files by name (wildcards) or by text they contain |
+| `fs_mkdir`     | write   | ask     | Create a folder inside the writable roots |
+| `fs_copy`      | write   | ask     | Copy a file or folder, within the writable roots |
+| `fs_move`      | write   | ask     | Move or rename a file or folder, within the writable roots |
+| `fs_delete`    | write   | ask     | Delete to the Trash (or for good), within the writable roots |
 | `proc_list`    | read    | allow   | Processes, with filtering and sorting by memory |
 | `proc_run`     | execute | ask     | Run one program (no shell) in the [sandbox](#sandbox), with a timeout and an output cap |
+| `proc_signal`  | write   | ask     | Stop, interrupt, pause or resume a process; never the ones the system stands on |
 | `svc_list`     | read    | allow   | systemd units: running, failed or stopped, and enabled at boot |
 | `svc_status`   | read    | allow   | One unit's state, last result, memory, CPU, restarts and recent log |
 | `svc_control`  | write   | ask     | Start, stop, restart, reload, enable or disable a unit (critical ones are protected) |
+| `journal_read` | read    | allow   | The system journal, by unit, time, priority, boot or text |
+| `timer_list`   | read    | allow   | systemd timers: what each runs, when it ran and runs next |
+| `timer_create` | write   | ask     | Schedule a tool call, run through the policy and audit log when it fires |
+| `timer_remove` | write   | ask     | Remove a timer Orion made |
 | `pkg_list`     | read    | allow   | Installed packages (apt, dnf, zypper or pacman) |
 | `pkg_search`   | read    | allow   | Search the repositories |
 | `pkg_info`     | read    | allow   | One package: installed and available versions, description, dependencies |
@@ -509,6 +519,36 @@ Or in a client's JSON config:
 
 Beyond files and processes, the AI sees and manages the parts of the machine an AI-first system cares about.
 
+### Files
+
+`fs_list`, `fs_read` and `fs_find` look inside the readable roots; `fs_write`, `fs_mkdir`, `fs_copy`, `fs_move` and `fs_delete` change things only inside the writable roots.
+
+- **Symlinks are never followed out.** Copying, moving and deleting handle a link as the link itself, so a link inside a root can't reach anything outside it. Copies keep links as links.
+- **Nothing is replaced unless asked** (`overwrite`, and never a folder). Copying or moving into an existing folder puts it inside, as `cp` and `mv` do. A move across filesystems copies, then removes the original.
+- **Deleting goes to the Trash,** the freedesktop one file managers show and restore from. `permanent: true` deletes for good, and a folder with things in it needs `recursive: true`.
+- **`fs_find`** matches names ignoring case, with `*` and `?` or any part of the name, and can look for text inside small files (up to 1 MiB), giving the line it found. It skips hidden files unless asked, and stops at 100,000 entries or 15 seconds.
+
+### Processes
+
+`proc_list` shows processes; `proc_signal` sends one a signal (`term` by default, or `kill`, `int`, `hup`, `stop`, `cont`, `usr1`, `usr2`), by pid or by name, then waits for it to exit. With `escalate`, what ignores `term` is killed when the wait is over.
+
+- **Never stopped, whatever you approve:** PID 1, kernel threads, Orion itself and everything it runs under, processes of protected services, and the names in `[proc] protected` (systemd, sshd, D-Bus, NetworkManager, the display server and login manager, …).
+- **A name must be unambiguous,** or `all: true` acts on every process of that name.
+- **Processes a service runs are named with their service,** since systemd may start them again; `svc_control` stops a service for good.
+
+### The journal
+
+`journal_read` reads systemd's journal: by unit, by time (`since` and `until`, like `"1h ago"`, `"today"` or `"2026-10-20 09:00"`), by priority (`"err"` and worse), by boot (`-1` is the one before), kernel messages only, or entries containing some text. Without the `systemd-journal` group, only your own processes' entries are shown, and the result says so.
+
+### Timers
+
+`timer_list` lists every systemd timer, the system's and yours, with its schedule, what it runs, and when it last ran and runs next. `timer_create` schedules a tool call (`"daily"`, `"Mon..Fri 08:30"`, any systemd calendar schedule), and `timer_remove` removes one.
+
+- **A scheduled call is an ordinary call.** The timer runs `orion call <tool> <args>`, so when it fires the call goes through the policy, the sandbox and the audit log (as `"caller": "timer <name>"`), with nobody there to approve it.
+- **So only calls that would run unattended can be scheduled.** `timer_create` refuses a call the policy would only ask about, and says what to pre-approve: `[proc] allowed_commands` for `proc_run`, `[packages] updates` for `update_apply`, or the tool itself.
+- **Schedules are checked by systemd** (`systemd-analyze calendar`) before anyone is asked, and the result shows the next runs.
+- **They are your user timers,** in `~/.config/systemd/user/orion-timer-<name>.*`. They run while you are logged in, or always with `loginctl enable-linger`. Root work in them (security updates, say) goes through the [privileged helper](#the-privileged-helper).
+
 ### Services
 
 `svc_list`, `svc_status` and `svc_control` work on systemd units: the machine's (`scope: "system"`, the default) or your own (`"user"`).
@@ -719,8 +759,9 @@ src/
   helper.rs     the privileged helper: the root service, its client, who may use it;
                 each tool module checks its own commands (helper_check)
   sandbox.rs    sandboxing for proc_run: bubblewrap, Landlock, resource limits
-  tools/        built-in tools: system, fs, process, network, services
-                (systemd), packages, models (inference servers, VRAM budget), gpu
+  tools/        built-in tools: system, fs and fileops (copy, move, delete, find),
+                process (list, run, signal), network, services (systemd), journal,
+                timers, packages, models (inference servers, VRAM budget), gpu
                 (recognition, per-process use, placement, gpu_assign), netconf
                 (Wi-Fi, connections, firewall), disks (disks, usage, mounts), updates
                 (pending updates, upgrading, restarts and reboots);

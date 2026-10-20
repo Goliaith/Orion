@@ -39,7 +39,7 @@ const CONTROLLABLE: [&str; 4] = [".service", ".socket", ".timer", ".path"];
 
 /// A unit name as systemd would take it, with `.service` added when the
 /// name has no type. Anything that could be read as an option is refused.
-fn unit_name(raw: &str) -> Result<String> {
+pub(super) fn unit_name(raw: &str) -> Result<String> {
     let raw = raw.trim();
     ensure!(!raw.is_empty() && raw.len() <= 255, "a unit name is 1 to 255 characters");
     ensure!(!raw.starts_with('-'), "{raw:?} is not a unit name");

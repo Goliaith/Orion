@@ -1,10 +1,11 @@
 use std::fs;
 use std::time::Duration;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::exec::glob_match;
 use crate::policy::Policy;
 use crate::tool::{parse_args, Preapproval, Risk, Tool};
 
@@ -209,6 +210,222 @@ impl Tool for ProcRun {
             "stdout_truncated": done.stdout_truncated,
             "stderr_truncated": done.stderr_truncated,
             "sandbox": sandbox.name(),
+        }))
+    }
+}
+
+pub struct ProcSignal;
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+enum Signal {
+    #[default]
+    Term,
+    Kill,
+    Int,
+    Hup,
+    Stop,
+    Cont,
+    Usr1,
+    Usr2,
+}
+
+impl Signal {
+    fn number(self) -> i32 {
+        match self {
+            Signal::Term => libc::SIGTERM,
+            Signal::Kill => libc::SIGKILL,
+            Signal::Int => libc::SIGINT,
+            Signal::Hup => libc::SIGHUP,
+            Signal::Stop => libc::SIGSTOP,
+            Signal::Cont => libc::SIGCONT,
+            Signal::Usr1 => libc::SIGUSR1,
+            Signal::Usr2 => libc::SIGUSR2,
+        }
+    }
+
+    /// Whether the process is meant to go away.
+    fn ends(self) -> bool {
+        matches!(self, Signal::Term | Signal::Kill | Signal::Int)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignalArgs {
+    pid: Option<u32>,
+    /// The program's name, as proc_list shows it.
+    name: Option<String>,
+    #[serde(default)]
+    signal: Signal,
+    /// With `name`: every process of that name, not just one.
+    #[serde(default)]
+    all: bool,
+    #[serde(default = "default_wait")]
+    wait_secs: u64,
+    /// After `term` or `int`, `kill` what is still running when the wait is over.
+    #[serde(default)]
+    escalate: bool,
+}
+
+fn default_wait() -> u64 {
+    5
+}
+
+/// A process `proc_signal` may act on: (pid, name, its systemd unit).
+struct Target {
+    pid: u32,
+    name: String,
+    unit: Option<String>,
+}
+
+/// Orion's own process and the ones it runs under (the shell, the chat,
+/// the terminal): stopping those would stop Orion.
+fn own_lineage() -> Vec<u32> {
+    let mut out = vec![std::process::id()];
+    while let Some(ppid) = read_proc(*out.last().unwrap_or(&1)).and_then(|p| p.ppid) {
+        if ppid <= 1 || out.contains(&ppid) {
+            break;
+        }
+        out.push(ppid);
+    }
+    out
+}
+
+fn check_target(policy: &Policy, pid: u32) -> Result<Target> {
+    let p = read_proc(pid).with_context(|| format!("there is no process {pid}"))?;
+    ensure!(pid > 1, "PID 1 runs the whole system; Orion never signals it");
+    // Kernel threads have no program file and descend from kthreadd (PID 2).
+    ensure!(pid != 2 && p.ppid != Some(2), "{pid} ({}) is a kernel thread", p.name);
+    ensure!(!own_lineage().contains(&pid), "{pid} ({}) is Orion itself, or what it runs under", p.name);
+    if let Some(pat) = policy.proc.protected.iter().find(|pat| glob_match(pat, &p.name)) {
+        bail!("{pid} ({}) is protected (proc.protected: {pat:?}); no approval can stop it", p.name);
+    }
+    let unit = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok().as_deref().and_then(super::updates::unit_of).map(|(u, _)| u);
+    if let Some(u) = &unit {
+        if let Some(pat) = policy.services.protected.iter().find(|pat| glob_match(pat, u)) {
+            bail!("{pid} ({}) belongs to {u}, which is protected (services.protected: {pat:?})", p.name);
+        }
+    }
+    // SAFETY: getuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    if me != 0 {
+        let owner = fs::metadata(format!("/proc/{pid}")).map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(0);
+        ensure!(owner == me, "{pid} ({}) belongs to another user", p.name);
+    }
+    Ok(Target { pid, name: p.name, unit })
+}
+
+fn targets(policy: &Policy, a: &SignalArgs) -> Result<Vec<Target>> {
+    match (a.pid, &a.name) {
+        (Some(pid), None) => Ok(vec![check_target(policy, pid)?]),
+        (None, Some(name)) => {
+            ensure!(!name.is_empty(), "name a process");
+            let pids: Vec<u32> = all_pids().into_iter().filter(|&pid| read_proc(pid).is_some_and(|p| p.name == *name)).collect();
+            ensure!(!pids.is_empty(), "no process is called {name:?} (proc_list shows the names)");
+            ensure!(
+                pids.len() == 1 || a.all,
+                "{} processes are called {name:?} (PIDs {}); name one by pid, or set all",
+                pids.len(),
+                pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+            );
+            ensure!(pids.len() <= 50, "{} processes are called {name:?}; that's more than Orion stops at once", pids.len());
+            pids.into_iter().map(|pid| check_target(policy, pid)).collect()
+        }
+        _ => bail!("give either pid or name"),
+    }
+}
+
+fn all_pids() -> Vec<u32> {
+    fs::read_dir("/proc")
+        .map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Gone, or a zombie waiting for its parent: either way, it has exited.
+fn exited(pid: u32) -> bool {
+    read_proc(pid).is_none_or(|p| p.state == "Z")
+}
+
+fn send(pid: u32, signal: Signal) -> Result<()> {
+    // SAFETY: kill(2) has no memory-safety preconditions.
+    let r = unsafe { libc::kill(pid as libc::pid_t, signal.number()) };
+    ensure!(r == 0, "signalling {pid}: {}", std::io::Error::last_os_error());
+    Ok(())
+}
+
+fn wait_exit(pids: &[u32], secs: u64) {
+    let until = std::time::Instant::now() + Duration::from_secs(secs);
+    while std::time::Instant::now() < until && !pids.iter().all(|&p| exited(p)) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+impl Tool for ProcSignal {
+    fn name(&self) -> &'static str {
+        "proc_signal"
+    }
+
+    fn description(&self) -> &'static str {
+        "Stop, interrupt, pause or resume a process by pid or name: send it a signal (term by default), wait for it \
+         to exit, and with `escalate` kill it if it doesn't. Never PID 1, kernel threads, Orion itself, or the \
+         processes the session, network and machine stand on. For a process a systemd service runs, svc_control \
+         is the better way; the result says which service it is."
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Write
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pid": { "type": "integer", "minimum": 2 },
+                "name": { "type": "string", "description": "The process name as proc_list shows it; give this or pid." },
+                "signal": { "type": "string", "enum": ["term", "kill", "int", "hup", "stop", "cont", "usr1", "usr2"], "default": "term" },
+                "all": { "type": "boolean", "default": false, "description": "With name: every process of that name." },
+                "wait_secs": { "type": "integer", "minimum": 0, "maximum": 60, "default": 5 },
+                "escalate": { "type": "boolean", "default": false, "description": "After term or int, kill what is still running when the wait is over." }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
+        targets(policy, &parse_args(args.clone())?).map(drop)
+    }
+
+    fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
+        let a: SignalArgs = parse_args(args)?;
+        ensure!(a.wait_secs <= 60, "wait at most 60 seconds");
+        let found = targets(policy, &a)?;
+        for t in &found {
+            send(t.pid, a.signal)?;
+        }
+        let pids: Vec<u32> = found.iter().map(|t| t.pid).collect();
+        if a.signal.ends() {
+            wait_exit(&pids, a.wait_secs);
+        }
+        let mut escalated = Vec::new();
+        if a.escalate && a.signal != Signal::Kill && a.signal.ends() {
+            for &pid in pids.iter().filter(|&&p| !exited(p)) {
+                if send(pid, Signal::Kill).is_ok() {
+                    escalated.push(pid);
+                }
+            }
+            wait_exit(&escalated, 2);
+        }
+        Ok(json!({
+            "signal": format!("{:?}", a.signal).to_uppercase(),
+            "processes": found.iter().map(|t| json!({
+                "pid": t.pid,
+                "name": t.name,
+                "exited": a.signal.ends().then(|| exited(t.pid)),
+                "killed_after_wait": escalated.contains(&t.pid),
+                "service": t.unit,
+                "note": t.unit.as_ref().filter(|u| u.ends_with(".service")).map(|u| format!("{u} may start it again; svc_control stops a service for good")),
+            })).collect::<Vec<_>>(),
         }))
     }
 }

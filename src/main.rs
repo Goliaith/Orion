@@ -199,6 +199,9 @@ enum Cmd {
         /// Arguments as a JSON object.
         #[arg(default_value = "{}")]
         args: String,
+        /// Who is asking, for the audit log (a timer names itself).
+        #[arg(long)]
+        caller: Option<String>,
     },
     /// Print the most recent audit log entries.
     Audit {
@@ -343,11 +346,11 @@ fn main() -> Result<()> {
             println!("root access for the machine tools: {}", orion::tools::root_access(orion.policy()));
             Ok(())
         }
-        Cmd::Call { name, args } => {
+        Cmd::Call { name, args, caller } => {
             let args = serde_json::from_str(&args).context("arguments must be a JSON object")?;
             let orion = Orion::new(policy);
             let approver = PromptApprover::new();
-            let value = orion.call(&name, args, approver.as_ref().map(|a| a as &dyn Approver))?;
+            let value = orion.call_as(&name, args, approver.as_ref().map(|a| a as &dyn Approver), caller.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             // It ran, but what it drove failed (a package manager partway):
             // exit non-zero, so scripts and services see it.
