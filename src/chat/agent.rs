@@ -16,6 +16,9 @@ use crate::{interrupt, Decision, Orion, Tool};
 
 pub enum ToAgent {
     Turn(String),
+    /// A request spoken by an enrolled person: their name goes before it,
+    /// and their limits hold for the turn.
+    Spoken { text: String, by: crate::voice::Person },
     /// A slash command, without the slash.
     Command(String),
     CycleMode,
@@ -90,6 +93,8 @@ struct ChannelUi<'a> {
     tx: &'a Sender<FromAgent>,
     always: &'a mut HashSet<String>,
     answered_at: Option<Instant>,
+    /// Who spoke this turn's request, if it was spoken.
+    speaker: Option<crate::voice::Person>,
 }
 
 impl ChannelUi<'_> {
@@ -164,7 +169,18 @@ impl Ui for ChannelUi<'_> {
         self.send(FromAgent::Confirm { question: question.to_string(), reply });
         Self::wait(rx, false)
     }
+
+    fn refuses(&mut self, _tool: &str, risk: crate::tool::Risk) -> Option<String> {
+        let s = self.speaker.as_ref()?;
+        s.tools.refuses(&s.name, risk)
+    }
+
+    fn caller(&self) -> Option<String> {
+        self.speaker.as_ref().map(|s| format!("{} (by voice)", s.name))
+    }
 }
+
+pub use crate::voice::capitalize;
 
 /// Serve the screen thread until it hangs up or a command quits.
 pub fn run(orion: &Orion, mut session: Session, saver: Saver, rx: Receiver<ToAgent>, tx: Sender<FromAgent>) {
@@ -179,9 +195,14 @@ pub fn run(orion: &Orion, mut session: Session, saver: Saver, rx: Receiver<ToAge
     for msg in rx {
         let mut out = String::new();
         match msg {
-            ToAgent::Turn(text) => {
+            ToAgent::Turn(_) | ToAgent::Spoken { .. } => {
+                let (text, speaker) = match msg {
+                    ToAgent::Spoken { text, by } => (format!("{} (by voice): {text}", capitalize(&by.name)), Some(by)),
+                    ToAgent::Turn(text) => (text, None),
+                    _ => unreachable!(),
+                };
                 interrupt::clear();
-                let mut ui = ChannelUi { tx: &tx, always: &mut always, answered_at: None };
+                let mut ui = ChannelUi { tx: &tx, always: &mut always, answered_at: None, speaker };
                 if let Err(e) = session.turn(&text, &mut ui) {
                     send(FromAgent::Error(format!("{e:#}")));
                 }

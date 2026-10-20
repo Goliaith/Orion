@@ -219,19 +219,36 @@ How it works: the microphone stays open, and a pause detector (with a noise floo
 
 #### Speaker verification
 
-Enroll your voice and only you can wake Orion. Other people, and the television, are ignored.
+Enroll your voice, and the voices of the people you live or work with, and only you can wake Orion. Everyone else, and the television, is ignored. Orion knows who is asking.
 
 ```sh
-orion voice model install   # the neural speaker model: about 16 MB from PyPI, once
-orion voice enroll          # say six short phrases; about a minute
-orion voice test            # say anything: "That's you: similarity 0.86 (needs at least 0.80)"
-orion voice status
-orion voice forget          # anyone can wake Orion again
+orion voice model install       # the neural speaker model: about 16 MB from PyPI, once
+orion voice enroll              # you: six short phrases, about a minute
+orion voice enroll --name ana   # and anyone else
+orion voice test                # say anything: "That's Ana: similarity 0.90 (needs at least 0.80)"
+orion voice status              # who is enrolled, and what each may do
+orion voice forget ana          # or --all: anyone can wake Orion again
 ```
 
 - **It applies wherever Orion listens for its wake word:** the full-screen chat, the shell and `orion listen`. It covers spoken approvals too, so "Orion, yes" from someone else approves nothing. Ctrl-T recordings aren't checked, since you're at the keyboard.
 - **Other voices are never transcribed.** Each utterance is checked before anything transcribes it, and one in another voice is dropped. Their words never reach the transcriber, and `/voice` shows how many were ignored.
 - **A bare "Orion" is often too short to judge**, so it may wake Orion, but the request that follows is judged together with it and must match. If it doesn't, the chat and the shell show "that didn't sound like your voice", and `orion listen` says "Sorry, I didn't recognize your voice."
+
+**Several people.** Each utterance is matched against everyone enrolled, and the closest person is taken if they are close enough.
+
+- **The AI is told who is asking:** "Ana (by voice): what's using the GPU?". The chat and the shell show the same.
+- **The audit log names them:** `"caller": "ana (by voice)"` on every tool call their request makes.
+- **What each person may do** is set under `[voice.people.<name>]` in the policy:
+
+  ```toml
+  [voice.people.kid]
+  tools = "read"      # "all" (default), "read" (only tools that look at the machine), or "none" (just talk)
+  approve = false     # may not answer approval prompts by voice (default true, with wake_approvals)
+  ```
+
+  A tool their request would need is refused before anyone is asked, whatever the policy otherwise allows. The AI is told why, and the refusal is in the audit log. Someone who may not approve hears "Sorry, Kid, you can't approve that," and the question stays open for someone who can.
+- **Enrolling warns** when a new person's phrases also match someone already enrolled, since Orion may mix the two up.
+- **The single voiceprint of earlier versions** moves to `~/.local/state/orion/voices/<login name>.json` the first time it's needed.
 
 There are two methods, and Orion uses the better one it has (`verify_method = "auto"`).
 
@@ -249,7 +266,7 @@ For both:
 
 - **It keeps other voices out; it isn't proof of identity.** A recording of you gets through, and so may a similar voice, which is why spoken approval stays off unless you turn on `wake_approvals`.
 - **Enroll where you usually talk to Orion,** with the same microphone, and enroll again if that changes. Enrollment warns about a phrase that doesn't match the rest.
-- **The voiceprint** is `~/.local/state/orion/voiceprint.json`, readable only by you. It holds averaged features that can't be turned back into speech. Programs the AI runs can't see it; the sandbox hides Orion's whole state directory.
+- **Voiceprints** are in `~/.local/state/orion/voices/`, one file per person, readable only by you. It holds averaged features that can't be turned back into speech. Programs the AI runs can't see it; the sandbox hides Orion's whole state directory.
 - **Settings** under `[voice]`:
   - `verify_speaker = "auto"`: on once a voice is enrolled. `"on"` refuses to listen without one, and `"off"` never checks.
   - `verify_method = "auto"`, `"neural"` or `"builtin"`.
@@ -594,4 +611,4 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. Next: run `orion chat` and the shell through it too, and route `ask` approvals from MCP agents to you.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. Next: GPU placement (which card a model goes on), network changes (Wi-Fi, firewall), disks and mounts, and updates.
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~ and ~~a neural speaker model~~ are done too. Next for voice: several enrolled people, and a benchmark on real recordings.
+5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. Next for voice: a benchmark on real recordings, and per-person conversations and memory.

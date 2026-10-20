@@ -55,7 +55,7 @@ pub struct Headless<L: Log> {
     log: L,
     /// Turns and commands sent and not yet done.
     in_flight: usize,
-    queued: Option<String>,
+    queued: Option<(String, Option<String>)>,
     asking: Option<(Asking, Instant)>,
     reply: String,
     last_done: Option<Instant>,
@@ -98,7 +98,7 @@ impl<L: Log> Headless<L> {
     }
 
     /// Ask the conversation, starting a new one after a long quiet spell.
-    fn ask(&mut self, text: String) {
+    fn ask(&mut self, text: String, speaker: Option<String>) {
         let mins = self.voice.config.listen_new_after_mins;
         let stale = self.last_done.is_some_and(|t| mins > 0 && t.elapsed() >= Duration::from_secs(mins * 60));
         if stale && self.turns > 0 {
@@ -106,9 +106,15 @@ impl<L: Log> Headless<L> {
             self.send(ToAgent::Command("new".into()));
             self.turns = 0;
         }
-        self.log.line(&format!("you: {text}"));
+        self.log.line(&format!("{}: {text}", speaker.as_deref().unwrap_or("you")));
         self.turns += 1;
-        self.send(ToAgent::Turn(text));
+        match speaker {
+            Some(name) => {
+                let by = self.voice.config.who(&name);
+                self.send(ToAgent::Spoken { text, by })
+            }
+            None => self.send(ToAgent::Turn(text)),
+        }
     }
 
     pub fn on_wake(&mut self, ev: WakeEvent) {
@@ -126,30 +132,30 @@ impl<L: Log> Headless<L> {
                 self.log.line(&format!("the microphone stopped: {e} (trying again in {}s)", RETRY.as_secs()));
                 self.failed_at = Some(Instant::now());
             }
-            WakeEvent::Request(text) => {
+            WakeEvent::Request { text, speaker } => {
                 self.voice.hush();
-                if let Some((asking, _)) = self.asking.take() {
-                    return self.answer(asking, &text);
+                if let Some((asking, at)) = self.asking.take() {
+                    return self.answer(asking, at, &text, speaker.as_deref());
                 }
                 if is_stop_request(&text) {
-                    self.log.line(&format!("you: {text}"));
+                    self.log.line(&format!("{}: {text}", speaker.as_deref().unwrap_or("you")));
                     if self.busy() {
                         interrupt::request();
                         self.queued = None;
                     }
                 } else if self.busy() {
                     self.log.line(&format!("(queued: {text})"));
-                    self.queued = Some(text);
+                    self.queued = Some((text, speaker));
                     self.say("I'll do that next.");
                 } else {
-                    self.ask(text);
+                    self.ask(text, speaker);
                 }
             }
         }
     }
 
     /// A spoken answer to the question asked aloud.
-    fn answer(&mut self, asking: Asking, text: &str) {
+    fn answer(&mut self, asking: Asking, asked_at: Instant, text: &str, speaker: Option<&str>) {
         let yes = match spoken_answer(text) {
             Some(yes) => yes,
             None if is_stop_request(text) => false,
@@ -160,7 +166,15 @@ impl<L: Log> Headless<L> {
                 return;
             }
         };
-        self.log.line(&format!("you: {text} ({})", if yes { "approved" } else { "declined" }));
+        if yes && !self.voice.config.may_approve(speaker) {
+            // Someone else may still answer, until the question times out.
+            let name = speaker.unwrap_or_default();
+            self.log.line(&format!("{name}: {text} (may not approve: voice.people.{name})"));
+            self.say(&format!("Sorry, {}, you can't approve that.", super::agent::capitalize(name)));
+            self.asking = Some((asking, asked_at));
+            return;
+        }
+        self.log.line(&format!("{}: {text} ({})", speaker.unwrap_or("you"), if yes { "approved" } else { "declined" }));
         match asking {
             Asking::Approve(tx) => {
                 let _ = tx.send(if yes { Answer::Yes } else { Answer::No });
@@ -227,8 +241,8 @@ impl<L: Log> Headless<L> {
                 if !self.busy() {
                     self.last_done = Some(Instant::now());
                     self.asking = None;
-                    if let Some(text) = self.queued.take() {
-                        self.ask(text);
+                    if let Some((text, speaker)) = self.queued.take() {
+                        self.ask(text, speaker);
                     }
                 }
             }
@@ -391,10 +405,10 @@ mod tests {
     #[test]
     fn a_spoken_conversation() {
         let (mut h, rx, said, lines) = headless(false);
-        h.on_wake(WakeEvent::Request("how long has this machine been up?".into()));
+        h.on_wake(WakeEvent::Request { text: "how long has this machine been up?".into(), speaker: None });
         assert!(matches!(rx.try_recv().unwrap(), ToAgent::Turn(t) if t == "how long has this machine been up?"));
         // Asked while busy: queued, and sent when the first is done.
-        h.on_wake(WakeEvent::Request("and the load?".into()));
+        h.on_wake(WakeEvent::Request { text: "and the load?".into(), speaker: None });
         assert!(rx.try_recv().is_err());
         h.on_agent(FromAgent::Text("Up three days. ".into()));
         h.on_agent(FromAgent::Text("All is well.".into()));
@@ -419,30 +433,47 @@ mod tests {
         h.on_agent(FromAgent::Approve { tool: "svc_control".into(), preview, reply });
         assert!(spoken(&said, "May I restart ollama?").contains("Say orion yes, or orion no."));
         // Anything else is not an answer: it asks again and keeps waiting.
-        h.on_wake(WakeEvent::Request("what's the weather".into()));
+        h.on_wake(WakeEvent::Request { text: "what's the weather".into(), speaker: None });
         assert!(answer.try_recv().is_err());
-        h.on_wake(WakeEvent::Request("Yes.".into()));
+        h.on_wake(WakeEvent::Request { text: "Yes.".into(), speaker: None });
         assert_eq!(answer.try_recv().unwrap(), Answer::Yes);
 
         let (reply, answer) = mpsc::channel();
         h.on_agent(FromAgent::Approve { tool: "pkg_install".into(), preview: r#"{"packages":["htop"]}"#.into(), reply });
-        h.on_wake(WakeEvent::Request("no".into()));
+        h.on_wake(WakeEvent::Request { text: "no".into(), speaker: None });
         assert_eq!(answer.try_recv().unwrap(), Answer::No);
+    }
+
+    #[test]
+    fn only_people_allowed_may_approve_and_requests_name_the_speaker() {
+        let (mut h, rx, said, lines) = headless(true);
+        h.voice.config.people.insert("kid".into(), crate::voice::PersonPolicy { approve: false, ..Default::default() });
+        h.on_wake(WakeEvent::Request { text: "restart ollama".into(), speaker: Some("ana".into()) });
+        assert!(matches!(rx.try_recv().unwrap(), ToAgent::Spoken { by, .. } if by.name == "ana"));
+        let (reply, answer) = mpsc::channel();
+        h.on_agent(FromAgent::Approve { tool: "svc_control".into(), preview: r#"{"unit":"ollama","action":"restart"}"#.into(), reply });
+        h.on_wake(WakeEvent::Request { text: "yes".into(), speaker: Some("kid".into()) });
+        assert!(answer.try_recv().is_err(), "the kid can't approve");
+        assert!(spoken(&said, "Sorry, Kid").contains("Sorry, Kid, you can't approve that."));
+        h.on_wake(WakeEvent::Request { text: "yes".into(), speaker: Some("ana".into()) });
+        assert_eq!(answer.try_recv().unwrap(), Answer::Yes);
+        assert!(lines.0.lock().unwrap().iter().any(|l| l == "ana: restart ollama"));
     }
 
     #[test]
     fn starts_afresh_after_a_quiet_spell() {
         let (mut h, rx, _said, _) = headless(false);
         h.voice.config.listen_new_after_mins = 1;
-        h.on_wake(WakeEvent::Request("hello".into()));
+        h.on_wake(WakeEvent::Request { text: "hello".into(), speaker: None });
         h.on_agent(FromAgent::Done);
         h.last_done = Some(Instant::now() - Duration::from_secs(120));
-        h.on_wake(WakeEvent::Request("what time is it".into()));
+        h.on_wake(WakeEvent::Request { text: "what time is it".into(), speaker: None });
         let sent: Vec<String> = rx
             .try_iter()
             .map(|m| match m {
                 ToAgent::Turn(t) => t,
                 ToAgent::Command(c) => format!("/{c}"),
+                ToAgent::Spoken { text, by } => format!("{}: {text}", by.name),
                 ToAgent::CycleMode => "cycle".into(),
             })
             .collect();

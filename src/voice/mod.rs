@@ -24,6 +24,7 @@ pub use record::{Recorder, Recording};
 pub use speak::{Sentences, Speaker};
 pub use transcribe::Transcriber;
 pub use wake::{is_stop_request, spoken_answer, WakeEvent, WakeListener, WakeState};
+pub use speaker::{Heard, Identity};
 
 /// `[voice]` in orion.toml.
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +99,9 @@ pub struct VoiceConfig {
     /// Built-in method: the distortion ratio allowed, where 1.0 is typical
     /// for the enrolled speaker. Lower is stricter.
     pub verify_threshold: f32,
+    /// What each enrolled person may do by voice (`[voice.people.<name>]`).
+    /// People without an entry may do everything.
+    pub people: std::collections::BTreeMap<String, PersonPolicy>,
     /// `orion listen`: start a new conversation when the last request is
     /// this many minutes old (0: one conversation for good).
     pub listen_new_after_mins: u64,
@@ -137,6 +141,7 @@ impl Default for VoiceConfig {
             verify_method: VerifyMethod::Auto,
             verify_similarity: 0.8,
             verify_threshold: 1.2,
+            people: Default::default(),
         }
     }
 }
@@ -150,6 +155,52 @@ pub enum Verify {
     Off,
 }
 
+/// `[voice.people.<name>]`: what someone may do by voice.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonPolicy {
+    /// May answer approval prompts by voice (with `voice.wake_approvals`).
+    pub approve: bool,
+    /// Which tools their requests may use.
+    pub tools: ToolAccess,
+}
+
+impl Default for PersonPolicy {
+    fn default() -> Self {
+        Self { approve: true, tools: ToolAccess::All }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolAccess {
+    /// Whatever the policy allows.
+    #[default]
+    All,
+    /// Only tools that observe the machine (risk `read`).
+    Read,
+    /// No tools: conversation only.
+    None,
+}
+
+impl ToolAccess {
+    /// Why a tool of this risk is refused, if it is.
+    pub fn refuses(self, who: &str, risk: crate::tool::Risk) -> Option<String> {
+        match (self, risk) {
+            (ToolAccess::All, _) | (ToolAccess::Read, crate::tool::Risk::Read) => None,
+            (ToolAccess::Read, _) => Some(format!("{who} may only use tools that look at the machine (voice.people.{who}.tools = \"read\")")),
+            (ToolAccess::None, _) => Some(format!("{who} may not use tools (voice.people.{who}.tools = \"none\")")),
+        }
+    }
+}
+
+/// Who asked by voice, and what they may do.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Person {
+    pub name: String,
+    pub tools: ToolAccess,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifyMethod {
@@ -160,6 +211,20 @@ pub enum VerifyMethod {
 }
 
 impl VoiceConfig {
+    pub fn person(&self, name: &str) -> PersonPolicy {
+        self.people.get(name).copied().unwrap_or_default()
+    }
+
+    /// Someone who asked by voice, with their tool access.
+    pub fn who(&self, name: &str) -> Person {
+        Person { name: name.to_string(), tools: self.person(name).tools }
+    }
+
+    /// Whether this person's spoken "yes" may approve.
+    pub fn may_approve(&self, name: Option<&str>) -> bool {
+        self.wake_approvals && name.is_none_or(|n| self.person(n).approve)
+    }
+
     /// The neural speaker model, if installed and wanted.
     pub fn speaker_model(&self) -> Result<Option<neural::Ge2e>, String> {
         if self.verify_method == VerifyMethod::Builtin {
@@ -179,19 +244,20 @@ impl VoiceConfig {
         if self.verify_speaker == Verify::Off {
             return Ok(None);
         }
-        let path = speaker::Voiceprint::default_path().ok_or("no state directory for the voiceprint (is HOME set?)")?;
-        if !path.exists() {
+        let people = speaker::Voiceprint::all().map_err(|e| format!("{e:#}"))?;
+        if people.is_empty() {
             return match self.verify_speaker {
                 Verify::On => Err("speaker verification is on, but no voice is enrolled: run `orion voice enroll`".into()),
                 _ => Ok(None),
             };
         }
-        let print = speaker::Voiceprint::load(&path).map_err(|e| format!("{e:#}"))?;
         let model = self.speaker_model()?;
-        if self.verify_method == VerifyMethod::Neural && print.neural.is_none() {
-            return Err("your voice was enrolled without the neural model: run `orion voice enroll` again".into());
+        if self.verify_method == VerifyMethod::Neural {
+            if let Some(v) = people.iter().find(|v| v.neural.is_none()) {
+                return Err(format!("{} was enrolled without the neural model: run `orion voice enroll --name {}` again", v.name, v.name));
+            }
         }
-        Ok(Some(speaker::Judge::new(print, model, self.verify_threshold, self.verify_similarity)))
+        Ok(Some(speaker::Judge::new(people, model, self.verify_threshold, self.verify_similarity)))
     }
 }
 
@@ -350,11 +416,13 @@ impl VoiceIo {
                             (Ok(None), _) => "anyone (orion voice enroll: only you)".into(),
                             (Ok(Some(j)), w) => {
                                 let how = match j.method() {
-                                    speaker::Method::Neural => "neural model",
-                                    speaker::Method::Codebook => "built-in method",
+                                    Some(speaker::Method::Neural) => "neural model",
+                                    Some(speaker::Method::Codebook) => "built-in method",
+                                    None => "neural model and built-in method",
                                 };
+                                let names: Vec<&str> = j.people.iter().map(|v| v.name.as_str()).collect();
                                 let ignored = w.as_ref().map(|w| format!("; {} others ignored", w.ignored())).unwrap_or_default();
-                                format!("only your voice ({how}, {} phrases enrolled){ignored}", j.print.phrases)
+                                format!("only {} ({how}){ignored}", names.join(", "))
                             }
                         }
                     ),
@@ -372,6 +440,12 @@ impl VoiceIo {
             }
         }
     }
+}
+
+/// "ana" → "Ana", for addressing people.
+pub fn capitalize(name: &str) -> String {
+    let mut c = name.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 /// The command that plays a WAV file (`{wav}`): `voice.play_command`, or

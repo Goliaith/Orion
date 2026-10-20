@@ -172,6 +172,10 @@ verify_method = "auto"          # the neural model when installed (`orion voice 
                                 # else built-in; or "neural", "builtin"
 verify_similarity = 0.8         # neural: cosine similarity needed; higher is stricter
 verify_threshold = 1.2          # built-in: about 1.0 is typical for you; lower is stricter
+# What each enrolled person may do by voice (people without an entry may do everything):
+# [voice.people.kid]
+# tools = "read"                # "all", "read" (only tools that look at the machine), "none"
+# approve = false               # may not answer approval prompts by voice
 # Headless voice (`orion listen`) always listens and speaks.
 listen_new_after_mins = 10      # a new conversation after this long a quiet spell (0: never)
 

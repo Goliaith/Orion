@@ -129,6 +129,21 @@ impl Orion {
         });
         result
     }
+
+    /// Turn a call away before the policy is consulted (the person asking
+    /// may not use it), and record that in the audit log.
+    pub fn refuse(&self, name: &str, args: &Value, reason: &str, caller: Option<&str>) -> CallError {
+        self.audit.record(audit::Entry {
+            tool: name,
+            caller,
+            decision: Decision::Deny,
+            approved: None,
+            args,
+            error: Some(reason.to_string()),
+            duration: std::time::Duration::ZERO,
+        });
+        CallError::Denied(reason.to_string())
+    }
 }
 
 #[cfg(test)]

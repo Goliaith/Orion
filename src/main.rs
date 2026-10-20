@@ -33,14 +33,22 @@ enum ConversationCmd {
 
 #[derive(Subcommand)]
 enum VoiceCmd {
-    /// Teach Orion your voice, so only you can wake it.
-    Enroll,
-    /// Say something and see whether Orion takes it for your voice.
+    /// Teach Orion someone's voice; only enrolled people can wake it.
+    Enroll {
+        /// Whose voice (default: your login name, for the first person).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Say something and see who Orion takes it for.
     Test,
-    /// Whether a voice is enrolled.
+    /// Who is enrolled, and what each may do by voice.
     Status,
-    /// Delete the voiceprint: anyone can wake Orion again.
-    Forget,
+    /// Forget someone's voice (or everyone's, with --all).
+    Forget {
+        name: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
     /// The neural speaker model: install, check or remove it.
     Model {
         #[command(subcommand)]
@@ -218,10 +226,10 @@ fn main() -> Result<()> {
         Cmd::Voice { action } => {
             let v = &policy.voice;
             match action {
-                VoiceCmd::Enroll => orion::voice::enroll::enroll(v),
+                VoiceCmd::Enroll { name } => orion::voice::enroll::enroll(v, name.as_deref()),
                 VoiceCmd::Test => orion::voice::enroll::test(v),
                 VoiceCmd::Status => orion::voice::enroll::status(v),
-                VoiceCmd::Forget => orion::voice::enroll::forget(),
+                VoiceCmd::Forget { name, all } => orion::voice::enroll::forget(name.as_deref(), all),
                 VoiceCmd::Model { action } => match action {
                     ModelCmd::Install { from } => orion::voice::enroll::model_install(from.as_deref()),
                     ModelCmd::Status => orion::voice::enroll::model_status(),

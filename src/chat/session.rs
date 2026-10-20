@@ -506,14 +506,18 @@ impl<'a> Session<'a> {
 fn run_tool(orion: &Orion, router: &Router, provider: Provider, call: &ToolCall, ui: &mut dyn Ui) -> (String, bool) {
     ui.tool_start(&call.name, &call.input);
     let start = Instant::now();
-    let result = match router.private_path_in(&call.input) {
+    let risk = orion.tools().find(|(t, _)| t.name() == call.name).map(|(t, _)| t.risk());
+    let caller = ui.caller();
+    let refused = risk.and_then(|r| ui.refuses(&call.name, r));
+    let result = match (router.private_path_in(&call.input), refused) {
+        (_, Some(reason)) => Err(orion.refuse(&call.name, &call.input, &reason, caller.as_deref()).to_string()),
         // Private files never reach Claude, whatever the policy allows.
-        Some(path) if provider == Provider::Claude => {
+        (Some(path), None) if provider == Provider::Claude => {
             Err(format!("{path} is private: only the local model may access it (chat.router.private_paths)"))
         }
         _ => {
             let approver = UiApprover(RefCell::new(&mut *ui));
-            orion.call(&call.name, call.input.clone(), Some(&approver)).map_err(|e| e.to_string())
+            orion.call_as(&call.name, call.input.clone(), Some(&approver), caller.as_deref()).map_err(|e| e.to_string())
         }
     };
     ui.tool_end(&call.name, &result, start.elapsed());
@@ -765,6 +769,51 @@ mod tests {
         let mut next = Recorder::default();
         s.turn("@local hi", &mut next).unwrap();
         assert!(next.out.ends_with("never"), "{}", next.out);
+    }
+
+    /// Answers like `Recorder`, but turns away tools that change things,
+    /// as for someone with `tools = "read"`.
+    #[derive(Default)]
+    struct ReadOnly {
+        inner: Recorder,
+    }
+
+    impl Ui for ReadOnly {
+        fn text(&mut self, t: &str) {
+            self.inner.text(t)
+        }
+        fn thinking(&mut self, t: &str) {
+            self.inner.thinking(t)
+        }
+        fn tool_start(&mut self, name: &str, input: &Value) {
+            self.inner.tool_start(name, input)
+        }
+        fn tool_end(&mut self, name: &str, r: &Result<Value, String>, took: Duration) {
+            self.inner.tool_end(name, r, took)
+        }
+        fn notice(&mut self, t: &str) {
+            self.inner.notice(t)
+        }
+        fn approve(&mut self, tool: &dyn crate::Tool, args: &Value) -> bool {
+            panic!("asked to approve {}: a refused tool must not get that far ({args})", tool.name())
+        }
+        fn refuses(&mut self, _tool: &str, risk: crate::tool::Risk) -> Option<String> {
+            crate::voice::ToolAccess::Read.refuses("ana", risk)
+        }
+    }
+
+    #[test]
+    fn a_turn_can_refuse_tools_before_anyone_is_asked() {
+        let log = Log::default();
+        let orion = orion();
+        let call = |id: &str, name: &str, input: Value| ToolCall { id: id.into(), name: name.into(), input, invalid_input: None };
+        let calls = vec![call("a", "system_info", json!({})), call("b", "fs_write", json!({ "path": "/tmp/x", "content": "y" }))];
+        let local = Scripted::new("local", &log, vec![Ok(("Checking.".into(), calls)), say("done")]);
+        let mut s = Session::with_backends(&orion, Mode::Local, None, Some(local));
+        s.turn("Ana (by voice): write a note", &mut ReadOnly::default()).unwrap();
+        let results = entries(&log, "local result");
+        assert_eq!(results[0], "local result: ok");
+        assert!(results[1].contains("ana may only use tools that look at the machine"), "{results:?}");
     }
 
     #[test]

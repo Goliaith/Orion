@@ -42,6 +42,9 @@ const MIN_FRAMES: usize = 40;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Voiceprint {
     pub version: u32,
+    /// Whose voice ("" in voiceprints from before there could be several).
+    #[serde(default)]
+    pub name: String,
     pub codebook: Vec<Vec<f32>>,
     /// Typical distortion of the speaker's own phrases (leave one out).
     pub baseline: f32,
@@ -132,6 +135,7 @@ impl Voiceprint {
         };
         Ok(Self {
             version: 1,
+            name: String::new(),
             codebook: codebook.iter().map(|c| c.to_vec()).collect(),
             baseline,
             consistency: loo.iter().map(|d| d / baseline).collect(),
@@ -170,8 +174,51 @@ impl Voiceprint {
         }
     }
 
-    pub fn default_path() -> Option<PathBuf> {
+    /// Where the single voiceprint of earlier versions lived.
+    pub fn legacy_path() -> Option<PathBuf> {
         crate::policy::Policy::state_dir().map(|d| d.join("voiceprint.json"))
+    }
+
+    /// One file per person.
+    pub fn dir() -> Option<PathBuf> {
+        crate::policy::Policy::state_dir().map(|d| d.join("voices"))
+    }
+
+    pub fn path_for(name: &str) -> Option<PathBuf> {
+        Self::dir().map(|d| d.join(format!("{name}.json")))
+    }
+
+    /// Everyone enrolled, by name. A voiceprint from before there could be
+    /// several is moved in under the login name first.
+    pub fn all() -> Result<Vec<Voiceprint>> {
+        let state = crate::policy::Policy::state_dir().context("no state directory for voiceprints (is HOME set?)")?;
+        Self::all_in(&state)
+    }
+
+    /// [`all`](Self::all), for a given state directory.
+    pub fn all_in(state: &Path) -> Result<Vec<Voiceprint>> {
+        let dir = state.join("voices");
+        if let Some(legacy) = Some(state.join("voiceprint.json")).filter(|p| p.exists()) {
+            let mut v = Self::load(&legacy)?;
+            v.name = default_name();
+            v.save(&dir.join(format!("{}.json", v.name)))?;
+            std::fs::remove_file(&legacy)?;
+        }
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().is_some_and(|x| x == "json") {
+                    let mut v = Self::load(&path)?;
+                    if v.name.is_empty() {
+                        v.name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                    }
+                    out.push(v);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -223,35 +270,105 @@ impl NeuralPrint {
     }
 }
 
-/// Decides whether an utterance is the enrolled voice, by the best method
-/// available.
+/// A login-friendly default name for the first person enrolled.
+pub fn default_name() -> String {
+    std::env::var("USER").ok().and_then(|u| valid_name(&u).ok()).unwrap_or_else(|| "me".into())
+}
+
+/// Names are file names too: letters, digits, `-` and `_`, up to 32.
+pub fn valid_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    let ok = !name.is_empty() && name.len() <= 32 && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        bail!("{name:?} can't be a name: use letters, digits, - and _ (up to 32)");
+    }
+    Ok(name.to_string())
+}
+
+/// Who an utterance sounds like.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Identity {
+    pub name: String,
+    pub score: Score,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Heard {
+    /// An enrolled person.
+    Person(Identity),
+    /// Nobody enrolled; the closest, for display.
+    Nobody(Option<Identity>),
+    /// Too little speech to tell.
+    TooShort,
+}
+
+/// Decides who of the enrolled people an utterance is, by the best method
+/// each voiceprint allows.
 #[derive(Clone)]
 pub struct Judge {
-    pub print: Voiceprint,
+    pub people: Vec<Voiceprint>,
     model: Option<Arc<Ge2e>>,
     ratio_limit: f32,
     similarity_limit: f32,
 }
 
 impl Judge {
-    /// The neural method when the voiceprint has an embedding from this
-    /// model and the model is given; the built-in one otherwise.
-    pub fn new(print: Voiceprint, model: Option<Ge2e>, ratio_limit: f32, similarity_limit: f32) -> Self {
-        let usable = print.neural.as_ref().is_some_and(|n| n.model == super::neural::MODEL_NAME);
-        Self { print, model: model.filter(|_| usable).map(Arc::new), ratio_limit, similarity_limit }
+    /// The neural method for voiceprints with an embedding from this model,
+    /// when the model is given; the built-in one for the rest.
+    pub fn new(people: Vec<Voiceprint>, model: Option<Ge2e>, ratio_limit: f32, similarity_limit: f32) -> Self {
+        Self { people, model: model.map(Arc::new), ratio_limit, similarity_limit }
     }
 
-    pub fn method(&self) -> Method {
-        if self.model.is_some() { Method::Neural } else { Method::Codebook }
+    fn neural_for<'a>(&'a self, v: &'a Voiceprint) -> Option<(&'a Ge2e, &'a NeuralPrint)> {
+        let print = v.neural.as_ref().filter(|n| n.model == super::neural::MODEL_NAME)?;
+        Some((self.model.as_deref()?, print))
     }
 
-    pub fn verify(&self, samples: &[i16], rate: u32) -> Verdict {
-        let (Some(model), Some(print)) = (&self.model, &self.print.neural) else {
-            return self.print.verify(samples, rate, self.ratio_limit);
-        };
-        let Some(e) = model.embed(samples, rate) else { return Verdict::TooShort };
-        let score = Score { method: Method::Neural, value: cosine(&e, &print.embedding), limit: self.similarity_limit };
-        if score.value >= score.limit { Verdict::Match(score) } else { Verdict::Other(score) }
+    /// The method used for this person.
+    pub fn method_for(&self, v: &Voiceprint) -> Method {
+        if self.neural_for(v).is_some() { Method::Neural } else { Method::Codebook }
+    }
+
+    /// The method used, if it's the same for everyone.
+    pub fn method(&self) -> Option<Method> {
+        let mut methods = self.people.iter().map(|v| self.method_for(v));
+        let first = methods.next()?;
+        methods.all(|m| m == first).then_some(first)
+    }
+
+    /// The best-matching enrolled person, if anyone is close enough. Scores
+    /// from the two methods are ranked by how far past their own limit
+    /// they are.
+    pub fn identify(&self, samples: &[i16], rate: u32) -> Heard {
+        // One embedding serves everyone on the neural method.
+        let embedding = self.people.iter().any(|v| self.neural_for(v).is_some()).then(|| self.model.as_ref().and_then(|m| m.embed(samples, rate))).flatten();
+        let mut best: Option<(f32, Identity)> = None;
+        let mut too_short = true;
+        for v in &self.people {
+            let score = match self.neural_for(v) {
+                Some((_, print)) => match &embedding {
+                    Some(e) => Score { method: Method::Neural, value: cosine(e, &print.embedding), limit: self.similarity_limit },
+                    None => continue,
+                },
+                None => match v.score(samples, rate) {
+                    Some(value) => Score { method: Method::Codebook, value, limit: self.ratio_limit },
+                    None => continue,
+                },
+            };
+            too_short = false;
+            let margin = match score.method {
+                Method::Neural => (score.value - score.limit) / (1.0 - score.limit).max(1e-3),
+                Method::Codebook => (score.limit - score.value) / score.limit.max(1e-3),
+            };
+            if best.as_ref().is_none_or(|(m, _)| margin > *m) {
+                best = Some((margin, Identity { name: v.name.clone(), score }));
+            }
+        }
+        match best {
+            _ if too_short => Heard::TooShort,
+            Some((m, id)) if m >= 0.0 => Heard::Person(id),
+            other => Heard::Nobody(other.map(|(_, id)| id)),
+        }
     }
 }
 
@@ -560,6 +677,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tells_enrolled_people_apart() {
+        let person = |name: &str, f0, tract| {
+            let clips: Vec<Vec<i16>> = (1..=6).map(|t| voice(f0, tract, t, 3.0)).collect();
+            let mut v = Voiceprint::enroll(&clips, RATE, None).unwrap();
+            v.name = name.into();
+            v
+        };
+        let judge = Judge::new(vec![person("ana", 120.0, 1.0), person("ben", 210.0, 1.25)], None, 1.2, 0.8);
+        assert_eq!(judge.method(), Some(Method::Codebook));
+        let who = |f0, tract, text| match judge.identify(&voice(f0, tract, text, 1.5), RATE) {
+            Heard::Person(id) => id.name,
+            Heard::Nobody(_) => "nobody".into(),
+            Heard::TooShort => "too short".into(),
+        };
+        for text in 20..24 {
+            assert_eq!(who(120.0, 1.0, text), "ana");
+            assert_eq!(who(210.0, 1.25, text), "ben");
+            assert_eq!(who(95.0, 0.88, text), "nobody");
+        }
+        // The closest is named even when nobody matches.
+        let Heard::Nobody(Some(closest)) = judge.identify(&voice(130.0, 0.9, 21, 1.5), RATE) else { panic!() };
+        assert_eq!(closest.name, "ana");
+        assert!(valid_name("ana-2").is_ok() && valid_name("../x").is_err() && valid_name("").is_err());
+    }
+
+    #[test]
+    fn moves_the_old_single_voiceprint_in() {
+        let state = tempfile::tempdir().unwrap();
+        let clips: Vec<Vec<i16>> = (1..=3).map(|t| voice(120.0, 1.0, t, 1.5)).collect();
+        let mut old = Voiceprint::enroll(&clips, RATE, None).unwrap();
+        old.save(&state.path().join("voiceprint.json")).unwrap();
+        let people = Voiceprint::all_in(state.path()).unwrap();
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].name, default_name());
+        assert!(!state.path().join("voiceprint.json").exists());
+        assert!(state.path().join(format!("voices/{}.json", default_name())).exists());
+        // Another person alongside, listed by name.
+        old.name = "aaron".into();
+        old.save(&state.path().join("voices/aaron.json")).unwrap();
+        let names: Vec<String> = Voiceprint::all_in(state.path()).unwrap().into_iter().map(|v| v.name).collect();
+        assert_eq!(names[0], "aaron");
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
     fn saves_privately_and_loads() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -616,11 +778,11 @@ pub(crate) mod tests {
         let Some(model) = Ge2e::default_path().filter(|p| p.exists()).and_then(|p| Ge2e::load(&p).ok()) else { return };
         let vp = Voiceprint::enroll(&enroll, 22_050, Some(&model)).unwrap();
         assert_eq!(vp.neural.as_ref().unwrap().consistency.len(), 5);
-        let judge = Judge::new(vp, Some(model), 1.2, 0.8);
-        assert_eq!(judge.method(), Method::Neural);
-        let mine = judge.verify(&say("en-us+m3", 45, "Orion, install htop for me."), 22_050);
-        assert!(matches!(mine, Verdict::Match(Score { method: Method::Neural, .. })), "{mine:?}");
-        let other = judge.verify(&say("en-us+f2", 60, "Orion, install htop for me."), 22_050);
-        assert!(matches!(other, Verdict::Other(_)), "{other:?}");
+        let judge = Judge::new(vec![vp], Some(model), 1.2, 0.8);
+        assert_eq!(judge.method(), Some(Method::Neural));
+        let mine = judge.identify(&say("en-us+m3", 45, "Orion, install htop for me."), 22_050);
+        assert!(matches!(mine, Heard::Person(Identity { score: Score { method: Method::Neural, .. }, .. })), "{mine:?}");
+        let other = judge.identify(&say("en-us+f2", 60, "Orion, install htop for me."), 22_050);
+        assert!(matches!(other, Heard::Nobody(_)), "{other:?}");
     }
 }

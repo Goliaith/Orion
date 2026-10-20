@@ -22,13 +22,13 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::agent::{self, Answer, FromAgent, Status, ToAgent};
+use super::agent::{self, capitalize, Answer, FromAgent, Status, ToAgent};
 use super::machine::{watch_machine, Machine};
 use self::input::Input;
 use super::store::Turn;
 use super::terminal::{clip, provider_label, Saver};
 use super::{Mode, Session};
-use crate::voice::{is_stop_request, spoken_answer, Recording, VoiceConfig, VoiceIo, WakeEvent, WakeState};
+use crate::voice::{is_stop_request, spoken_answer, Person, Recording, VoiceConfig, VoiceIo, WakeEvent, WakeState};
 use crate::{interrupt, Orion};
 
 const LABEL: usize = 8;
@@ -89,6 +89,8 @@ struct App {
     busy: bool,
     stopping: bool,
     queued: Option<String>,
+    /// Who spoke the queued message, if it was spoken by an enrolled person.
+    queued_by: Option<Person>,
     status: Status,
     machine: Machine,
     /// Who is answering, for labeling replies.
@@ -122,6 +124,7 @@ impl App {
             busy: true, // until the agent reports in
             stopping: false,
             queued: None,
+            queued_by: None,
             status: Status::default(),
             machine: Machine::default(),
             who: "claude",
@@ -242,7 +245,8 @@ impl App {
                 self.busy = false;
                 self.stopping = false;
                 if let Some(text) = self.queued.take() {
-                    self.submit(text);
+                    let by = self.queued_by.take();
+                    self.submit_spoken(text, by);
                 }
             }
             FromAgent::Quit => self.quit = true,
@@ -284,6 +288,16 @@ impl App {
             self.busy = true;
             self.send(ToAgent::Turn(trimmed.to_string()));
         }
+        self.top = None;
+    }
+
+    /// Send a request, as spoken by an enrolled person if `by` is given.
+    fn submit_spoken(&mut self, text: String, by: Option<Person>) {
+        let Some(by) = by else { return self.submit(text) };
+        self.entries.push(Entry::User(format!("{} (by voice): {text}", capitalize(&by.name))));
+        self.voice.hush();
+        self.busy = true;
+        self.send(ToAgent::Spoken { text, by });
         self.top = None;
     }
 
@@ -377,6 +391,7 @@ impl App {
                 if self.busy {
                     if !self.input.is_empty() {
                         self.queued = Some(self.input.submit());
+                        self.queued_by = None;
                         self.flash("queued: sends when the AI is done");
                     }
                 } else {
@@ -472,11 +487,16 @@ impl App {
             WakeEvent::NoRequest => self.flash("woke, but heard no request"),
             WakeEvent::NotYou => self.flash("that didn't sound like your voice"),
             WakeEvent::Failed(e) => self.entries.push(Entry::Notice(format!("voice: stopped listening for the wake phrase: {e}"))),
-            WakeEvent::Request(text) => {
+            WakeEvent::Request { text, speaker } => {
                 self.voice.hush();
+                let by = speaker.as_deref().map(|n| self.voice.config.who(n));
                 match (&self.prompt, spoken_answer(&text)) {
                     (Some(_), Some(true)) if !self.voice.config.wake_approvals => {
                         self.flash("answer with y: spoken approval is off (voice.wake_approvals)")
+                    }
+                    (Some(_), Some(true)) if !self.voice.config.may_approve(speaker.as_deref()) => {
+                        let who = capitalize(speaker.as_deref().unwrap_or_default());
+                        self.flash(&format!("{who} may not approve by voice (voice.people.{})", speaker.as_deref().unwrap_or_default()))
                     }
                     (Some(Prompt::Approve(_)), Some(yes)) => self.answer_approval(if yes { Answer::Yes } else { Answer::No }),
                     (Some(Prompt::Confirm(_)), Some(yes)) => self.answer_confirm(yes),
@@ -490,9 +510,10 @@ impl App {
                     }
                     (None, _) if self.busy => {
                         self.queued = Some(text);
+                        self.queued_by = by;
                         self.flash("queued: sends when the AI is done");
                     }
-                    (None, _) => self.submit(text),
+                    (None, _) => self.submit_spoken(text, by),
                 }
             }
         }
@@ -1112,25 +1133,49 @@ mod tests {
     #[test]
     fn spoken_requests_act_like_typed_ones() {
         let (mut app, rx) = app();
-        app.on_wake(WakeEvent::Request("how full is my disk?".into()));
+        app.on_wake(WakeEvent::Request { text: "how full is my disk?".into(), speaker: None });
         assert!(matches!(rx.try_recv().unwrap(), ToAgent::Turn(t) if t == "how full is my disk?"));
         // While the AI works: queued, and "stop" stops it.
-        app.on_wake(WakeEvent::Request("then restart ollama".into()));
+        app.on_wake(WakeEvent::Request { text: "then restart ollama".into(), speaker: None });
         assert_eq!(app.queued.as_deref(), Some("then restart ollama"));
-        app.on_wake(WakeEvent::Request("Stop!".into()));
+        app.on_wake(WakeEvent::Request { text: "Stop!".into(), speaker: None });
         assert!(app.stopping);
 
         // A spoken "no" declines; a spoken "yes" approves only if allowed.
         let (reply, answers) = mpsc::channel();
         app.apply(FromAgent::Approve { tool: "proc_run".into(), preview: "{}".into(), reply });
-        app.on_wake(WakeEvent::Request("Yes.".into()));
+        app.on_wake(WakeEvent::Request { text: "Yes.".into(), speaker: None });
         assert!(app.prompt.is_some(), "spoken approval is off by default");
-        app.on_wake(WakeEvent::Request("No.".into()));
+        app.on_wake(WakeEvent::Request { text: "No.".into(), speaker: None });
         assert!(matches!(answers.try_recv(), Ok(Answer::No)));
         app.voice.config.wake_approvals = true;
         let (reply, answers) = mpsc::channel();
         app.apply(FromAgent::Approve { tool: "proc_run".into(), preview: "{}".into(), reply });
-        app.on_wake(WakeEvent::Request("yes please".into()));
+        app.on_wake(WakeEvent::Request { text: "yes please".into(), speaker: None });
+        assert!(matches!(answers.try_recv(), Ok(Answer::Yes)));
+    }
+
+    #[test]
+    fn spoken_requests_name_the_speaker_and_carry_their_limits() {
+        let (mut app, rx) = app();
+        app.voice.config.wake_approvals = true;
+        app.voice.config.people.insert("kid".into(), crate::voice::PersonPolicy { approve: false, tools: crate::voice::ToolAccess::Read });
+        app.on_wake(WakeEvent::Request { text: "what's the weather".into(), speaker: Some("kid".into()) });
+        match rx.try_recv().unwrap() {
+            ToAgent::Spoken { text, by } => {
+                assert_eq!(text, "what's the weather");
+                assert_eq!(by.name, "kid");
+                assert_eq!(by.tools, crate::voice::ToolAccess::Read);
+            }
+            _ => panic!("expected a spoken turn"),
+        }
+        assert!(matches!(app.entries.last(), Some(Entry::User(t)) if t == "Kid (by voice): what's the weather"));
+        // The kid may not approve; Ana may.
+        let (reply, answers) = mpsc::channel();
+        app.apply(FromAgent::Approve { tool: "proc_run".into(), preview: "{}".into(), reply });
+        app.on_wake(WakeEvent::Request { text: "yes".into(), speaker: Some("kid".into()) });
+        assert!(answers.try_recv().is_err() && app.prompt.is_some());
+        app.on_wake(WakeEvent::Request { text: "yes".into(), speaker: Some("ana".into()) });
         assert!(matches!(answers.try_recv(), Ok(Answer::Yes)));
     }
 

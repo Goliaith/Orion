@@ -23,12 +23,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use self::http::Request;
-use super::agent::{self, Answer, FromAgent, Status, ToAgent};
+use super::agent::{self, capitalize, Answer, FromAgent, Status, ToAgent};
 use super::machine::{watch_machine, Machine};
 use super::store::{self, Store};
 use super::terminal::{provider_label, Saver};
 use super::Session;
-use crate::voice::{is_stop_request, spoken_answer, Recording, VoiceIo, WakeEvent, WakeState};
+use crate::voice::{is_stop_request, spoken_answer, Person, Recording, VoiceIo, WakeEvent, WakeState};
 use crate::{interrupt, Orion};
 
 const PAGE: &str = include_str!("shell.html");
@@ -73,7 +73,7 @@ struct Hub {
     listening: Mutex<Option<Recording>>,
     transcribing: AtomicBool,
     /// A spoken request heard while the AI was busy, sent when it is done.
-    wake_queue: Mutex<Option<String>>,
+    wake_queue: Mutex<Option<(String, Option<Person>)>>,
     /// Why wake listening didn't start, for pages that connect.
     wake_error: Mutex<Option<String>>,
     show_reasoning: bool,
@@ -108,12 +108,22 @@ impl Hub {
         f(&mut self.voice.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Send a message as the user, as if typed.
-    fn start_turn(&self, text: String) {
+    /// Send a message as the user, as if typed; as spoken by an enrolled
+    /// person if `by` is given.
+    fn start_turn(&self, text: String, by: Option<Person>) {
         self.voice(|v| v.hush());
         self.set_busy(true);
-        self.broadcast(json!({ "type": "user", "text": text }), true);
-        self.send_agent(ToAgent::Turn(text));
+        match by {
+            Some(by) => {
+                let shown = format!("{} (by voice): {text}", capitalize(&by.name));
+                self.broadcast(json!({ "type": "user", "text": shown }), true);
+                self.send_agent(ToAgent::Spoken { text, by });
+            }
+            None => {
+                self.broadcast(json!({ "type": "user", "text": text }), true);
+                self.send_agent(ToAgent::Turn(text));
+            }
+        }
     }
 
     fn wake_json(&self) -> Value {
@@ -202,8 +212,8 @@ fn relay(hub: &Hub, from_agent: Receiver<FromAgent>) {
                 // Prompts left unanswered when a turn ends are moot.
                 hub.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 hub.set_busy(false);
-                if let Some(text) = hub.wake_queue.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                    hub.start_turn(text);
+                if let Some((text, by)) = hub.wake_queue.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    hub.start_turn(text, by);
                 }
             }
             FromAgent::Quit => {}
@@ -278,9 +288,10 @@ fn on_wake(hub: &Hub, ev: WakeEvent) {
             hub.broadcast(json!({ "type": "voice_error", "text": format!("stopped listening for the wake phrase: {e}") }), false);
             hub.broadcast(hub.wake_json(), false);
         }
-        WakeEvent::Request(text) => {
+        WakeEvent::Request { text, speaker } => {
             hub.voice(|v| v.hush());
-            let approvals = hub.voice(|v| v.config.wake_approvals);
+            let approvals = hub.voice(|v| v.config.may_approve(speaker.as_deref()));
+            let by = speaker.as_deref().map(|n| hub.voice(|v| v.config.who(n)));
             let pending = {
                 let mut p = hub.pending.lock().unwrap_or_else(|e| e.into_inner());
                 match spoken_answer(&text) {
@@ -291,7 +302,12 @@ fn on_wake(hub: &Hub, ev: WakeEvent) {
                     _ if !p.is_empty() => {
                         drop(p);
                         return note(&if spoken_answer(&text) == Some(true) {
-                            "Approve with the button: spoken approval is off (voice.wake_approvals)".to_string()
+                            match &speaker {
+                                Some(n) if hub.voice(|v| v.config.wake_approvals) => {
+                                    format!("{} may not approve by voice (voice.people.{n})", capitalize(n))
+                                }
+                                _ => "Approve with the button: spoken approval is off (voice.wake_approvals)".to_string(),
+                            }
                         } else {
                             format!("Heard \"{text}\" · answer the prompt first")
                         });
@@ -314,10 +330,10 @@ fn on_wake(hub: &Hub, ev: WakeEvent) {
                     interrupt::request();
                 }
             } else if hub.busy.load(Ordering::SeqCst) {
-                *hub.wake_queue.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
+                *hub.wake_queue.lock().unwrap_or_else(|e| e.into_inner()) = Some((text.clone(), by));
                 note(&format!("Queued \"{text}\": it sends when the AI is done"));
             } else {
-                hub.start_turn(text);
+                hub.start_turn(text, by);
             }
         }
     }

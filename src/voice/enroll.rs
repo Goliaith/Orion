@@ -1,5 +1,5 @@
-//! `orion voice enroll | test | status | forget`: teach Orion your voice,
-//! check it, and undo it.
+//! `orion voice enroll | test | status | forget`: teach Orion the voices
+//! of the people who may wake it, check them, and undo it.
 
 use std::io::{BufRead, Write};
 use std::thread;
@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use super::speaker::{Method, Verdict, Voiceprint};
-use super::{Recorder, Verify, VoiceConfig};
+use super::capitalize as cap;
+use super::speaker::{valid_name, Heard, Method, Voiceprint};
+use super::{Recorder, ToolAccess, Verify, VoiceConfig};
 
 /// About three seconds each, the way people talk to Orion.
 const PHRASES: [&str; 6] = [
@@ -19,10 +20,6 @@ const PHRASES: [&str; 6] = [
     "Orion, install the package I need for the project we talked about.",
     "Orion, stop that, and remind me what we were doing yesterday.",
 ];
-
-fn path() -> Result<std::path::PathBuf> {
-    Voiceprint::default_path().context("no state directory for the voiceprint (is HOME set?)")
-}
 
 /// Record one utterance until the speaker pauses, with a meter.
 fn record(recorder: &Recorder) -> Result<Vec<i16>> {
@@ -47,14 +44,30 @@ fn wait_for_enter() -> Result<()> {
     Ok(())
 }
 
-pub fn enroll(config: &VoiceConfig) -> Result<()> {
+/// Enroll someone: `name`, or the login name for the first person.
+pub fn enroll(config: &VoiceConfig, name: Option<&str>) -> Result<()> {
+    let people = Voiceprint::all()?;
+    let name = match name {
+        Some(n) => valid_name(n)?,
+        None if people.is_empty() => super::speaker::default_name(),
+        None => bail!(
+            "{} enrolled already; name the person: `orion voice enroll --name <name>` (again with an existing name replaces their voice)",
+            people.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    };
     let recorder = Recorder::detect(config)?;
     let model = config.speaker_model().map_err(anyhow::Error::msg)?;
     if model.is_none() && config.verify_method != super::VerifyMethod::Builtin {
         println!("(The neural speaker model isn't installed, so this enrolls with the built-in method, which tells");
         println!(" microphones apart better than people. `orion voice model install` first is better.)\n");
     }
-    println!("Orion will learn your voice from {} short phrases, so that only you can wake it.", PHRASES.len());
+    let again = people.iter().any(|v| v.name == name);
+    println!(
+        "Orion will learn {}'s voice from {} short phrases{}.",
+        cap(&name),
+        PHRASES.len(),
+        if again { " (replacing the voice enrolled under that name)" } else { "" }
+    );
     println!("Speak as you normally would to Orion, from where you usually sit. Each recording ends when you pause.\n");
     let mut clips = Vec::new();
     for (i, phrase) in PHRASES.iter().enumerate() {
@@ -73,8 +86,9 @@ pub fn enroll(config: &VoiceConfig) -> Result<()> {
             }
         }
     }
-    println!("\nLearning your voice…");
-    let vp = Voiceprint::enroll(&clips, recorder.rate(), model.as_ref())?;
+    println!("\nLearning {}'s voice…", cap(&name));
+    let mut vp = Voiceprint::enroll(&clips, recorder.rate(), model.as_ref())?;
+    vp.name = name.clone();
     let odd = |i: usize, how: String| {
         println!("  Phrase {} sounded different from the rest ({how}): noise, or a different distance from the microphone?", i + 1)
     };
@@ -94,65 +108,126 @@ pub fn enroll(config: &VoiceConfig) -> Result<()> {
             }
         }
     }
-    let path = path()?;
+    // Too close to someone already enrolled: Orion would mix them up.
+    if let Some(judge) = config.judge().ok().flatten() {
+        let others = judge.people.iter().filter(|v| v.name != name).count();
+        if others > 0 {
+            for (i, clip) in clips.iter().enumerate() {
+                if let Heard::Person(id) = judge.identify(clip, recorder.rate()) {
+                    if id.name != name {
+                        println!("  Phrase {} also sounds like {} ({}): Orion may mix the two of you up.", i + 1, cap(&id.name), id.score);
+                    }
+                }
+            }
+        }
+    }
+    let path = Voiceprint::path_for(&name).context("no state directory for voiceprints (is HOME set?)")?;
     vp.save(&path)?;
-    println!("Saved your voiceprint to {} (readable only by you).", path.display());
+    println!("Saved {}'s voiceprint to {} (readable only by you).", cap(&name), path.display());
     match config.verify_speaker {
         Verify::Off => println!("Speaker verification is off in the policy (voice.verify_speaker = \"off\"); set it to \"auto\" to use it."),
-        _ => println!("From now on, only your voice wakes Orion. Check it with `orion voice test`."),
+        _ => {
+            let all: Vec<String> = Voiceprint::all()?.iter().map(|v| cap(&v.name)).collect();
+            println!("From now on, only {} can wake Orion. Check it with `orion voice test`.", all.join(", "));
+            if !config.people.contains_key(&name) {
+                println!("{} may do everything by voice; limit that under [voice.people.{name}] in the policy.", cap(&name));
+            }
+        }
     }
     Ok(())
 }
 
 pub fn test(config: &VoiceConfig) -> Result<()> {
-    let judge = config.judge().map_err(anyhow::Error::msg)?.context("no voice enrolled yet: run `orion voice enroll`")?;
+    let judge = config.judge().map_err(anyhow::Error::msg)?.context("nobody is enrolled yet: run `orion voice enroll`")?;
     let recorder = Recorder::detect(config)?;
     print!("Press Enter, then say anything to Orion. ");
     std::io::stdout().flush()?;
     wait_for_enter()?;
     let clip = record(&recorder)?;
-    let setting = match judge.method() {
-        Method::Neural => "lower voice.verify_similarity",
-        Method::Codebook => "raise voice.verify_threshold",
-    };
-    match judge.verify(&clip, recorder.rate()) {
-        Verdict::Match(s) => println!("That's you: {s}."),
-        Verdict::Other(s) => println!(
-            "That doesn't sound like the enrolled voice: {s}. If it was you, enroll again where you usually talk to Orion, or {setting}."
-        ),
-        Verdict::TooShort => println!("Too little speech to tell; say a little more."),
+    match judge.identify(&clip, recorder.rate()) {
+        Heard::Person(id) => println!("That's {}: {}.", cap(&id.name), id.score),
+        Heard::Nobody(closest) => {
+            print!("That doesn't sound like anyone enrolled");
+            match closest {
+                Some(id) => {
+                    let setting = match id.score.method {
+                        Method::Neural => "lower voice.verify_similarity",
+                        Method::Codebook => "raise voice.verify_threshold",
+                    };
+                    println!(
+                        " (closest: {}, {}). If it was {}, enroll again with `orion voice enroll --name {}`, or {setting}.",
+                        cap(&id.name),
+                        id.score,
+                        cap(&id.name),
+                        id.name
+                    )
+                }
+                None => println!("."),
+            }
+        }
+        Heard::TooShort => println!("Too little speech to tell; say a little more."),
     }
     Ok(())
 }
 
 pub fn status(config: &VoiceConfig) -> Result<()> {
-    let path = path()?;
-    match Voiceprint::load(&path) {
-        Ok(vp) => {
-            let mode = match config.verify_speaker {
-                Verify::Off => "off in the policy",
-                _ => "only your voice wakes Orion",
-            };
-            println!("enrolled: {} phrases, {} ({mode})", vp.phrases, path.display());
-            let judge = config.judge().ok().flatten().map(|j| j.method());
-            match (judge, &vp.neural) {
-                (Some(Method::Neural), _) => println!("method: neural model, similarity at least {:.2}", config.verify_similarity),
-                (_, Some(_)) => println!("method: built-in (the voice has a neural embedding, but the model isn't installed or is turned off)"),
-                _ => println!("method: built-in, distortion at most {:.2} (`orion voice model install`, then enroll again, for the neural model)", config.verify_threshold),
-            }
-        }
-        Err(_) if !path.exists() => println!("no voice enrolled: anyone can wake Orion (`orion voice enroll`)"),
-        Err(e) => println!("the voiceprint can't be read: {e:#}"),
+    let people = Voiceprint::all()?;
+    if people.is_empty() {
+        println!("nobody enrolled: anyone can wake Orion (`orion voice enroll`)");
+        return Ok(());
+    }
+    if config.verify_speaker == Verify::Off {
+        println!("speaker verification is off in the policy (voice.verify_speaker = \"off\")");
+    }
+    let judge = config.judge().ok().flatten();
+    println!("{} enrolled; only they can wake Orion:", people.len());
+    for v in &people {
+        let method = match judge.as_ref().map(|j| j.method_for(v)) {
+            Some(Method::Neural) => format!("neural model, similarity at least {:.2}", config.verify_similarity),
+            _ if v.neural.is_some() => "built-in (has a neural embedding, but the model isn't installed or is off)".into(),
+            _ => format!("built-in, distortion at most {:.2}", config.verify_threshold),
+        };
+        let p = config.person(&v.name);
+        let tools = match p.tools {
+            ToolAccess::All => "all tools",
+            ToolAccess::Read => "read-only tools",
+            ToolAccess::None => "no tools",
+        };
+        let approve = if !config.wake_approvals { "no spoken approvals (voice.wake_approvals)" } else if p.approve { "may approve" } else { "may not approve" };
+        println!("  {:<12} {method}; {tools}, {approve}", v.name);
+    }
+    if judge.as_ref().is_some_and(|j| j.method().is_none()) || people.iter().any(|v| v.neural.is_none()) {
+        println!("(With the neural model installed, enroll everyone again to use it: `orion voice enroll --name <name>`.)");
     }
     Ok(())
 }
 
-pub fn forget() -> Result<()> {
-    let path = path()?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => println!("Forgot your voice: anyone can wake Orion again."),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("No voice was enrolled."),
-        Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+/// Forget someone's voice, or everyone's.
+pub fn forget(name: Option<&str>, all: bool) -> Result<()> {
+    let people = Voiceprint::all()?;
+    let doomed: Vec<&Voiceprint> = match (name, all) {
+        (_, true) => people.iter().collect(),
+        (Some(n), _) => {
+            let v = people.iter().find(|v| v.name == n).with_context(|| format!("nobody named {n} is enrolled"))?;
+            vec![v]
+        }
+        (None, _) if people.len() <= 1 => people.iter().collect(),
+        (None, _) => bail!(
+            "several people are enrolled ({}); name one, or pass --all",
+            people.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    if doomed.is_empty() {
+        println!("Nobody was enrolled.");
+        return Ok(());
+    }
+    for v in &doomed {
+        let path = Voiceprint::path_for(&v.name).context("no state directory")?;
+        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        println!("Forgot {}'s voice.", cap(&v.name));
+    }
+    if doomed.len() == people.len() {
+        println!("Nobody is enrolled now: anyone can wake Orion again.");
     }
     Ok(())
 }
@@ -164,13 +239,15 @@ pub fn model_install(from: Option<&std::path::Path>) -> Result<()> {
     }
     let path = super::neural::install(from)?;
     println!("Installed: {}.", path.display());
-    let enrolled = Voiceprint::default_path().and_then(|p| Voiceprint::load(&p).ok());
-    match enrolled {
-        Some(vp) if vp.neural.is_none() => {
-            println!("Your voice was enrolled before the model was installed; run `orion voice enroll` again to use it.")
-        }
-        Some(_) => println!("Speaker verification now uses it."),
-        None => println!("Enroll your voice with `orion voice enroll` to use it."),
+    let people = Voiceprint::all().unwrap_or_default();
+    let before: Vec<&str> = people.iter().filter(|v| v.neural.is_none()).map(|v| v.name.as_str()).collect();
+    match (people.is_empty(), before.is_empty()) {
+        (true, _) => println!("Enroll your voice with `orion voice enroll` to use it."),
+        (false, true) => println!("Speaker verification now uses it."),
+        (false, false) => println!(
+            "{} enrolled before the model was installed; enroll again (`orion voice enroll --name <name>`) to use it.",
+            before.join(", ")
+        ),
     }
     Ok(())
 }
