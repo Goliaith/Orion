@@ -1,5 +1,7 @@
-# Orion's checks: lint, tests, the oldest supported Rust, and the package
-# and update tools against Fedora, openSUSE and Arch in Docker.
+# Orion's checks: lint, tests, the oldest supported Rust, the package and
+# update tools (with rollbacks and unattended updates) against Fedora,
+# openSUSE, Arch and Debian in Docker, and the privileged helper as root.
+# release.yml builds and tests the release packages.
 name: CI
 
 on:
@@ -46,12 +48,12 @@ jobs:
       - run: cargo build --locked
 
   distros:
-    name: Package tools on Fedora, openSUSE and Arch
+    name: Package tools on Fedora, openSUSE, Arch and Debian
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Tools to build the test repositories
-        run: sudo apt-get update -q && sudo apt-get install -y -q rpm createrepo-c zstd
+        run: sudo apt-get update -q && sudo apt-get install -y -q rpm createrepo-c zstd dpkg-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
@@ -64,5 +66,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Snapper and btrfs, for the snapshots
+        run: sudo apt-get update -q && sudo apt-get install -y -q snapper btrfs-progs
       - run: cargo build --locked
       - run: sudo tests/helper/run.sh

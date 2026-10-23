@@ -6,3 +6,5 @@ repo-add -q /srv/repo/test.db.tar.gz /srv/repo/*.pkg.tar.zst
 pacman -U --noconfirm /srv/base/*.pkg.tar.zst >/dev/null 2>&1
 sed -i "/^\[core\]/,\$d" /etc/pacman.conf; printf "[test]\nSigLevel = Never\nServer = file:///srv/repo\n" >> /etc/pacman.conf
 pacman -Sy >/dev/null 2>&1
+# As if they had come from the repository: pacman keeps what it installs.
+cp /srv/base/*.pkg.tar.zst /srv/repo/*.pkg.tar.zst /var/cache/pacman/pkg/

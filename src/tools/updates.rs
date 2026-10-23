@@ -217,7 +217,7 @@ fn parse_dnf_transaction(text: &str) -> Plan {
         }
         if !line.starts_with(' ') && line.ends_with(':') {
             section = match line {
-                l if l.starts_with("Upgrading") => Section::Upgrade,
+                l if l.starts_with("Upgrading") || l.starts_with("Downgrading") => Section::Upgrade,
                 l if l.starts_with("Installing") => Section::Install,
                 l if l.starts_with("Removing") => Section::Remove,
                 _ => Section::Other,
@@ -493,6 +493,10 @@ pub(super) enum Action {
     Install,
     Remove,
     Upgrade { security_only: bool, full: bool },
+    /// Install exact versions again, older ones included (a rollback):
+    /// `name=version` (apt, zypper), `name-version` (dnf), or pacman's
+    /// cached package files.
+    Restore,
 }
 
 /// The command line for `action` on `packages`: the real one, or (`dry`)
@@ -512,17 +516,20 @@ pub(super) fn command(m: Manager, action: Action, packages: &[String], dry: bool
     };
     let rest = match (m, action) {
         (Manager::Apt, Action::Install) => s(&["install"]),
+        (Manager::Apt, Action::Restore) => s(&["--allow-downgrades", "install"]),
         (Manager::Apt, Action::Remove) => s(&["remove"]),
         (Manager::Apt, Action::Upgrade { .. }) if !packages.is_empty() => s(&["install", "--only-upgrade"]),
         // New dependencies (a new kernel's packages) are fine; removals are not.
         (Manager::Apt, Action::Upgrade { full: false, .. }) => s(&["upgrade", "--with-new-pkgs"]),
         (Manager::Apt, Action::Upgrade { full: true, .. }) => s(&["dist-upgrade"]),
-        (Manager::Dnf, Action::Install) => s(&["install"]),
+        // dnf installs an older version named exactly by downgrading to it.
+        (Manager::Dnf, Action::Install | Action::Restore) => s(&["install"]),
         (Manager::Dnf, Action::Remove) => s(&["remove"]),
         (Manager::Dnf, Action::Upgrade { security_only, .. }) => {
             if security_only { s(&["upgrade", "--security"]) } else { s(&["upgrade"]) }
         }
         (Manager::Zypper, Action::Install) => s(&["install"]),
+        (Manager::Zypper, Action::Restore) => s(&["install", "--oldpackage"]),
         (Manager::Zypper, Action::Remove) => s(&["remove"]),
         (Manager::Zypper, Action::Upgrade { security_only: true, .. }) => s(&["patch", "--category", "security"]),
         // Tumbleweed is only ever upgraded as a whole distribution.
@@ -530,6 +537,7 @@ pub(super) fn command(m: Manager, action: Action, packages: &[String], dry: bool
         (Manager::Zypper, Action::Upgrade { .. }) => s(&["update"]),
         (Manager::Pacman, Action::Install) => s(&[if dry { "-Sp" } else { "-S" }, "--needed"]),
         (Manager::Pacman, Action::Remove) => s(&[if dry { "-Rp" } else { "-R" }]),
+        (Manager::Pacman, Action::Restore) => s(&[if dry { "-Up" } else { "-U" }]),
         (Manager::Pacman, Action::Upgrade { .. }) => s(&[if dry { "-Sup" } else { "-Syu" }]),
     };
     v.extend(rest);
@@ -608,7 +616,7 @@ fn pacman_plan(m: Manager, action: Action, argv: &[String]) -> Result<Plan> {
     let mut plan = Plan::default();
     match action {
         Action::Remove => plan.remove = targets,
-        Action::Install => plan.install = targets,
+        Action::Install | Action::Restore => plan.install = targets,
         Action::Upgrade { .. } => {
             let upgrades = pending(m)?;
             let have: BTreeMap<String, String> = exec::output("pacman", &["-Q"])?
@@ -662,12 +670,16 @@ pub(super) fn helper_check(policy: &Policy, program: &str, args: &[String]) -> R
     }
     let packages: Vec<String> = argv.iter().position(|a| a == "--").map(|i| argv[i + 1..].to_vec()).unwrap_or_default();
     ensure!(packages.len() <= 200, "name at most 200 packages");
-    for p in &packages {
-        package_name(p)?;
-    }
+    let names_ok = packages.iter().all(|p| package_name(p).is_ok());
+    let restore_ok = packages.iter().all(|p| super::changes::restore_spec(m, p).is_ok());
+    ensure!(names_ok || restore_ok, "{} aren't package names", packages.join(" "));
     let up = |security_only, full| Action::Upgrade { security_only, full };
-    let actions = [Action::Install, Action::Remove, up(false, false), up(true, false), up(false, true), up(true, true)];
+    let actions = [Action::Install, Action::Remove, up(false, false), up(true, false), up(false, true), up(true, true), Action::Restore];
     for action in actions {
+        let fits = if matches!(action, Action::Restore) { restore_ok } else { names_ok };
+        if !fits {
+            continue;
+        }
         for dry in [true, false] {
             if command(m, action, &packages, dry) != argv {
                 continue;
@@ -948,7 +960,7 @@ struct Prepared {
 
 /// Refuse a removal of anything protected or essential, and without
 /// `full`, any removal at all.
-fn guard_removals(policy: &Policy, m: Manager, plan: &Plan, full: bool) -> Result<()> {
+pub(super) fn guard_removals(policy: &Policy, m: Manager, plan: &Plan, full: bool) -> Result<()> {
     for (name, _) in &plan.remove {
         let bare = name.split(':').next().unwrap_or(name);
         if let Some(p) = policy.packages.protected.iter().find(|p| glob_match(p, bare)) {
@@ -1057,6 +1069,7 @@ impl Tool for UpdateApply {
     }
 
     fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
+        super::changes::precheck(policy)?;
         prepare(policy, args).map(drop)
     }
 
@@ -1071,6 +1084,7 @@ impl Tool for UpdateApply {
         for u in &mut plan.upgrade {
             u.security |= security.contains(&u.name);
         }
+        let tracker = super::changes::begin(policy, m, "update_apply", None)?;
         let (done, elevated) = run_as_root(policy, m, command(m, action, &only, false))?;
         let ok = finished_ok(m, &done);
         let pairs = |list: &[(String, String)]| list.iter().map(|(n, v)| json!({ "name": n, "version": v })).collect::<Vec<_>>();
@@ -1093,6 +1107,7 @@ impl Tool for UpdateApply {
             out["error"] = json!(complaint(&done));
         }
         merge(&mut out, after_effects(m));
+        tracker.finish(policy, ok, &mut out);
         Ok(out)
     }
 }

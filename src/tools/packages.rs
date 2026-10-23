@@ -462,6 +462,7 @@ fn check_change(policy: &Policy, args: &Value, remove: bool) -> Result<(Manager,
 fn change(policy: &Policy, args: Value, remove: bool) -> Result<Value> {
     let (m, packages, plan) = check_change(policy, &args, remove)?;
     let argv = command(m, if remove { Action::Remove } else { Action::Install }, &packages, false);
+    let tracker = super::changes::begin(policy, m, if remove { "pkg_remove" } else { "pkg_install" }, None)?;
     let (done, elevated) = run_as_root(policy, m, argv)?;
     let pairs = |list: Vec<(String, String)>| list.into_iter().map(|(name, version)| json!({ "name": name, "version": version })).collect::<Vec<_>>();
     let mut out = json!({
@@ -485,6 +486,7 @@ fn change(policy: &Policy, args: Value, remove: bool) -> Result<Value> {
     } else {
         out["error"] = json!(complaint(&done));
     }
+    tracker.finish(policy, done.success(), &mut out);
     Ok(out)
 }
 
@@ -548,6 +550,7 @@ impl Tool for PkgInstall {
     }
 
     fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
+        super::changes::precheck(policy)?;
         check_change(policy, args, false).map(drop)
     }
 
@@ -577,6 +580,7 @@ impl Tool for PkgRemove {
     }
 
     fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
+        super::changes::precheck(policy)?;
         check_change(policy, args, true).map(drop)
     }
 

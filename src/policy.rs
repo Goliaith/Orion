@@ -154,6 +154,18 @@ pub struct PackagesPolicy {
     /// are refused.
     pub updates: String,
     pub timeout_secs: u64,
+    /// Snapper snapshots around each package change: `auto` (when the
+    /// configuration below exists), `required` (no change without them) or
+    /// `never`.
+    pub snapshots: String,
+    pub snapper_config: String,
+    /// Unattended updates by the daemon: `off`, `security` or `all`. They
+    /// run only as far as `updates` lets update_apply run without a person.
+    pub automatic: String,
+    /// Daily, at or after this local time (`HH:MM`).
+    pub automatic_at: String,
+    /// Also when running on battery.
+    pub automatic_on_battery: bool,
 }
 
 impl Default for PackagesPolicy {
@@ -169,6 +181,11 @@ impl Default for PackagesPolicy {
             protected: protected.map(String::from).to_vec(),
             updates: "ask".into(),
             timeout_secs: 900,
+            snapshots: "auto".into(),
+            snapper_config: "root".into(),
+            automatic: "off".into(),
+            automatic_at: "04:00".into(),
+            automatic_on_battery: false,
         }
     }
 }

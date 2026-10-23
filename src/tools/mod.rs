@@ -1,5 +1,6 @@
 //! Built-in tools. Each module groups one area of the machine.
 
+mod changes;
 mod disks;
 pub(crate) mod exec;
 mod fileops;
@@ -70,6 +71,7 @@ pub fn helper_check(policy: &Policy, peer: &Peer, program: &str, args: &[String]
     let drop_in = args.last().is_some_and(|p| p.starts_with("/etc/systemd/system/"));
     match program {
         "env" | "dnf" | "zypper" | "pacman" => plain(updates::helper_check(policy, program, args)),
+        "snapper" => plain(changes::helper_check(policy, args)),
         "systemctl" | "tee" | "rm" => plain(services::helper_check(policy, program, args, stdin)),
         "mkdir" if drop_in => plain(services::helper_check(policy, program, args, stdin)),
         "mkdir" | "mount" | "umount" | "eject" | "fuser" => plain(disks::helper_check(policy, peer.uid, peer.gid, program, args)),
@@ -120,6 +122,8 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(packages::PkgRemove),
         Box::new(updates::UpdateCheck),
         Box::new(updates::UpdateApply),
+        Box::new(changes::PkgHistory),
+        Box::new(changes::PkgRollback),
         Box::new(models::ModelStatus),
         Box::new(models::ModelLoad),
         Box::new(models::ModelUnload),

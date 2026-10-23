@@ -70,6 +70,8 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `pkg_remove`   | execute | ask     | Remove packages, refused if the system or the policy needs them |
 | `update_check` | read    | allow   | Pending updates (security fixes and kernels marked), services to restart, reboot needed |
 | `update_apply` | execute | ask     | Install updates: all, security fixes only, or named packages |
+| `pkg_history`  | read    | allow   | Every package change Orion made: versions before and after, snapshots, rollbacks |
+| `pkg_rollback` | execute | ask     | Put a change back, through its snapper snapshots or by reinstalling the old versions |
 | `model_status` | read    | allow   | Local inference servers, their models (available and loaded), and the VRAM budget |
 | `model_load`   | write   | ask     | Load a model on Ollama, within the VRAM budget (optionally unloading others) |
 | `model_unload` | write   | ask     | Unload a model, freeing its VRAM |
@@ -80,17 +82,23 @@ Out of the box the AI can look at the machine freely. Changing it (writing files
 
 ## Install
 
-Linux only, because the tools read `/proc` and `/sys` directly. You need Rust 1.95 or newer ([rustup](https://rustup.rs)) and a C compiler.
+Linux only, because the tools read `/proc` and `/sys` directly. Each [release](https://github.com/Goliaith/Orion/releases) has binaries for x86_64 and aarch64 that run on Debian 11, Ubuntu 20.04, RHEL 9 and anything newer, as a `.deb`, an `.rpm`, an Arch PKGBUILD, and a tarball with an install script:
 
 ```sh
-git clone https://github.com/Goliaith/Orion.git && cd Orion
-cargo install --path .              # installs ~/.cargo/bin/orion
+curl -fsSL https://github.com/Goliaith/Orion/releases/latest/download/install.sh | sudo sh   # or without sudo: just you, in ~/.local
 orion tools                         # every tool and what the policy decides
 export ANTHROPIC_API_KEY=sk-ant-... # and/or run a local model with Ollama
 orion chat
 ```
 
-[Installing Orion](docs/install.md) covers each step in full, plus local models, the sandbox, voice, root access for the machine tools, and running Orion as a service. `cargo test` runs the tests.
+To build from source instead, you need Rust 1.95 or newer ([rustup](https://rustup.rs)) and a C compiler:
+
+```sh
+git clone https://github.com/Goliaith/Orion.git && cd Orion
+cargo install --path .              # installs ~/.cargo/bin/orion
+```
+
+[Installing Orion](docs/install.md) covers each step in full: the packages for each distribution, local models, the sandbox, voice, root access for the machine tools, and running Orion as a service. `cargo test` runs the tests.
 
 ## Chat
 
@@ -583,12 +591,12 @@ Orion notices problems before anyone asks. The daemon checks every 15 minutes:
 
 | Package manager | Distributions | Tested |
 |---|---|---|
-| apt | Debian, Ubuntu, Mint, Pop!_OS | Ubuntu 24.04, against its real repositories |
+| apt | Debian, Ubuntu, Mint, Pop!_OS | Ubuntu 24.04, against its real repositories; Debian, against a local test repository |
 | dnf (dnf4 and dnf5) | Fedora, RHEL 8+, Rocky, Alma | Fedora 44 (dnf5), against a local test repository |
 | zypper | openSUSE Tumbleweed and Leap, SLES | Tumbleweed, against a local test repository |
 | pacman | Arch, Manjaro, EndeavourOS | Arch, against a local test repository |
 
-`tests/distros/run.sh` repeats the Fedora, openSUSE and Arch runs in Docker; see the script for what it needs.
+`tests/distros/run.sh` repeats the Fedora, openSUSE, Arch and Debian runs in Docker, rollbacks and unattended updates included; see the script for what it needs.
 
 - **Nothing runs on a bad request.** Names that could be read as options are refused. Every change is dry-run with the package manager itself before you are asked (`apt-get -s`, `dnf --assumeno`, `zypper --dry-run`, `pacman -p`), so unknown packages fail first, and the result lists every package that changed, dependencies included.
 - **Removal is guarded.** A removal is refused, before you are asked, if it would take away a package the system marks essential or required, or one in `[packages] protected` (the kernel, systemd, sudo, ssh, libc, the package manager, bubblewrap, …). That holds even when the package would only go as a dependent of what you named, or be replaced by one you install.
@@ -609,7 +617,23 @@ Orion notices problems before anyone asks. The daemon checks every 15 minutes:
   - other processes: list them;
   - the kernel, `/run/reboot-required`, or PID 1: say the machine needs a reboot, and why.
 - **Pre-approving updates:** set `[packages] updates = "security"` (security fixes need no approval), `"all"` (any update that removes nothing) or `"full"` (any update, also ones that remove or replace packages, as Tumbleweed's often do; protected packages still never go). With `update_apply` on `allow`, where nobody is asked, this setting is a hard limit: anything outside it is refused.
-- **`orion call` exits 1** when the package manager fails partway, and the audit log records it as a failure, so scripts and timers notice. [Operating Orion](docs/operating.md#scheduled-security-updates) has a systemd timer for unattended security updates.
+- **`orion call` exits 1** when the package manager fails partway, and the audit log records it as a failure, so scripts and timers notice.
+
+### Snapshots and rollback
+
+Every package change Orion makes (`pkg_install`, `pkg_remove`, `update_apply`) can be put back.
+
+- **A history.** Before and after each change, Orion notes the version of every installed package, so the record holds exactly what moved, dependencies and new kernels included, in `~/.local/state/orion/packages.jsonl`. `pkg_history` lists the changes, newest first, with what was put back since.
+- **Snapshots.** Where the root filesystem has a snapper configuration (openSUSE's default, and Fedora or Ubuntu on btrfs once `snapper -c root create-config /` is done), Orion takes a snapshot pair around each change, described "orion update_apply" and so on, and cleaned up by snapper's number algorithm. `[packages] snapshots = "required"` refuses changes when no snapshot can be taken; `"never"` turns them off.
+- **`pkg_rollback`** puts a change back, by its id:
+  - with a snapshot pair, `snapper undochange` reverts every file the change touched (method `snapshot`, the default when there is one). If that configuration doesn't hold the package database, the rollback says so and fails, so the other method is still open;
+  - otherwise it asks the package manager for the old versions again, from the repositories (apt `name=version` with `--allow-downgrades`, dnf `name-version`, zypper `--oldpackage`) or from pacman's cache, and removes what the change added (method `packages`). Old versions first, then the removals; or the other way round when the old version can't go in beside its replacement. The removals are dry-run first and may take nothing else with them.
+- **Newest first.** A change can't be put back while a later one that touched the same packages is still in place; the refusal names it. Protected packages stay installed, and a change is put back only once.
+- `pkg_rollback` is `execute` and asks, like the changes themselves. Through the privileged helper, `snapper` runs only as Orion builds it, on the helper's own snapper configuration.
+
+### Unattended updates
+
+`[packages] automatic = "security"` (or `"all"`) has the daemon install updates once a day, at or after `automatic_at` (default `04:00`, local time). It catches up after the machine was off, and waits while on battery unless `automatic_on_battery` is set. Each run refreshes the lists and calls `update_apply` under the policy like any other caller: so `[packages] updates` must allow it (`"security"` for security fixes, `"all"` for everything), and it never removes packages. Every run is snapshotted and in the history, so `pkg_rollback` undoes it. The daemon notifies the desktop when it installed something; a failed run shows under what needs attention and tries again the next day. `orion status` shows the setting and the last run. Orion never reboots: the reboot check says when one is due.
 
 ### Network
 
@@ -803,7 +827,8 @@ src/
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
   daemon.rs     the system service: socket, peer checks, live reload, the stdio bridge
   approvals.rs  approvals through the daemon: the broker, and `orion approvals`
-  watch.rs      what needs attention: the checks, the daemon's watch, system_health
+  watch.rs      what needs attention: the checks, the daemon's watch, system_health,
+                unattended updates
   remote.rs     the chat calling tools through the daemon
   helper.rs     the privileged helper: the root service, its client, who may use it;
                 each tool module checks its own commands (helper_check)
@@ -813,7 +838,8 @@ src/
                 timers, packages, models (inference servers, VRAM budget), gpu
                 (recognition, per-process use, placement, gpu_assign), netconf
                 (Wi-Fi, connections, firewall), disks (disks, usage, mounts), updates
-                (pending updates, upgrading, restarts and reboots);
+                (pending updates, upgrading, restarts and reboots), changes
+                (snapshots, the package history, pkg_rollback);
                 exec.rs runs programs for them
   chat/
     mod.rs      config, the Backend and Ui traits
@@ -840,16 +866,22 @@ src/
                 neural speaker encoder (neural.rs), reading PyTorch weights
                 (torch.rs) and enrolling a voice (enroll.rs)
 docs/           install.md and operating.md: the installation and operating guides
+packaging/      release files: build.sh (tarball, .deb, .rpm), pkgbuild.sh (Arch),
+                install.sh (any distribution), assemble.sh, and test.sh, which
+                installs them in clean containers
 contrib/        orion.socket and orion.service (the daemon), orion-approvals.service
                 (approvals by notification), orion-helper.socket and
                 orion-helper.service (the privileged helper), orion-voice.service
                 (headless voice), orion-kiosk (boot into the shell), orion-shell.service
 tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
-                (daemon plus bridge), distros/ (package and update tools on
-                Fedora, openSUSE and Arch, in Docker), helper/ (the privileged
-                helper, as root)
-.github/        CI: lint, tests, the oldest supported Rust, distros/ and helper/,
-                on every push and nightly
+                (daemon plus bridge), distros/ (package and update tools,
+                rollbacks and unattended updates on Fedora, openSUSE, Arch and
+                Debian, in Docker), helper/ (the privileged helper and its
+                snapshots, as root)
+.github/        ci.yml: lint, tests, the oldest supported Rust, distros/ and
+                helper/, on every push and nightly; release.yml: the release
+                files, built and installed in clean containers on every push,
+                published as a GitHub release for a v* tag
 ```
 
 To add a capability, implement `Tool` in `src/tools/` and register it in `tools::builtin()`. Pick its `Risk` honestly, because that is what the policy defaults key off. Put checks that no approval should override in `precheck`, and argument-dependent pre-approval (like `proc_run`'s command list) in `preapproval`.
@@ -859,6 +891,7 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. The chat, the shell and `orion listen` call tools through it, and ~~`ask` approvals from MCP agents~~ reach you in a terminal, a notification or the shell.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits, and ~~a privileged helper~~ (`orion helper`) for root work in place of sudo rules. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
-4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots), on apt, dnf, zypper and pacman. Next: scheduled unattended updates, and a status-bar badge for pending security fixes.
-5. ~~**Proactive monitoring.**~~ Done: the daemon watches for failed services, full disks, security updates, a due reboot and low memory, notifies the desktop, and tells the AI.
-6. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.
+4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots), on apt, dnf, zypper and pacman. ~~Unattended updates~~, with ~~snapshots and rollback~~ under every package change, are done too. Next: a status-bar badge for pending security fixes.
+5. ~~**Packaging.**~~ Done: release binaries for x86_64 and aarch64 (glibc 2.31 and newer), `.deb`, `.rpm`, an Arch PKGBUILD and an install script, each installed and tested in clean containers before a release is published.
+6. ~~**Proactive monitoring.**~~ Done: the daemon watches for failed services, full disks, security updates, a due reboot and low memory, notifies the desktop, and tells the AI.
+7. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

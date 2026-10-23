@@ -205,16 +205,40 @@ orion call update_apply                                   # everything that remo
 orion call update_apply '{"full": true}'                  # also updates that remove or replace packages
 ```
 
+Each result names its `change` in the package history and the snapshots taken; `pkg_rollback` with that id puts it back ([below](#undoing-package-changes)).
+
 - **Nothing is removed unless you say `full`.** On apt such updates are held back and listed under `kept_back`. On dnf, zypper and pacman the update is refused and names what it would remove.
 - **After an update**, the result lists services still running replaced code (`restart_services`), other processes (`restart_processes`) and whether to reboot, and why (`reboot_reasons`). Restart services with `svc_control`; Orion never reboots the machine.
 - **Arch** upgrades everything or nothing, and has no security labels.
 - **openSUSE Tumbleweed** is upgraded with `zypper dist-upgrade`.
 
-A routine that works well: security fixes install on a schedule (below); you ask "check for updates" now and then and review the rest.
+A routine that works well: security fixes install unattended (below); you ask "check for updates" now and then and review the rest.
 
-With the [privileged helper](install.md#the-privileged-helper-recommended) set up, a timer of your own does it too, with no root unit: set `[packages] updates = "security"`, then `timer_create '{"name": "security-updates", "schedule": "daily", "tool": "update_apply", "args": {"security_only": true}}'`. The system timer below does the same as root, without the helper, and runs whether or not you're logged in.
+#### Unattended updates
 
-#### Scheduled security updates
+The daemon installs updates once a day when the policy asks it to:
+
+```toml
+[packages]
+updates = "security"        # security fixes need no approval: what makes unattended runs possible
+automatic = "security"      # "all" for every update (with updates = "all")
+automatic_at = "04:00"      # local time; a run missed while the machine was off happens at the next chance
+automatic_on_battery = false
+```
+
+Each run refreshes the package lists, then calls `update_apply` like any other caller: through the policy (so `updates` must allow it, and nothing is ever removed), with snapshots and an entry in the package history. The audit log names the caller "unattended updates". `orion status` shows the setting and the last run:
+
+```
+updates:      unattended: security fixes, daily from 04:00, not on battery; last 2026-10-23 04:00: installed 3 updates (change 12)
+```
+
+A run that installed something sends a desktop notification naming the change, so `pkg_rollback` can undo it. A failed run (no network, a refusal by the policy) appears under [what needs attention](#what-needs-attention) with the reason, and the next day's run tries again. Orion never reboots; the reboot check says when one is due.
+
+The daemon is a user service, so unattended updates run while you are logged in, or always with `loginctl enable-linger`. Root work goes through the [privileged helper](install.md#the-privileged-helper-recommended), or `sudo -n`. For a machine nobody logs into, the root timer below does the same without the daemon.
+
+A timer of your own works as well, through the helper, with no root unit: set `[packages] updates = "security"`, then `timer_create '{"name": "security-updates", "schedule": "daily", "tool": "update_apply", "args": {"security_only": true}}'`.
+
+#### Without the daemon: a root timer
 
 With `[packages] updates = "security"` and `update_apply` left at `ask`, a security-only update needs no approval, and any other update still does. With nobody to ask, "any other" means refused. That makes a timer safe: it can install security fixes and nothing else.
 
@@ -264,9 +288,26 @@ sudo systemctl start orion-updates.service     # once now, to check it
 journalctl -u orion-updates                    # what was checked and installed, and what to restart
 ```
 
-This needs the binary in `/usr/local/bin` ([installing for every user](install.md#1-build-and-install)). It runs as root, so it needs no sudo rule. The first step refreshes the package lists; the second installs only security fixes, never removes a package, and says which services to restart and whether to reboot. Orion never restarts or reboots on its own.
+This needs the binary in `/usr/local/bin` ([installing for every user](install.md#1-install); with a release package, write `/usr/bin/orion` instead). It runs as root, so it needs no sudo rule. The first step refreshes the package lists; the second installs only security fixes, never removes a package, and says which services to restart and whether to reboot. Orion never restarts or reboots on its own.
 
 `orion call` exits non-zero, so the service run shows as failed, when a call is refused, can't start, or the package manager fails partway. In that last case the result says `"ok": false` with the error, and the audit log records the failure. Arch has no security labels, so this does nothing there.
+
+### Undoing package changes
+
+Every install, removal and update Orion makes is written down, every package's version before and after, and snapshotted where snapper is set up:
+
+```sh
+orion call pkg_history                                    # newest first: what moved, the snapshots, what was put back
+orion call pkg_rollback '{"id": 12}'                      # put change 12 back
+orion call pkg_rollback '{"id": 12, "method": "packages"}'  # by the package manager, even with snapshots
+```
+
+- **With snapshots** (`snapper` with a configuration for `/`: openSUSE has one; on Fedora or Ubuntu with btrfs, `sudo snapper -c root create-config /`), the rollback undoes every file the change touched (`snapper undochange`). `pkg_history` says whether snapshots are on.
+- **Without**, it installs the old versions again, from the repositories or pacman's cache, and removes what the change added. An old version that the repositories no longer carry can't come back this way; the refusal says which, before anything runs.
+- **Changes go back newest first**: a rollback is refused while a later change to the same packages is in place, and the refusal names that change.
+- **A reboot is wise** after putting back a kernel or core libraries; the result of the next `update_check` says so.
+
+`[packages] snapshots = "required"` makes every package change wait for a snapshot, refusing it where none can be taken; `"never"` turns them off; `snapper_config` names another configuration than `root`.
 
 ### Files
 
@@ -494,6 +535,8 @@ The graphical shell shows the same requests as cards, naming the agent. Answer w
 | `~/.local/state/orion/chat_history` | your typed message history |
 | `~/.local/state/orion/shell-url` | the running shell's address and token |
 | `~/.local/state/orion/pacman-db/` | Arch: the private copy of the package lists |
+| `~/.local/state/orion/packages.jsonl` | the package history: every change Orion made, for `pkg_history` and `pkg_rollback` |
+| `~/.local/state/orion/unattended.json` | the last unattended update run |
 | `~/.local/share/orion/models/` | the neural speaker model |
 | `~/orion-workspace/` | where the AI writes, by default |
 | `$XDG_RUNTIME_DIR/orion/orion.sock` | the daemon's socket |

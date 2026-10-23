@@ -322,6 +322,9 @@ fn main() -> Result<()> {
                     println!("sandbox:      {}", orion::sandbox::describe(&policy));
                     println!("root access:  {}", orion::tools::root_access(&policy));
                     print_attention(&orion::watch::check(&policy, false), " (quick checks, no updates: the daemon checks those)");
+                    let auto = orion::watch::describe_automatic(&policy, orion::watch::last_unattended().as_ref());
+                    let note = if policy.packages.automatic == "off" { "" } else { " (the daemon runs them)" };
+                    println!("updates:      {auto}{note}");
                     std::process::exit(1);
                 }
             };
@@ -354,6 +357,8 @@ fn main() -> Result<()> {
             let found: Vec<orion::watch::Finding> = serde_json::from_value(st["health"]["findings"].clone()).unwrap_or_default();
             let checked = st["health"]["checked_at"].as_str().map(|t| format!(" (checked {})", &t[t.len().saturating_sub(8)..])).unwrap_or_default();
             print_attention(&found, &checked);
+            let last: Option<orion::watch::Unattended> = serde_json::from_value(st["health"]["unattended"].clone()).ok();
+            println!("updates:      {}", orion::watch::describe_automatic(&policy, last.as_ref()));
             if let Some(log) = st["audit_log"].as_str() {
                 println!("audit log:    {log}");
             }

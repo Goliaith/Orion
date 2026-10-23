@@ -7,8 +7,15 @@
 //! and notifies the desktop the first time each one appears. `orion
 //! status`, the `system_health` tool, the chat and the shell show them.
 //! Without a daemon, the interfaces run the quick checks themselves.
+//!
+//! The daemon also installs updates unattended, once a day, when `[packages]
+//! automatic` asks for it: through `update_apply`, under the policy like any
+//! other call (so only as far as `packages.updates` lets it run without a
+//! person), with snapshots and a history entry, and never on battery unless
+//! allowed. It never reboots; the reboot check says when one is due.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -234,6 +241,146 @@ pub struct Health {
     pub findings: Vec<Finding>,
     pub checked_at: Option<String>,
     pub updates_checked_at: Option<String>,
+    /// The latest unattended update run.
+    pub unattended: Option<Unattended>,
+}
+
+/// One unattended update run, as `$XDG_STATE_HOME/orion/unattended.json`
+/// keeps the latest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Unattended {
+    /// Local date and time it ran.
+    pub at: String,
+    pub ok: bool,
+    pub summary: String,
+    /// Its entry in the package history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<u64>,
+}
+
+fn unattended_path() -> Option<PathBuf> {
+    Policy::state_dir().map(|d| d.join("unattended.json"))
+}
+
+/// The latest unattended update run, if there was one.
+pub fn last_unattended() -> Option<Unattended> {
+    serde_json::from_str(&std::fs::read_to_string(unattended_path()?).ok()?).ok()
+}
+
+/// `HH:MM` as minutes after midnight.
+fn minutes(hhmm: &str) -> Option<u32> {
+    let (h, m) = hhmm.split_once(':')?;
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (h < 24 && m < 60 && hhmm.len() == 5).then_some(h * 60 + m)
+}
+
+/// `[packages] automatic`: the update_apply arguments and the time of
+/// day, `None` when off, or what is wrong with the settings.
+fn automatic(policy: &Policy) -> Result<Option<(Value, u32)>, String> {
+    let p = &policy.packages;
+    let args = match p.automatic.as_str() {
+        "off" => return Ok(None),
+        "security" => json!({ "security_only": true }),
+        "all" => json!({}),
+        other => return Err(format!("packages.automatic must be off, security or all, not {other:?}")),
+    };
+    let at = minutes(&p.automatic_at).ok_or_else(|| format!("packages.automatic_at must be a time like \"04:00\", not {:?}", p.automatic_at))?;
+    Ok(Some((args, at)))
+}
+
+/// Whether the day's run is due at `now` (local "YYYY-MM-DD HH:MM:SS"):
+/// the time has come, and it hasn't run today.
+fn due(at: u32, now: &str, last: Option<&Unattended>) -> bool {
+    let Some((date, time)) = now.split_once(' ') else { return false };
+    let Some(mins) = time.get(..5).and_then(minutes) else { return false };
+    mins >= at && last.is_none_or(|l| !l.at.starts_with(date))
+}
+
+/// Running on battery: a battery discharging.
+fn on_battery() -> bool {
+    let Ok(dir) = std::fs::read_dir("/sys/class/power_supply") else { return false };
+    dir.flatten().any(|e| {
+        let read = |f: &str| std::fs::read_to_string(e.path().join(f)).unwrap_or_default();
+        read("type").trim() == "Battery" && read("status").trim() == "Discharging"
+    })
+}
+
+/// What unattended updates are set to do, for `orion status`.
+pub fn describe_automatic(policy: &Policy, last: Option<&Unattended>) -> String {
+    let mut out = match automatic(policy) {
+        Ok(None) => "unattended: off ([packages] automatic)".to_string(),
+        Ok(Some(_)) => format!(
+            "unattended: {}, daily from {}{}",
+            if policy.packages.automatic == "security" { "security fixes" } else { "all updates" },
+            policy.packages.automatic_at,
+            if policy.packages.automatic_on_battery { "" } else { ", not on battery" }
+        ),
+        Err(e) => format!("unattended: misconfigured: {e}"),
+    };
+    if let Some(l) = last {
+        let change = l.change.map(|c| format!(" (change {c})")).unwrap_or_default();
+        out.push_str(&format!("; last {}: {}{change}", &l.at[..l.at.len().min(16)], l.summary));
+    }
+    out
+}
+
+/// Refresh the lists and install the updates, as the policy allows.
+fn run_unattended(orion: &crate::Orion, args: Value) -> Unattended {
+    let caller = Some("unattended updates");
+    let at = now();
+    let fail = |summary: String, change: Option<u64>| Unattended { at: at.clone(), ok: false, summary, change };
+    if let Err(e) = orion.call_as("update_check", json!({ "refresh": true }), None, caller) {
+        return fail(format!("checking for updates: {e}"), None);
+    }
+    match orion.call_as("update_apply", args, None, caller) {
+        Ok(v) if v["ok"] == false => fail(v["error"].as_str().unwrap_or("the update failed").to_string(), v["change"].as_u64()),
+        Ok(v) => {
+            let n = v["upgraded"].as_array().map_or(0, Vec::len);
+            let summary = match n {
+                0 => "nothing to update".to_string(),
+                1 => "installed 1 update".to_string(),
+                n => format!("installed {n} updates"),
+            };
+            Unattended { at: at.clone(), ok: true, summary, change: v["change"].as_u64() }
+        }
+        Err(e) => fail(e.to_string(), None),
+    }
+}
+
+/// The day's unattended updates, when due. What needs attention about them.
+fn unattended_round(orion: &crate::Orion, last: &mut Option<Unattended>, health: &Shared) -> (Vec<Finding>, bool) {
+    let policy = orion.policy();
+    let mut ran = false;
+    match automatic(policy) {
+        Err(why) => {
+            return (vec![finding("unattended", false, "Unattended updates are misconfigured".to_string(), why, "fix [packages] in orion.toml")], false);
+        }
+        Ok(Some((args, at))) if due(at, &now(), last.as_ref()) && (policy.packages.automatic_on_battery || !on_battery()) => {
+            let run = run_unattended(orion, args);
+            if let Some(path) = unattended_path() {
+                let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path)).and_then(|()| std::fs::write(&path, json!(run).to_string()));
+            }
+            if run.ok && run.change.is_some() && policy.watch.notify {
+                let undo = run.change.map(|c| format!("pkg_rollback with id {c} puts them back")).unwrap_or_default();
+                notify_text(&format!("Orion {}", run.summary), &undo, false);
+            }
+            health.lock().unwrap_or_else(|e| e.into_inner()).unattended = Some(run.clone());
+            *last = Some(run);
+            ran = true;
+        }
+        Ok(_) => {}
+    }
+    let mut found = Vec::new();
+    if let Some(l) = last.as_ref().filter(|l| !l.ok) {
+        found.push(finding(
+            "unattended",
+            false,
+            format!("Unattended updates failed ({})", &l.at[..l.at.len().min(16)]),
+            l.summary.clone(),
+            "they try again tomorrow; update_apply shows what goes wrong",
+        ));
+    }
+    (found, ran)
 }
 
 pub type Shared = Arc<Mutex<Health>>;
@@ -249,9 +396,15 @@ pub fn run(policy: impl Fn() -> Arc<crate::Orion>, health: Shared) {
     let mut first_seen: BTreeMap<String, String> = BTreeMap::new();
     let mut updates_found: Vec<Finding> = Vec::new();
     let mut updates_at: Option<Instant> = None;
+    let mut last = last_unattended();
+    health.lock().unwrap_or_else(|e| e.into_inner()).unattended = last.clone();
     loop {
         let orion = policy();
         let cfg = orion.policy().watch.clone();
+        let (unattended, ran) = unattended_round(&orion, &mut last, &health);
+        if ran {
+            updates_at = None; // what is still pending has changed
+        }
         if cfg.enabled {
             let due = updates_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(cfg.updates_hours.max(1) * 3600));
             if due {
@@ -260,6 +413,7 @@ pub fn run(policy: impl Fn() -> Arc<crate::Orion>, health: Shared) {
                 health.lock().unwrap_or_else(|e| e.into_inner()).updates_checked_at = Some(now());
             }
             let mut found = check(orion.policy(), false);
+            found.extend(unattended.into_iter().filter(|f| !cfg.ignore.iter().any(|p| crate::tools::exec::glob_match(p, &f.key))));
             found.extend(updates_found.iter().filter(|f| !cfg.ignore.iter().any(|p| crate::tools::exec::glob_match(p, &f.key))).cloned());
             let stamp = now();
             for f in &mut found {
@@ -284,13 +438,17 @@ pub fn run(policy: impl Fn() -> Arc<crate::Orion>, health: Shared) {
 }
 
 fn notify(f: &Finding) {
+    let body = [f.detail.as_str(), f.hint.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" · ");
+    notify_text(&f.title, &body, f.severity == "critical");
+}
+
+fn notify_text(title: &str, body: &str, critical: bool) {
     if !crate::tools::exec::installed("notify-send") {
         return;
     }
-    let body = [f.detail.as_str(), f.hint.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" · ");
-    let urgency = if f.severity == "critical" { "--urgency=critical" } else { "--urgency=normal" };
+    let urgency = if critical { "--urgency=critical" } else { "--urgency=normal" };
     let _ = std::process::Command::new("notify-send")
-        .args(["--app-name=Orion", urgency, "--", &f.title, &body])
+        .args(["--app-name=Orion", urgency, "--", title, body])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -311,6 +469,7 @@ pub fn from_daemon(config: &crate::daemon::DaemonConfig) -> Option<Health> {
         findings: serde_json::from_value(r["findings"].clone()).ok()?,
         checked_at: r["checked_at"].as_str().map(String::from),
         updates_checked_at: r["updates_checked_at"].as_str().map(String::from),
+        unattended: serde_json::from_value(r["unattended"].clone()).ok(),
     })
 }
 
@@ -409,5 +568,22 @@ mod tests {
         // Memory: nothing has 101% available.
         assert_eq!(memory(101).len(), 1);
         assert!(memory(0).is_empty());
+    }
+
+    #[test]
+    fn unattended_updates_run_once_a_day() {
+        assert_eq!((minutes("04:00"), minutes("23:59"), minutes("24:00"), minutes("4:00"), minutes("x")), (Some(240), Some(1439), None, None, None));
+        let ran = |at: &str| Unattended { at: at.into(), ok: true, summary: String::new(), change: None };
+        assert!(!due(240, "2026-10-23 03:59:59", None));
+        assert!(due(240, "2026-10-23 04:00:00", None));
+        assert!(due(240, "2026-10-23 13:30:00", Some(&ran("2026-10-22 04:00:10"))), "catches up after the machine was off");
+        assert!(!due(240, "2026-10-23 13:30:00", Some(&ran("2026-10-23 04:00:10"))));
+        let p = |t: &str| Policy::from_toml(t).unwrap();
+        assert_eq!(automatic(&p("")), Ok(None));
+        assert_eq!(automatic(&p("[packages]\nautomatic = \"security\"\n")), Ok(Some((json!({ "security_only": true }), 240))));
+        assert!(automatic(&p("[packages]\nautomatic = \"all\"\nautomatic_at = \"25:00\"\n")).unwrap_err().contains("automatic_at"));
+        assert!(automatic(&p("[packages]\nautomatic = \"yes\"\n")).is_err());
+        let d = describe_automatic(&p("[packages]\nautomatic = \"security\"\n"), Some(&ran("2026-10-23 04:00:10")));
+        assert_eq!(d, "unattended: security fixes, daily from 04:00, not on battery; last 2026-10-23 04:00: ");
     }
 }

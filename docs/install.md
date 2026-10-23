@@ -1,9 +1,9 @@
 # Installing Orion
 
-This guide takes a Linux machine from nothing to a working Orion: building it, giving it a model to talk to, the optional parts (sandbox, voice, the graphical shell, network and disk tools), root access for the machine tools, and running it as a service. [Operating Orion](operating.md) covers using it day to day.
+This guide takes a Linux machine from nothing to a working Orion: installing it, giving it a model to talk to, the optional parts (sandbox, voice, the graphical shell, network and disk tools), root access for the machine tools, and running it as a service. [Operating Orion](operating.md) covers using it day to day.
 
 - [What you need](#what-you-need)
-- [1. Build and install](#1-build-and-install)
+- [1. Install](#1-install)
 - [2. Check it works](#2-check-it-works)
 - [3. Write a policy](#3-write-a-policy)
 - [4. Connect a model](#4-connect-a-model)
@@ -13,14 +13,16 @@ This guide takes a Linux machine from nothing to a working Orion: building it, g
 - [8. Connect other AI agents (MCP)](#8-connect-other-ai-agents-mcp)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
+- [Making a release](#making-a-release)
 
 ## What you need
 
 | | Required | Notes |
 |---|---|---|
 | Linux | yes | Any distribution. The tools read `/proc` and `/sys` directly, so Orion doesn't build or run on macOS or Windows. |
-| Rust 1.95 or newer | to build | Older compilers stop with "rustc … is not supported". Distribution packages are often older; [rustup](https://rustup.rs) always works. |
-| A C compiler | to build | One dependency (`ring`, for TLS) compiles C. |
+| glibc 2.31 or newer | for a release | Debian 11, Ubuntu 20.04, RHEL 9, and every current distribution. On x86_64 or aarch64. Older or musl-based systems build from source. |
+| Rust 1.95 or newer | to build from source | Older compilers stop with "rustc … is not supported". Distribution packages are often older; [rustup](https://rustup.rs) always works. |
+| A C compiler | to build from source | One dependency (`ring`, for TLS) compiles C. |
 | A model | to chat | Claude (an API key), a model on this machine (Ollama, llama.cpp, vLLM or LM Studio), or both. |
 | systemd | for some tools | The service tools, `gpu_assign` and the service units in `contrib/`. Everything else works without it. |
 
@@ -29,11 +31,55 @@ What works on which distribution:
 | | Debian, Ubuntu | Fedora, RHEL 8+ | openSUSE, SLES | Arch |
 |---|---|---|---|---|
 | Package and update tools | apt | dnf | zypper | pacman |
-| Tested on | Ubuntu 24.04 | Fedora 44 | Tumbleweed | Arch |
+| Tested on | Ubuntu 24.04, Debian | Fedora 44 | Tumbleweed | Arch |
+| Release package | `.deb` | `.rpm` | `.rpm` | PKGBUILD |
+| Snapshots before changes | with snapper on btrfs | with snapper on btrfs | by default | with snapper on btrfs |
 
 Other distributions (Alpine, Void, Gentoo, NixOS, image-based systems such as Fedora Silverblue) run everything except the package and update tools. The network tools need NetworkManager, and the firewall tools ufw or firewalld.
 
-## 1. Build and install
+## 1. Install
+
+Install a release, or build from source. A release is ready to run: the binary (about 10 MB), its systemd units, the `orion` group for the [privileged helper](#the-privileged-helper-recommended), and the guides and example policy in `/usr/share/doc/orion`.
+
+### From a release
+
+Every [release](https://github.com/Goliaith/Orion/releases) has packages for x86_64 and aarch64. Pick your distribution; `V` is the release you want:
+
+```sh
+V=0.1.0
+
+# Debian, Ubuntu (on ARM: _arm64.deb)
+curl -LO https://github.com/Goliaith/Orion/releases/download/v$V/orion_${V}_amd64.deb
+sudo apt install ./orion_${V}_amd64.deb
+
+# Fedora, RHEL 9, Rocky, Alma (on ARM: .aarch64.rpm)
+curl -LO https://github.com/Goliaith/Orion/releases/download/v$V/orion-$V-1.x86_64.rpm
+sudo dnf install ./orion-$V-1.x86_64.rpm
+
+# openSUSE
+curl -LO https://github.com/Goliaith/Orion/releases/download/v$V/orion-$V-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./orion-$V-1.x86_64.rpm
+
+# Arch: the PKGBUILD packages the release binary (orion-bin)
+mkdir orion-bin && cd orion-bin
+curl -LO https://github.com/Goliaith/Orion/releases/download/v$V/PKGBUILD
+makepkg -si
+```
+
+On any other distribution, or to skip the package manager, the install script installs the latest release, checked against the release's `SHA256SUMS`:
+
+```sh
+curl -fsSL https://github.com/Goliaith/Orion/releases/latest/download/install.sh | sudo sh   # for every user
+curl -fsSL https://github.com/Goliaith/Orion/releases/latest/download/install.sh | sh        # just you
+```
+
+As root it installs `/usr/local/bin/orion`, the user units in `/etc/systemd/user`, the helper's units in `/etc/systemd/system`, and the `orion` group. Without root it installs into `~/.local/bin` and `~/.config/systemd/user`, and leaves out the helper, which needs root. `--version v0.1.0` picks a release, and `--uninstall` removes what it installed.
+
+The packages aren't signed. To check one by hand, download `SHA256SUMS` beside it and run `sha256sum -c --ignore-missing SHA256SUMS`.
+
+With a package or the install script the systemd units are already in place, so in [7. Run it as a service](#7-run-it-as-a-service) you skip the `cp` lines.
+
+### From source
 
 Install the build tools. Pick your distribution:
 
@@ -68,7 +114,7 @@ cargo build --release
 sudo install -m 755 target/release/orion /usr/local/bin/orion
 ```
 
-If you do that, change `ExecStart=%h/.cargo/bin/orion` to `ExecStart=/usr/local/bin/orion` in the units you copy from `contrib/`.
+If you do that, change `ExecStart=%h/.cargo/bin/orion` to `ExecStart=/usr/local/bin/orion` in the units you copy from `contrib/`. (`packaging/install.sh`, run from a release tarball, does all of that for you.)
 
 To run the tests (optional, about a minute):
 
@@ -247,7 +293,8 @@ Installing packages and updates, controlling system services, changing the netwo
 
 `orion helper` is a small root service that does Orion's root work and nothing else. Orion sends it each command on a Unix socket that only root and the `orion` group can open. The helper runs the command only if it is one Orion's own tools build, and checks it again on its own side, against its own policy:
 
-- **Packages and updates:** only the package manager commands Orion makes, on plain package names (no files, no options that run commands), and only if the helper's own dry run, as root, removes no protected or essential package.
+- **Packages and updates:** only the package manager commands Orion makes, on plain package names (no files, no options that run commands), and only if the helper's own dry run, as root, removes no protected or essential package. Rollbacks may name old versions (`name=version`) or pacman's cached package files, and nothing else.
+- **Snapshots:** only the `snapper` commands Orion makes (a pre or post snapshot described "orion …", or undoing a pair), and only on the snapper configuration in the helper's own policy (`[packages] snapper_config`, default `root`).
 - **Services:** `systemctl` start, stop, restart, reload, enable and disable of units that aren't protected. That includes the units that give a root shell on a console, such as `debug-shell.service`.
 - **GPU pins:** only Orion's `50-orion-gpu.conf` drop-in, holding only the GPU variables. A drop-in with `ExecStart=` would run anything as root.
 - **Disks:** mounts only under the mount roots, always `nosuid,nodev`, of disks the system doesn't run from; unmounts of anything but the system's own mounts.
@@ -255,7 +302,14 @@ Installing packages and updates, controlling system services, changing the netwo
 
 Its protected lists come from `/etc/orion/helper.toml`, which only root may change, so code running as you can't loosen them. Everything else is refused, and every command it ran or refused is logged with who asked. Compared with a sudo rule, code running as you gets Orion's operations, not a root shell.
 
-Set it up once, as root:
+With a release package or a system-wide `install.sh`, the binary, the units and the `orion` group are already there. Join the group and start it:
+
+```sh
+sudo usermod -aG orion "$USER"                                 # then log out and back in
+sudo systemctl enable --now orion-helper.socket
+```
+
+Built from source, set it up once, as root:
 
 ```sh
 sudo install -m 755 ~/.cargo/bin/orion /usr/local/bin/orion   # the helper runs from /usr/local/bin
@@ -278,7 +332,7 @@ With `[admin] elevate = "auto"` (the default), Orion uses the helper whenever it
 
 To give the helper its own protected lists or another group, copy the sections you want to change from `orion.example.toml` (`[packages]`, `[services]`, `[disks]`, `[helper]`) into `/etc/orion/helper.toml`. A list there replaces the default list, so copy the whole list and add to it. The file must belong to root and be writable only by root, or the helper won't start.
 
-`tests/helper/run.sh` (as root) checks all of this end to end: a normal user installing and removing a package through the helper, and the helper refusing a shell, an apt hook, a protected package, a unit that runs a command, a console root shell, a weak mount and an outsider.
+`tests/helper/run.sh` (as root) checks all of this end to end: a normal user installing, rolling back and removing a package through the helper, with snapshots of a scratch btrfs volume, and the helper refusing a shell, an apt hook, a protected package, a unit that runs a command, a console root shell, a snapper command Orion never makes, a weak mount and an outsider.
 
 ### Other ways
 
@@ -380,6 +434,15 @@ With no human at the keyboard, `ask` means no: an MCP client is offered only the
 
 ## Upgrading
 
+A release package upgrades like any other: install the new one the same way (`sudo apt install ./orion_…deb`, `sudo dnf install ./orion-….rpm`, `makepkg -si` with the new PKGBUILD). With the install script, run it again. Then restart what runs:
+
+```sh
+systemctl --user restart orion.service orion-voice.service orion-shell.service 2>/dev/null
+sudo systemctl restart orion-helper.service 2>/dev/null
+```
+
+Built from source:
+
 ```sh
 cd Orion
 git pull
@@ -390,6 +453,8 @@ systemctl --user restart orion.service orion-voice.service orion-shell.service 2
 Your policy, conversations, memory, voiceprints and audit log are kept. A new version may refuse a setting it no longer knows; the error names it.
 
 ## Uninstalling
+
+A release package: `sudo apt remove orion`, `sudo dnf remove orion`, `sudo zypper remove orion` or `sudo pacman -R orion-bin`. The install script: run it again with `--uninstall` (with `sudo` if you installed it that way). Built from source:
 
 ```sh
 systemctl --user disable --now orion.socket orion.service orion-voice.service orion-shell.service 2>/dev/null
@@ -402,7 +467,7 @@ That leaves your data. To remove it too:
 | Path | What |
 |---|---|
 | `~/.config/orion/` | the policy and the `env` file |
-| `~/.local/state/orion/` | conversations, memory, voiceprints, the audit log, chat history, the shell's address |
+| `~/.local/state/orion/` | conversations, memory, voiceprints, the audit log, chat history, the shell's address, the package history and the last unattended update |
 | `~/.local/share/orion/` | the neural speaker model |
 | `~/orion-workspace/` | files the AI wrote (the default write root) |
 | `/etc/sudoers.d/orion` | the sudoers rule, if you made one |
@@ -410,3 +475,19 @@ That leaves your data. To remove it too:
 | `/etc/systemd/system/*.d/50-orion-gpu.conf` | GPU pins made by `gpu_assign`; remove them with `gpu_assign` and an empty list first |
 
 Packages Orion installed, firewall rules it added (commented "added by Orion" in ufw) and Wi-Fi networks it joined stay as they are.
+
+## Making a release
+
+1. Set the new version in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows), and commit.
+2. Tag it and push the tag: `git tag v0.2.0 && git push origin v0.2.0`.
+
+`.github/workflows/release.yml` then builds the binaries for x86_64 and aarch64 against glibc 2.31, makes the tarballs, `.deb`, `.rpm`, PKGBUILD, `install.sh` and `SHA256SUMS`, installs them in clean containers (Debian 11, Ubuntu, Rocky Linux 9, Fedora, openSUSE, Arch, and arm64 under emulation), runs the distro tests against the release binary, and only then publishes the GitHub release. A tag that doesn't match the version in `Cargo.toml` stops the build. Every push runs the same build and package tests without publishing, and keeps the files as workflow artifacts.
+
+To build them on your own machine (needs zig, `cargo-zigbuild`, dpkg-deb and rpmbuild):
+
+```sh
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
+packaging/build.sh 0.1.0 x86_64 target/x86_64-unknown-linux-gnu/release/orion dist
+packaging/assemble.sh dist 0.1.0       # after building every architecture into dist
+packaging/test.sh dist 0.1.0           # install and check them in Docker
+```

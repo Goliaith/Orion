@@ -1,0 +1,124 @@
+# Orion's release files: binaries for x86_64 and aarch64, built against
+# glibc 2.31 so they run on Debian 11, Ubuntu 20.04, RHEL 9 and anything
+# newer; .deb and .rpm packages; a tarball with install.sh; and an Arch
+# PKGBUILD. Every push builds them and installs them in clean containers.
+# A v* tag (matching the version in Cargo.toml) publishes them as a
+# GitHub release, after the package tests and the distro tests pass
+# against the release binary itself.
+name: Release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIG_VERSION: "0.17.0"
+  ZIGBUILD_VERSION: "0.24.0"
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The version, which a tag must match
+        id: version
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ $GITHUB_REF == refs/tags/v* && ${GITHUB_REF#refs/tags/v} != "$v" ]]; then
+            echo "::error::the tag ${GITHUB_REF#refs/tags/} doesn't match the version in Cargo.toml ($v)"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Packaging tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q rpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+      - name: Zig and cargo-zigbuild, to build against glibc 2.31
+        run: |
+          python3 -m venv ~/zig && ~/zig/bin/pip install -q "ziglang==$ZIG_VERSION"
+          echo ~/zig/bin >> "$GITHUB_PATH"
+          cargo install --locked "cargo-zigbuild@$ZIGBUILD_VERSION"
+      - name: Build
+        run: cargo zigbuild --release --locked --target ${{ matrix.arch }}-unknown-linux-gnu.2.31
+      - name: No newer glibc than 2.31
+        run: |
+          newest=$(objdump -T target/${{ matrix.arch }}-unknown-linux-gnu/release/orion | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "needs $newest"
+          [ "$(printf '%s\n' "$newest" GLIBC_2.31 | sort -V | tail -1)" = GLIBC_2.31 ]
+      - name: Package
+        run: packaging/build.sh ${{ steps.version.outputs.version }} ${{ matrix.arch }} target/${{ matrix.arch }}-unknown-linux-gnu/release/orion dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+
+  test:
+    name: Install and test the packages
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Assemble the release
+        run: packaging/assemble.sh dist ${{ needs.build.outputs.version }}
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Install in clean containers
+        run: packaging/test.sh dist ${{ needs.build.outputs.version }} arm64
+      - name: Tools to build the distro test repositories
+        if: startsWith(github.ref, 'refs/tags/')
+        run: sudo apt-get update -q && sudo apt-get install -y -q rpm createrepo-c zstd dpkg-dev
+      - name: The distro tests, against the release binary
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir rel && tar -C rel -xzf dist/orion-x86_64-linux.tar.gz
+          ORION_BIN=$PWD/rel/orion-x86_64-linux tests/distros/run.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/
+
+  publish:
+    name: Publish the release
+    needs: [build, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Orion ${{ needs.build.outputs.version }}" --generate-notes

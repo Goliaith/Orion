@@ -73,6 +73,18 @@ protected = ["sudo", "systemd", "systemd-*", "openssh-server", "openssh", "linux
 # update_apply = "allow", where nobody is asked, anything else is refused.
 updates = "ask"
 timeout_secs = 900
+# Snapper snapshots before and after each package change, for pkg_rollback:
+# "auto" (when snapper has the configuration below), "required" (no change
+# without them) or "never". Every change also goes in the package history.
+snapshots = "auto"
+snapper_config = "root"
+# Unattended updates by the daemon, once a day: "off", "security" or "all".
+# They run only as far as `updates` above lets update_apply run without a
+# person ("security" needs updates = "security" or more), never remove
+# packages, and never reboot.
+automatic = "off"
+automatic_at = "04:00"          # local time; a missed run happens at the next chance
+automatic_on_battery = false
 
 # Local inference servers and the VRAM they share (model_status, model_load, ...).
 [models]
