@@ -479,7 +479,7 @@ Packages Orion installed, firewall rules it added (commented "added by Orion" in
 ## Making a release
 
 1. Set the new version in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows), and commit.
-2. Tag it and push the tag: `git tag v0.2.0 && git push origin v0.2.0`.
+2. Tag it and push the tag: `git tag v0.2.0 && git push origin v0.2.0`. Or, where you can't push a tag, run the Release workflow by hand (Actions → Release → Run workflow) on the branch with **publish** checked: once the tests pass, it creates the tag `v<version>` on that commit along with the release. It refuses a version that is released already.
 
 `.github/workflows/release.yml` then builds the binaries for x86_64 and aarch64 against glibc 2.31, makes the tarballs, `.deb`, `.rpm`, PKGBUILD, `install.sh` and `SHA256SUMS`, installs them in clean containers (Debian 11, Ubuntu, Rocky Linux 9, Fedora, openSUSE, Arch, and arm64 under emulation), runs the distro tests against the release binary, and only then publishes the GitHub release. A tag that doesn't match the version in `Cargo.toml` stops the build. Every push runs the same build and package tests without publishing, and keeps the files as workflow artifacts.
 
