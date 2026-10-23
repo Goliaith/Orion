@@ -238,3 +238,15 @@ chat = "auto"                   # the chat, shell and orion listen call tools th
 socket = "/run/orion/helper.sock"
 group = "orion"                 # members may use it
 users = []                      # and these login names
+
+# What Orion watches for unasked, in the daemon: failed services, filesystems
+# filling up, pending security updates, a reboot that is due, memory running
+# out. orion status, the system_health tool, the chat and the shell show it.
+[watch]
+enabled = true
+interval_mins = 15
+updates_hours = 6               # listing pending updates takes a moment
+disk_percent = 90               # a filesystem this full needs attention
+memory_percent = 5              # memory below this share available does too
+notify = true                   # a desktop notification when something new turns up
+ignore = []                     # by key, e.g. ["service:backup.service", "disk:/mnt/archive", "reboot"]

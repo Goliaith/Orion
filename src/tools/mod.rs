@@ -28,6 +28,21 @@ pub use models::loaded_models;
 pub use services::failed_units;
 pub use system::info as machine_info;
 
+/// `YYYY-MM-DD HH:MM:SS` in local time.
+pub fn journal_time(secs: i64) -> String {
+    journal::local_time(secs)
+}
+
+/// Pending updates for the health watch: (all, security fixes, a kernel).
+pub fn pending_updates(policy: &Policy) -> Result<(usize, usize, bool)> {
+    updates::summary(policy)
+}
+
+/// Why the machine needs a reboot, for the health watch; empty if it doesn't.
+pub fn reboot_needed(policy: &Policy) -> Vec<String> {
+    updates::reboot_needed(policy)
+}
+
 /// How Orion gets root for the machine tools, for `orion tools` and
 /// `orion status`.
 pub fn root_access(policy: &Policy) -> String {
@@ -66,6 +81,7 @@ pub fn helper_check(policy: &Policy, peer: &Peer, program: &str, args: &[String]
 pub fn builtin() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(system::SystemInfo),
+        Box::new(crate::watch::SystemHealth),
         Box::new(gpu::GpuInfo),
         Box::new(network::NetInfo),
         Box::new(netconf::NetConnections),

@@ -157,6 +157,11 @@ pub fn run(policy: Policy, source: Option<PathBuf>, socket: Option<PathBuf>) -> 
     let shared: Shared = Arc::new(RwLock::new(Arc::new(Orion::new(policy))));
     let stats = Arc::new(Stats::default());
     let started = Instant::now();
+    let health: crate::watch::Shared = Arc::default();
+    {
+        let (shared, health) = (shared.clone(), health.clone());
+        thread::spawn(move || crate::watch::run(move || shared.read().unwrap_or_else(|e| e.into_inner()).clone(), health));
+    }
     tracing::info!(socket = %path.display(), policy = %describe_source(&source), sandbox = %sandbox, "orion daemon ready");
 
     if let Some(file) = watched.clone() {
@@ -165,9 +170,12 @@ pub fn run(policy: Policy, source: Option<PathBuf>, socket: Option<PathBuf>) -> 
     }
 
     let status: Extension = {
-        let (shared, stats, path, watched, broker) =
-            (shared.clone(), stats.clone(), path.clone(), watched.clone(), broker.clone());
+        let (shared, stats, path, watched, broker, health) =
+            (shared.clone(), stats.clone(), path.clone(), watched.clone(), broker.clone(), health.clone());
         Arc::new(move |method: &str, _params: &Value| {
+            if method == "orion/health" {
+                return Some(json!(health.lock().unwrap_or_else(|e| e.into_inner()).clone()));
+            }
             (method == "orion/status").then(|| {
                 let orion = shared.read().unwrap_or_else(|e| e.into_inner()).clone();
                 let count = |d: Decision| orion.tools().filter(|(_, x)| *x == d).count();
@@ -185,6 +193,7 @@ pub fn run(policy: Policy, source: Option<PathBuf>, socket: Option<PathBuf>) -> 
                     "sandbox": crate::sandbox::describe(orion.policy()),
                     "audit_log": orion.policy().audit_path(),
                     "approvals": { "offered": offer_ask, "approvers": broker.watching(), "waiting": broker.list().len() },
+                    "health": health.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 })
             })
         })

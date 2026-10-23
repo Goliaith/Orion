@@ -684,6 +684,21 @@ pub(super) fn helper_check(policy: &Policy, program: &str, args: &[String]) -> R
     bail!("that isn't a command Orion makes for {}", m.name())
 }
 
+/// For the health watch: (pending updates, of them security fixes, a
+/// kernel among them), from the lists as they are (no refresh).
+pub(super) fn summary(policy: &Policy) -> Result<(usize, usize, bool)> {
+    let m = manager(policy)?;
+    let list = pending(m)?;
+    Ok((list.len(), list.iter().filter(|u| u.security).count(), list.iter().any(|u| kernel_package(&u.name))))
+}
+
+/// For the health watch: why the machine needs a reboot, if it does.
+pub(super) fn reboot_needed(policy: &Policy) -> Vec<String> {
+    let m = manager(policy).unwrap_or(Manager::Apt);
+    let (stale, _) = stale_processes(Path::new("/proc"));
+    reboot_reasons(m, &stale)
+}
+
 /// A process still running code an update replaced.
 #[derive(Debug, PartialEq)]
 struct Stale {

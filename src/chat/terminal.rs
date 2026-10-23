@@ -721,6 +721,11 @@ fn banner(s: &Style, orion: &Orion, session: &Session) {
     if runs != "in this process" {
         println!("{}", s.dim(&format!("tools run {runs}")));
     }
+    let found = crate::watch::current(orion.policy());
+    if !found.is_empty() {
+        let titles: Vec<&str> = found.iter().map(|f| f.title.as_str()).collect();
+        println!("{}", s.yellow(&format!("! needs attention: {}", titles.join(" · "))));
+    }
     println!();
 }
 

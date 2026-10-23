@@ -267,6 +267,14 @@ pub fn connect(orion: &Orion, provider: Provider, model: Option<&str>) -> Result
 }
 
 pub(crate) fn system_prompt(policy: &Policy) -> String {
+    let base = base_prompt(policy);
+    match attention(policy) {
+        Some(a) => format!("{base}\n\n{a}"),
+        None => base,
+    }
+}
+
+fn base_prompt(policy: &Policy) -> String {
     let list = |items: Vec<String>| if items.is_empty() { "none".to_string() } else { items.join(", ") };
     let paths = |roots: &[std::path::PathBuf]| list(roots.iter().map(|r| r.display().to_string()).collect());
     let read = |p: &str| std::fs::read_to_string(p).map(|s| s.trim().to_string()).unwrap_or_default();
@@ -303,6 +311,33 @@ read-only path), say so rather than looking for a way around it.",
         commands = list(policy.proc.allowed_commands.clone()),
         sandbox = crate::sandbox::describe(policy),
     )
+}
+
+/// What needs attention on the machine, for the AI to bring up: the
+/// daemon's findings or the quick checks, kept for half an hour so the
+/// prompt (and the model's prompt cache) stays put.
+fn attention(policy: &Policy) -> Option<String> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, text)) = cache.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(1800)) {
+        return text.clone();
+    }
+    let found = crate::watch::current(policy);
+    let text = (!found.is_empty()).then(|| {
+        let items: Vec<String> = found
+            .iter()
+            .map(|f| format!("- {}{} ({})", f.title, if f.detail.is_empty() { String::new() } else { format!(": {}", f.detail) }, f.hint))
+            .collect();
+        format!(
+            "Orion's own checks found this needs attention on the machine:\n{}\nMention it to the owner briefly when it \
+             fits, once rather than in every reply, and offer to help. Don't act on it unless they ask.",
+            items.join("\n")
+        )
+    });
+    *cache = Some((Instant::now(), text.clone()));
+    text
 }
 
 #[cfg(test)]

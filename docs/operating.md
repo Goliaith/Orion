@@ -360,6 +360,29 @@ orion call gpu_assign '{"unit": "ollama", "gpus": [1]}'   # pin Ollama to GPU 1
 
 The argument names above are the common ones; `orion tools` and each tool's schema (the AI sees it, and errors name a wrong argument) have the rest.
 
+## What needs attention
+
+The daemon checks the machine every 15 minutes and keeps what it finds: failed services, filesystems 90% full, pending security updates, a reboot that is due, memory under 5%.
+
+```sh
+orion status                                      # the findings, each with what to do about it
+orion call system_health                          # checks afresh, including updates
+```
+
+```
+attention:    2 things (checked 09:14:11)
+  !  /home is 93% full: 12 GiB free
+     disk_usage shows what fills it; fs_delete moves things to the Trash
+  !  3 security updates pending
+     update_apply with security_only installs them
+```
+
+- A **desktop notification** comes once per problem, when it first appears.
+- **The AI is told** at the start of each conversation, and brings it up once when it fits. Ask "how is the machine doing?" for a fresh check.
+- **The chat and the shell** show the findings: under the header, in the full-screen panel (Ctrl-B), in the shell's machine panel.
+- **Too noisy?** Raise `[watch] disk_percent`, or leave findings out by key with `ignore`, such as `["disk:/mnt/archive", "service:backup.service"]`. `notify = false` keeps the checks but stops the notifications; `enabled = false` stops the watch.
+- **Without the daemon,** `orion status` and the interfaces run the quick checks themselves, all but the update list.
+
 ## The audit log
 
 Every tool call, by any model, agent or person, is one JSON line in `~/.local/state/orion/audit.jsonl`:

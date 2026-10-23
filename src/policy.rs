@@ -264,6 +264,8 @@ pub struct Policy {
     pub daemon: crate::daemon::DaemonConfig,
     /// The privileged helper (`orion helper`) that does root work for Orion.
     pub helper: crate::helper::HelperConfig,
+    /// What the daemon watches for, unasked (`system_health`).
+    pub watch: crate::watch::WatchConfig,
 }
 
 impl Policy {

@@ -1002,6 +1002,11 @@ fn panel_lines(m: &Machine, s: &Status, width: usize) -> Vec<Line<'static>> {
         Some(_) => l.push(Line::styled(" services ok", dim)),
         None => {}
     }
+    for a in &m.attention {
+        for row in wrap(&format!(" ! {a}"), width) {
+            l.push(Line::styled(row, Style::new().fg(Color::Yellow)));
+        }
+    }
 
     l.push(Line::raw(""));
     l.push(Line::styled(" Routing", head));
@@ -1291,6 +1296,7 @@ mod tests {
             gpus: vec![Gpu { index: 0, name: "NVIDIA GeForce RTX 4070".into(), util: Some(42), mem_used: Some(3174), mem_total: Some(12282), temp: Some(61) }],
             loaded: vec![("qwen3:8b".into(), 5427, vec![1])],
             failed: Some(vec!["nginx.service".into()]),
+            attention: vec!["/home is 93% full".into()],
             ..Default::default()
         };
         let s = Status {
@@ -1299,7 +1305,7 @@ mod tests {
             ..Default::default()
         };
         let text: String = panel_lines(&m, &s, 32).iter().map(|l| l.to_string() + "\n").collect();
-        for want in ["box", "31%", "9.0/16G", "GPU0 RTX 4070", "42% 61°C", "3.1/12G", "qwen3:8b", "5.3G ·1", "1 service failed: nginx", "judges the rest", "unavailable"] {
+        for want in ["box", "31%", "9.0/16G", "GPU0 RTX 4070", "42% 61°C", "3.1/12G", "qwen3:8b", "5.3G ·1", "1 service failed: nginx", "! /home is 93% full", "judges the rest", "unavailable"] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }
     }

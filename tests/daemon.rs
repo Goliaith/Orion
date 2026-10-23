@@ -95,6 +95,9 @@ fn serve_bridges_to_a_running_daemon() {
         let r = rpc(id, method, json!({ "id": 1, "approve": true }));
         assert!(r["error"]["message"].as_str().unwrap_or_default().contains("can't answer approval requests"), "{method}: {r}");
     }
+    // The daemon's watch: what needs attention, as a list (maybe empty).
+    let h = rpc(9, "orion/health", json!({}));
+    assert!(h["result"]["findings"].is_array(), "{h}");
 
     drop(stdin);
     let _ = serve.wait(); // exits when its stdin closes

@@ -31,6 +31,7 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | Tool           | Risk    | Default | What it does |
 |----------------|---------|---------|--------------|
 | `system_info`  | read    | allow   | Hostname, OS, kernel, CPU, memory, load, uptime |
+| `system_health` | read   | allow   | What needs attention: failed services, full disks, security updates, a due reboot, low memory |
 | `gpu_info`     | read    | allow   | Every GPU (NVIDIA, AMD, Intel) by name: memory, load, temperature, power, compute stacks, and what runs on each, down to the model |
 | `net_info`     | read    | allow   | Interfaces and addresses, default routes, DNS, and listening ports with the process behind each |
 | `net_connections` | read | allow  | NetworkManager's devices and saved connections, marking those that carry an SSH session |
@@ -519,6 +520,24 @@ Or in a client's JSON config:
 
 Beyond files and processes, the AI sees and manages the parts of the machine an AI-first system cares about.
 
+### Watching the machine
+
+Orion notices problems before anyone asks. The daemon checks every 15 minutes:
+
+| Check | Needs attention when |
+|---|---|
+| Services | a system service, or one of yours, has failed |
+| Disks | a writable filesystem is 90% full (`disk_percent`) |
+| Updates | security updates are pending (listed every 6 hours) |
+| Reboot | the kernel was replaced, the package manager asks for one, or PID 1 runs replaced libraries |
+| Memory | under 5% is available (`memory_percent`) |
+
+- **A desktop notification** comes the first time each problem appears, not again while it lasts, and again if it comes back after clearing.
+- **`orion status`** lists what needs attention, with what to do about each. Without the daemon it runs the quick checks itself (all but updates).
+- **The AI knows:** each conversation starts with the findings, and the AI mentions them once when it fits ("by the way, /home is 93% full") and offers to help, without acting unasked. `system_health` checks afresh.
+- **The interfaces show them:** the line-by-line chat under its header, the full-screen chat's panel and the shell's machine panel.
+- **Settings** are under `[watch]`: the interval, the thresholds, notifications, and `ignore` for findings you don't care about, by key (`"service:backup.service"`, `"disk:/mnt/archive"`, `"reboot"`).
+
 ### Files
 
 `fs_list`, `fs_read` and `fs_find` look inside the readable roots; `fs_write`, `fs_mkdir`, `fs_copy`, `fs_move` and `fs_delete` change things only inside the writable roots.
@@ -784,6 +803,7 @@ src/
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
   daemon.rs     the system service: socket, peer checks, live reload, the stdio bridge
   approvals.rs  approvals through the daemon: the broker, and `orion approvals`
+  watch.rs      what needs attention: the checks, the daemon's watch, system_health
   remote.rs     the chat calling tools through the daemon
   helper.rs     the privileged helper: the root service, its client, who may use it;
                 each tool module checks its own commands (helper_check)
@@ -840,4 +860,5 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. The chat, the shell and `orion listen` call tools through it, and ~~`ask` approvals from MCP agents~~ reach you in a terminal, a notification or the shell.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits, and ~~a privileged helper~~ (`orion helper`) for root work in place of sudo rules. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots), on apt, dnf, zypper and pacman. Next: scheduled unattended updates, and a status-bar badge for pending security fixes.
-5. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.
+5. ~~**Proactive monitoring.**~~ Done: the daemon watches for failed services, full disks, security updates, a due reboot and low memory, notifies the desktop, and tells the AI.
+6. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

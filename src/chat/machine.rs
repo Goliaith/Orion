@@ -37,6 +37,9 @@ pub struct Machine {
     pub loaded: Vec<(String, u64, Vec<usize>)>,
     /// Failed system services; `None` when there is no systemd.
     pub failed: Option<Vec<String>>,
+    /// Everything else that needs attention (crate::watch): disks filling
+    /// up, security updates, a reboot due, memory running out.
+    pub attention: Vec<String>,
 }
 
 /// CPU busy fraction between two /proc/stat samples.
@@ -66,6 +69,7 @@ fn read_machine(prev_cpu: &mut Option<(u64, u64)>, with_gpu: bool, last: &Machin
         other_gpus: last.other_gpus.clone(),
         loaded: last.loaded.clone(),
         failed: last.failed.clone(),
+        attention: last.attention.clone(),
     };
     if with_gpu {
         let all = crate::tools::gpu::inventory();
@@ -101,6 +105,11 @@ pub fn watch_machine(policy: &Policy, tx: Sender<Machine>, stop: &AtomicBool) {
         if tick.is_multiple_of(4) {
             last.loaded = crate::tools::loaded_models(policy);
             last.failed = crate::tools::failed_units();
+        }
+        // The daemon's findings, or the quick checks here, every minute.
+        if tick.is_multiple_of(30) {
+            last.attention =
+                crate::watch::current(policy).into_iter().filter(|f| !f.key.starts_with("service:")).map(|f| f.title).collect();
         }
         if tx.send(last.clone()).is_err() {
             return;

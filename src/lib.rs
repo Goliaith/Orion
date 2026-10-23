@@ -20,6 +20,7 @@ pub mod sandbox;
 pub mod tool;
 pub mod tools;
 pub mod voice;
+pub mod watch;
 
 use std::fmt;
 use std::time::Instant;

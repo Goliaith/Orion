@@ -221,6 +221,20 @@ enum Cmd {
     },
 }
 
+/// What needs attention, for `orion status`.
+fn print_attention(found: &[orion::watch::Finding], note: &str) {
+    if found.is_empty() {
+        println!("attention:    nothing{note}");
+        return;
+    }
+    println!("attention:    {} thing{}{note}", found.len(), if found.len() == 1 { "" } else { "s" });
+    for f in found {
+        let mark = if f.severity == "critical" { "!!" } else { "!" };
+        println!("  {mark:2} {}{}", f.title, if f.detail.is_empty() { String::new() } else { format!(": {}", f.detail) });
+        println!("     {}", f.hint);
+    }
+}
+
 fn main() -> Result<()> {
     // stdout carries the MCP stream, so all logging goes to stderr.
     tracing_subscriber::fmt()
@@ -307,6 +321,7 @@ fn main() -> Result<()> {
                     println!("Orion daemon: not running ({})", path.display());
                     println!("sandbox:      {}", orion::sandbox::describe(&policy));
                     println!("root access:  {}", orion::tools::root_access(&policy));
+                    print_attention(&orion::watch::check(&policy, false), " (quick checks, no updates: the daemon checks those)");
                     std::process::exit(1);
                 }
             };
@@ -336,6 +351,9 @@ fn main() -> Result<()> {
             } else if ap.is_object() {
                 println!("approvals:    off: agents get only allowed tools");
             }
+            let found: Vec<orion::watch::Finding> = serde_json::from_value(st["health"]["findings"].clone()).unwrap_or_default();
+            let checked = st["health"]["checked_at"].as_str().map(|t| format!(" (checked {})", &t[t.len().saturating_sub(8)..])).unwrap_or_default();
+            print_attention(&found, &checked);
             if let Some(log) = st["audit_log"].as_str() {
                 println!("audit log:    {log}");
             }
