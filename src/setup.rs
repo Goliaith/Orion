@@ -356,20 +356,38 @@ pub fn edit_config(path: &Path, edits: &[Edit]) -> Result<Option<PathBuf>> {
 }
 
 /// Write `new` to `path`, keeping `old` (if any, and different) as `.bak`.
+/// Both keep the file's permissions: a private profile stays private.
 pub fn replace(path: &Path, old: Option<&str>, new: &str) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::PermissionsExt;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    let mode = std::fs::metadata(path).map(|m| m.permissions().mode() & 0o7777).ok();
+    let write = |p: &Path, text: &str| -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::remove_file(p);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode.unwrap_or(0o644))
+            .open(p)
+            .with_context(|| format!("writing {}", p.display()))?;
+        if let Some(m) = mode {
+            f.set_permissions(std::fs::Permissions::from_mode(m))?;
+        }
+        f.write_all(text.as_bytes()).with_context(|| format!("writing {}", p.display()))
+    };
     let backup = match old {
         Some(old) if old != new => {
             let bak = PathBuf::from(format!("{}.bak", path.display()));
-            std::fs::write(&bak, old).with_context(|| format!("writing {}", bak.display()))?;
+            write(&bak, old)?;
             Some(bak)
         }
         _ => None,
     };
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    std::fs::write(&tmp, new).with_context(|| format!("writing {}", tmp.display()))?;
+    write(&tmp, new)?;
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
     Ok(backup)
 }
@@ -818,9 +836,14 @@ mod tests {
         let p = dir.path().join("orion.toml");
         assert_eq!(edit_config(&p, &[set("chat.provider", "claude")]).unwrap(), None);
         std::fs::write(&p, "[chat]\nprovider = \"local\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         let bak = edit_config(&p, &[set("chat.provider", "claude")]).unwrap().unwrap();
-        assert_eq!(std::fs::read_to_string(bak).unwrap(), "[chat]\nprovider = \"local\"\n");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "[chat]\nprovider = \"local\"\n");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "[chat]\nprovider = \"claude\"\n");
+        // A private file's backup, and the file itself, stay private.
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&bak), mode(&p)), (0o600, 0o600));
     }
 
     #[test]
