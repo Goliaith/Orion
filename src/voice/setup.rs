@@ -290,6 +290,8 @@ pub(crate) fn detector_line(line: &str, stdout: bool) -> Detector {
 fn start_detector(bin: &Path, record: &str) -> Result<(std::process::Child, Receiver<Detector>)> {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(bin);
+    // Ctrl-C reaches only the foreground group, so it must go when we do.
+    super::die_with_parent(&mut cmd);
     if !record.is_empty() {
         cmd.args(["--record", record]);
     }
@@ -463,12 +465,19 @@ fn request(ask: &mut Prompt, policy: &Policy, source: Option<&Path>) -> Result<O
                 Some(v.who(&id.name))
             }
             Heard::Nobody(_) => {
-                println!("That didn't sound like anyone enrolled, so the wake word would have ignored it; `orion voice test` helps find out why.");
-                None
+                println!("That didn't sound like anyone enrolled, so Orion ignores it, as the wake word would. `orion voice test` helps find out why.");
+                return Ok(Some(heard));
             }
-            Heard::TooShort => None,
+            Heard::TooShort => {
+                println!("Too little speech to tell who it was, so Orion ignores it, as the wake word would.");
+                return Ok(Some(heard));
+            }
         },
-        _ => None,
+        Ok(None) => None,
+        Err(e) => {
+            println!("Can't check who is speaking: {e}");
+            return Ok(Some(heard));
+        }
     };
     ask_model(ask, policy, source, wanted, by);
     Ok(Some(heard))
