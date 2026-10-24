@@ -282,6 +282,15 @@ impl App {
             self.entries.push(Entry::Output(format!("/{cmd}")));
             self.busy = true;
             self.send(ToAgent::Command(cmd.to_string()));
+        } else if let Some(typed) = super::cli::typed(trimmed) {
+            self.entries.push(Entry::User(trimmed.to_string()));
+            match typed {
+                super::cli::Typed::Run(cmd) => {
+                    self.busy = true;
+                    self.send(ToAgent::Command(cmd));
+                }
+                super::cli::Typed::Explain(text) => self.entries.push(Entry::Notice(text)),
+            }
         } else {
             self.entries.push(Entry::User(trimmed.to_string()));
             self.voice.hush();
@@ -1241,6 +1250,18 @@ mod tests {
         app.on_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
         let shown = screen_text(&mut app, 110, 30);
         assert!(!shown.contains("Run df.") && shown.contains("reasoning hidden"), "{shown}");
+    }
+
+    #[test]
+    fn orion_commands_typed_in_the_chat_run_or_are_explained() {
+        let (mut app, rx) = app();
+        app.submit("orion status".into());
+        assert!(matches!(rx.try_recv().unwrap(), ToAgent::Command(c) if c == "status"));
+        app.apply(FromAgent::Done);
+        app.submit("orion doctor".into());
+        assert!(rx.try_recv().is_err(), "not sent to the model");
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.contains("terminal")));
+        assert!(!app.busy);
     }
 
     #[test]

@@ -595,6 +595,21 @@ fn post(hub: &Arc<Hub>, path: &str, body: &Value) -> (u16, Value) {
                 hub.broadcast(json!({ "type": "notice", "text": "The shell keeps running; close the window to leave, or stop it with Ctrl-C where it runs." }), true);
                 return (200, ok);
             }
+            // `orion status` typed as a message: run /status, or say where it belongs.
+            match super::cli::typed(&text) {
+                Some(super::cli::Typed::Run(cmd)) => {
+                    hub.set_busy(true);
+                    hub.broadcast(json!({ "type": "user", "text": text }), true);
+                    hub.send_agent(ToAgent::Command(cmd));
+                    return (200, ok);
+                }
+                Some(super::cli::Typed::Explain(note)) => {
+                    hub.broadcast(json!({ "type": "user", "text": text }), true);
+                    hub.broadcast(json!({ "type": "notice", "text": note }), true);
+                    return (200, ok);
+                }
+                None => {}
+            }
             hub.set_busy(true);
             match text.strip_prefix('/') {
                 Some(cmd) => {

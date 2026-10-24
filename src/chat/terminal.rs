@@ -392,6 +392,8 @@ fn run_plain(orion: &Orion, mut session: Session, saver: Saver, resumed: bool) -
             Some((line, pos)) => editor.readline_with_initial(&prompt, (&line[..pos], &line[pos..])),
             None => editor.readline(&prompt),
         };
+        // Spoken lines skip the `orion …` check below: only typed ones are commands.
+        let mut typed = true;
         let line = match line {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => {
@@ -410,6 +412,7 @@ fn run_plain(orion: &Orion, mut session: Session, saver: Saver, resumed: bool) -
                             continue;
                         }
                         println!("{prompt}{joined}");
+                        typed = false;
                         joined
                     }
                     Some(p) => {
@@ -453,6 +456,19 @@ fn run_plain(orion: &Orion, mut session: Session, saver: Saver, resumed: bool) -
                 break;
             }
             continue;
+        }
+        match super::cli::typed(input).filter(|_| typed) {
+            Some(super::cli::Typed::Run(cmd)) => {
+                let mut out = String::new();
+                command(&cmd, orion, &mut session, &term.style, &saver, &mut out);
+                print!("{out}");
+                continue;
+            }
+            Some(super::cli::Typed::Explain(text)) => {
+                println!("  {}", term.style.dim(&text));
+                continue;
+            }
+            None => {}
         }
         println!();
         term.hinted = false;
@@ -749,6 +765,7 @@ pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style
             say!(out, "  /models                 list the models the local server has");
             say!(out, "  /effort <level>         set Claude's effort: low, medium, high, xhigh, max");
             say!(out, "  /tools                  what the AI can do, and what needs your approval");
+            say!(out, "  /status                 the daemon, the sandbox, and what needs attention");
             say!(out, "  /usage                  tokens used this session");
             say!(out, "  /new                    start a new conversation (this one stays saved)");
             say!(out, "  /history                saved conversations, most recent first");
@@ -775,6 +792,7 @@ pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style
                 say!(out, "  {d}  {:<12} {}", tool.name(), s.dim(tool.risk().as_str()));
             }
         }
+        "status" => status(orion, s, out),
         "model" if rest.is_empty() => {
             say!(out, "  {}", s.dim(&routing(session)));
             providers(s, session).iter().for_each(|l| say!(out, "{l}"));
@@ -943,6 +961,33 @@ pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style
         _ => say!(out, "  {}", s.red(&format!("unknown command /{cmd}; try /help"))),
     }
     true
+}
+
+/// `/status`: the short form of `orion status`.
+fn status(orion: &Orion, s: &Style, out: &mut String) {
+    let policy = orion.policy();
+    let findings: Vec<crate::watch::Finding> = match crate::daemon::status(&policy.daemon) {
+        Ok(st) => {
+            let up = st["uptime_secs"].as_u64().unwrap_or(0);
+            say!(out, "  daemon       running, pid {}, up {}h {}m, {} tool calls", st["pid"], up / 3600, up / 60 % 60, st["tool_calls"]);
+            serde_json::from_value(st["health"]["findings"].clone()).unwrap_or_default()
+        }
+        Err(_) => {
+            say!(out, "  daemon       {}", s.dim("not running"));
+            crate::watch::check(policy, false)
+        }
+    };
+    say!(out, "  sandbox      {}", crate::sandbox::describe(policy));
+    say!(out, "  root access  {}", crate::tools::root_access(policy));
+    if findings.is_empty() {
+        say!(out, "  attention    {}", s.green("nothing"));
+    }
+    for f in &findings {
+        let detail = if f.detail.is_empty() { String::new() } else { format!(": {}", f.detail) };
+        let line = format!("{}{detail}", f.title);
+        say!(out, "  attention    {}", if f.severity == "critical" { s.red(&line) } else { s.yellow(&line) });
+        say!(out, "               {}", s.dim(&f.hint));
+    }
 }
 
 /// Arguments for an approval prompt: pretty JSON with long strings shortened.
