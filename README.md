@@ -555,6 +555,8 @@ Things to know:
 ## Other commands
 
 ```sh
+orion setup                                   # connect Claude, Gemini or a local model: checks the key, writes the files
+orion doctor                                  # check the policy, keys, models, voice, sandbox and helper; offers fixes
 orion tools                                   # every tool, its risk, and the policy decision
 orion call system_info                        # call a tool yourself, exactly as the AI would (prompts for "ask" tools)
 orion call fs_list '{"path": "~"}'

@@ -89,7 +89,7 @@ gh auth login
 gh api -H 'Accept: application/vnd.github.raw' repos/Goliaith/Orion/contents/packaging/bootstrap.sh | sh
 ```
 
-It installs the build tools and Rust if they are missing, clones the source into `~/Orion`, builds it, installs the helper (copying the binary to `/usr/local/bin`, creating the `orion` group and adding you to it) and starts the daemon. Run it again, as `sh ~/Orion/packaging/bootstrap.sh`, to update: it pulls `main`, rebuilds and restarts the helper and the daemon. A checkout with local changes is built as it is, without pulling. `--no-helper`, `--no-daemon`, `--branch NAME`, `--dir DIR` and `--skip-deps` change what it does. Then connect a model (section 4).
+It installs the build tools and Rust if they are missing, clones the source into `~/Orion`, builds it, installs the helper (copying the binary to `/usr/local/bin`, creating the `orion` group and adding you to it) and starts the daemon. Run it again, as `sh ~/Orion/packaging/bootstrap.sh`, to update: it pulls `main`, rebuilds and restarts the helper and the daemon. A checkout with local changes is built as it is, without pulling. The first time, it ends by running `orion setup` (section 4) to connect a model. `--no-helper`, `--no-daemon`, `--no-setup`, `--branch NAME`, `--dir DIR` and `--skip-deps` change what it does.
 
 ### From source
 
@@ -184,6 +184,18 @@ Settings worth deciding on now:
 
 You need at least one. With both, Orion routes each message: private and simple work stays on this machine, complex work goes to Claude.
 
+The quick way:
+
+```sh
+orion setup
+```
+
+It asks which model to use (Claude, Gemini, or a server on this machine), takes the key with the typing hidden, drops any spaces or invisible characters the paste brought along, and checks it with a live call. Then it picks a model the key actually offers, asks it to say ok, and writes `~/.config/orion/orion.toml` (changing only the model settings, comments kept, the old file saved as `orion.toml.bak`) and `~/.config/orion/env` (mode 600). Every `orion` command reads that env file at start, so the key works at once, without a new shell. If a running service needs restarting to see it, setup offers to. With Claude, it also offers a local server it finds, so private and simple messages stay on this machine.
+
+`orion setup --provider gemini --model gemini-3.8-flash` skips the questions it can; `--yes` takes every default and a key already in the environment (`GEMINI_API_KEY=… orion setup --provider gemini --yes`).
+
+The sections below are the same steps by hand.
+
 ### Claude
 
 Create an API key at [console.anthropic.com](https://console.anthropic.com) and export it:
@@ -240,8 +252,11 @@ reasoning_effort = "low"              # less thinking, faster answers; "minimal"
 ### Check
 
 ```sh
+orion doctor
 orion chat
 ```
+
+`orion doctor` checks each part in turn and offers to fix what it can (see [Troubleshooting](operating.md#troubleshooting)).
 
 The header names the models it found. With neither, it says what is missing:
 

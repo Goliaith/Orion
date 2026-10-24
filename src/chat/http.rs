@@ -252,12 +252,18 @@ pub fn non_empty_env(var: &str) -> Option<String> {
 /// dropped wherever they are. Errors never include the value.
 pub fn secret_env(var: &str) -> Result<Option<String>> {
     let Some(value) = non_empty_env(var) else { return Ok(None) };
+    clean_secret(&value).map_err(|e| anyhow!("{var} {e}"))
+}
+
+/// A pasted key without the whitespace and invisible characters that came
+/// along with it; `None` if nothing is left. The error never includes it.
+pub fn clean_secret(value: &str) -> Result<Option<String>> {
     let value: String = value.chars().filter(|&c| !invisible(c)).collect();
     if value.is_empty() {
         return Ok(None);
     }
     if !value.bytes().all(|b| b.is_ascii_graphic()) {
-        bail!("{var} has a character that can't be part of a key (an accent, a curly quote?); copy the key again");
+        bail!("has a character that can't be part of a key (an accent, a curly quote?); copy the key again");
     }
     Ok(Some(value))
 }

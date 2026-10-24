@@ -15,7 +15,7 @@ ExecStart=%h/.cargo/bin/orion listen
 Restart=on-failure
 RestartSec=5
 # Put ANTHROPIC_API_KEY or other variables here, one VAR=value per line.
-EnvironmentFile=-%h/.config/orion/env
+EnvironmentFile=-%E/orion/env
 
 [Install]
 WantedBy=default.target
