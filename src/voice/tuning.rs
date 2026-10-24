@@ -129,7 +129,7 @@ fn valid_alias(a: &str) -> bool {
     !a.trim().is_empty() && a.len() <= 32 && a.chars().all(|c| c.is_alphabetic() || c == '\'' || c == ' ' || c == '-')
 }
 
-fn write_atomic(path: &std::path::Path, text: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &std::path::Path, text: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }

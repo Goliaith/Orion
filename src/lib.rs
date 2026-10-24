@@ -20,6 +20,7 @@ pub mod sandbox;
 pub mod seccomp;
 pub mod tool;
 pub mod tools;
+pub mod tuning;
 pub mod voice;
 pub mod watch;
 

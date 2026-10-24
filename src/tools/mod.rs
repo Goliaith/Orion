@@ -140,6 +140,8 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(crate::watch::SystemHealth),
         Box::new(crate::voice::tuning::VoiceCheck),
         Box::new(crate::voice::tuning::VoiceTune),
+        Box::new(crate::tuning::SettingsCheck),
+        Box::new(crate::tuning::SettingsTune),
         Box::new(gpu::GpuInfo),
         Box::new(network::NetInfo),
         Box::new(netconf::NetConnections),

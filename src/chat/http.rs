@@ -58,6 +58,7 @@ impl Http {
         extra: &[(&str, String)],
         notice: &mut dyn FnMut(&str),
     ) -> Result<impl BufRead> {
+        let model = body["model"].as_str().unwrap_or_default().to_string();
         let body = serde_json::to_string(body)?;
         let extra: Vec<(String, String)> = extra.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
         let mut attempt = 0;
@@ -79,6 +80,9 @@ impl Http {
                 Ok(reader) => break reader,
                 Err(retry) => retry,
             };
+            if code == 429 && attempt == 0 {
+                crate::tuning::Signals::rate_limited(&self.base, &model);
+            }
             attempt += 1;
             let wait = asked.unwrap_or(Duration::from_secs(1 << attempt)).min(Duration::from_secs(60));
             notice(&retry_notice(code, wait, attempt));
