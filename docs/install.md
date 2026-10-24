@@ -298,8 +298,15 @@ A wake-word detector, so Orion transcribes only after it hears its name. On a la
 install -Dm 755 contrib/orion-wake ~/.local/bin/orion-wake
 pip install --user vosk                 # or: openwakeword onnxruntime (see the README)
 orion-wake --verbose                    # say "Orion"; Ctrl-C to stop
-printf 'wake_command = "~/.local/bin/orion-wake"\n' >> ~/.config/orion/orion.toml   # under [voice]
 ```
+
+Then set it under `[voice]` in `~/.config/orion/orion.toml`. If the file already has a `[voice]` section, this adds the line there:
+
+```sh
+sed -i '/^\[voice\]/a wake_command = "~/.local/bin/orion-wake"' ~/.config/orion/orion.toml
+```
+
+Without a `[voice]` section, add one at the end: `printf '\n[voice]\nwake_command = "~/.local/bin/orion-wake"\n' >> ~/.config/orion/orion.toml`.
 
 If noise keeps Orion listening after you stop talking, run `orion voice noise` and add the settings it prints under `[voice]`.
 

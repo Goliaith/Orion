@@ -13,7 +13,8 @@ Two engines, both offline and light enough for a laptop processor:
 
   openwakeword uses a trained wake-word model: a ready-made one such as
   hey_jarvis, or your own .onnx (openWakeWord's notebook trains one for any
-  word). It is the more reliable of the two in a noisy room. Set up once:
+  word). It hears the model's phrase, so "Hey Jarvis" with hey_jarvis, not
+  "Orion". It is the more reliable of the two in a noisy room. Set up once:
   pip install --user openwakeword onnxruntime
 
 In ~/.config/orion/orion.toml, under [voice]:

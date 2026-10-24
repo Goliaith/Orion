@@ -293,7 +293,7 @@ How it works: the microphone stays open, and a pause detector (with a noise floo
   # wake_command = "~/.local/bin/orion-wake --engine openwakeword --model ~/models/orion.onnx"
   ```
 
-  The detector and Orion both open the microphone, so use a sound server (PipeWire or PulseAudio, with `parecord`) rather than raw ALSA. Say "Orion", then the request; the chime says it's listening.
+  The detector and Orion both open the microphone, so use a sound server (PipeWire or PulseAudio, with `parecord`) rather than raw ALSA. Say the detector's word, then the request; the chime says it's listening. With Vosk that is "Orion" (or `--word`); with openWakeWord it is the model's phrase, so "Hey Jarvis" for `hey_jarvis`, and "Orion" only with a model trained for it. `voice.wake_phrase` doesn't apply to a detector.
 - **The cost:** transcribing every utterance is light with a GPU or a small Whisper model, but a dedicated detector uses far less power on a CPU.
 - **Your own phrase:** `wake_phrase` sets it, for example `"hey computer"`. A short, distinctive name works best.
 - **No leftover microphone:** the microphone is closed as soon as wake listening stops, and it can't outlive Orion even if Orion is killed.
