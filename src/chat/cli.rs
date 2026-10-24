@@ -37,6 +37,12 @@ pub(super) fn typed(input: &str) -> Option<Typed> {
     if !SUBCOMMANDS.contains(&sub) {
         return None;
     }
+    let terminal = |hint: &str| {
+        Some(Typed::Explain(format!(
+            "`orion {sub}` is a command for a terminal. Here, what you type goes to the AI, \
+             and slash commands (/help lists them) control the chat. {hint}"
+        )))
+    };
     // Flags are fine anywhere; other words only where the command takes them,
     // so “orion status of my disks please” stays a message.
     let mut args = Vec::new();
@@ -48,13 +54,10 @@ pub(super) fn typed(input: &str) -> Option<Typed> {
             args.push(w);
         }
     }
-    let terminal = |hint: &str| {
-        Some(Typed::Explain(format!(
-            "`orion {sub}` is a command for a terminal. Here, what you type goes to the AI, \
-             and slash commands (/help lists them) control the chat. {hint}"
-        )))
-    };
     match (sub, args.as_slice()) {
+        ("call", _) if call_line(&args) => {
+            terminal("Here, ask for it in words and the AI calls the tool for you.")
+        }
         ("help", []) => Some(Typed::Run("help".into())),
         ("status", []) => Some(Typed::Run("status".into())),
         ("tools", []) => Some(Typed::Run("tools".into())),
@@ -75,11 +78,17 @@ pub(super) fn typed(input: &str) -> Option<Typed> {
         ),
         ("setup", []) => terminal("Run `orion setup` in a terminal to connect a model; /model shows the ones in use."),
         ("voice", [_, ..]) => terminal("Voice enrollment runs in a terminal; /voice shows the voice setup here."),
-        ("call", [] | [_] | [_, _]) if args.first().is_none_or(|t| t.contains('_')) => {
-            terminal("Here, ask for it in words and the AI calls the tool for you.")
-        }
         ("serve" | "daemon" | "helper" | "approvals" | "audit", []) => terminal("Run it in a terminal."),
         _ => None,
+    }
+}
+
+/// `orion call` with a tool name (they have an underscore), then JSON if
+/// anything: `orion call fs_list '{"path": "/tmp"}'`, spaces and all.
+fn call_line(args: &[&str]) -> bool {
+    match args {
+        [] => true,
+        [tool, json @ ..] => tool.contains('_') && json.first().is_none_or(|j| j.trim_start_matches(['\'', '"']).starts_with('{')),
     }
 }
 
@@ -106,7 +115,7 @@ mod tests {
     fn the_rest_are_explained() {
         for line in ["orion doctor", "orion doctor --no-fix", "orion setup --provider claude", "orion chat --local",
             "orion memory clear", "orion memory forget 3", "orion voice enroll", "orion audit -n 5",
-            "orion call system_info", "orion conversations show abc"]
+            "orion call system_info", "orion call fs_list '{\"path\": \"/tmp\"}'", "orion conversations show abc"]
         {
             assert!(matches!(typed(line), Some(Typed::Explain(_))), "{line}");
         }

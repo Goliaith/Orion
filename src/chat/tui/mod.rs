@@ -91,6 +91,8 @@ struct App {
     queued: Option<String>,
     /// Who spoke the queued message, if it was spoken by an enrolled person.
     queued_by: Option<Person>,
+    /// Whether the queued message was typed, not spoken.
+    queued_typed: bool,
     status: Status,
     machine: Machine,
     /// Who is answering, for labeling replies.
@@ -125,6 +127,7 @@ impl App {
             stopping: false,
             queued: None,
             queued_by: None,
+            queued_typed: false,
             status: Status::default(),
             machine: Machine::default(),
             who: "claude",
@@ -246,15 +249,24 @@ impl App {
                 self.stopping = false;
                 if let Some(text) = self.queued.take() {
                     let by = self.queued_by.take();
-                    self.submit_spoken(text, by);
+                    if std::mem::take(&mut self.queued_typed) {
+                        self.submit(text);
+                    } else {
+                        self.submit_spoken(text, by);
+                    }
                 }
             }
             FromAgent::Quit => self.quit = true,
         }
     }
 
-    /// Send a message or command; `/keys`, `/exit` and friends are handled here.
+    /// Send a typed message or command; `/keys`, `/exit` and friends are handled here.
     fn submit(&mut self, text: String) {
+        self.send_text(text, true);
+    }
+
+    /// Send a message or command; only a typed one can be an `orion …` command.
+    fn send_text(&mut self, text: String, typed: bool) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return;
@@ -282,7 +294,7 @@ impl App {
             self.entries.push(Entry::Output(format!("/{cmd}")));
             self.busy = true;
             self.send(ToAgent::Command(cmd.to_string()));
-        } else if let Some(typed) = super::cli::typed(trimmed) {
+        } else if let Some(typed) = super::cli::typed(trimmed).filter(|_| typed) {
             self.entries.push(Entry::User(trimmed.to_string()));
             match typed {
                 super::cli::Typed::Run(cmd) => {
@@ -302,7 +314,7 @@ impl App {
 
     /// Send a request, as spoken by an enrolled person if `by` is given.
     fn submit_spoken(&mut self, text: String, by: Option<Person>) {
-        let Some(by) = by else { return self.submit(text) };
+        let Some(by) = by else { return self.send_text(text, false) };
         self.entries.push(Entry::User(format!("{} (by voice): {text}", capitalize(&by.name))));
         self.voice.hush();
         self.busy = true;
@@ -401,6 +413,7 @@ impl App {
                     if !self.input.is_empty() {
                         self.queued = Some(self.input.submit());
                         self.queued_by = None;
+                        self.queued_typed = true;
                         self.flash("queued: sends when the AI is done");
                     }
                 } else {
@@ -526,6 +539,7 @@ impl App {
                     (None, _) if self.busy => {
                         self.queued = Some(text);
                         self.queued_by = by;
+                        self.queued_typed = false;
                         self.flash("queued: sends when the AI is done");
                     }
                     (None, _) => self.submit_spoken(text, by),
@@ -573,7 +587,7 @@ impl App {
                         self.input.insert_str(&text);
                         if self.voice.config.send_after_transcribe && !self.busy {
                             let text = self.input.submit();
-                            self.submit(text);
+                            self.send_text(text, false);
                         }
                     }
                     Err(e) => self.entries.push(Entry::Notice(format!("voice: {e:#}"))),
@@ -1262,6 +1276,9 @@ mod tests {
         assert!(rx.try_recv().is_err(), "not sent to the model");
         assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.contains("terminal")));
         assert!(!app.busy);
+        // Spoken, it's a request for the AI.
+        app.submit_spoken("orion status".into(), None);
+        assert!(matches!(rx.try_recv().unwrap(), ToAgent::Turn(t) if t == "orion status"));
     }
 
     #[test]
