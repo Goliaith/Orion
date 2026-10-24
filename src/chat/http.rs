@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
 use crate::interrupt::{self, ChannelReader};
@@ -188,6 +188,17 @@ pub fn non_empty_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// A credential from the environment, trimmed: a key pasted with a stray
+/// space or line ending still works. Errors never include the value.
+pub fn secret_env(var: &str) -> Result<Option<String>> {
+    let Some(value) = non_empty_env(var) else { return Ok(None) };
+    let value = value.trim();
+    if !value.bytes().all(|b| b.is_ascii_graphic()) {
+        bail!("{var} has a space, line break or non-ASCII character inside the key; copy the key again");
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Iterate the `data:` payloads of a Server-Sent Events stream.
 pub fn sse_data(reader: impl BufRead) -> impl Iterator<Item = Result<String>> {
     reader.lines().filter_map(|line| match line {
@@ -202,6 +213,16 @@ pub fn sse_data(reader: impl BufRead) -> impl Iterator<Item = Result<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_env_trims_and_never_echoes_the_key() {
+        std::env::set_var("ORION_TEST_KEY_OK", " abc.DEF-123\r\n");
+        assert_eq!(secret_env("ORION_TEST_KEY_OK").unwrap().as_deref(), Some("abc.DEF-123"));
+        std::env::set_var("ORION_TEST_KEY_BAD", "abc\u{a0}secret");
+        let err = secret_env("ORION_TEST_KEY_BAD").unwrap_err().to_string();
+        assert!(err.contains("ORION_TEST_KEY_BAD") && !err.contains("secret"), "{err}");
+        assert_eq!(secret_env("ORION_TEST_KEY_UNSET").unwrap(), None);
+    }
 
     #[test]
     fn loopback_skips_the_proxy() {

@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::http::{non_empty_env, sse_data, Http};
+use super::http::{secret_env, sse_data, Http};
 use super::{Backend, Event, Reply, Stop, ToolCall, ToolResult, ToolSpec, Usage};
 
 /// `[chat.local]` in orion.toml.
@@ -44,7 +44,7 @@ pub(super) fn auth_headers(config: &LocalConfig) -> Result<Vec<(String, String)>
     if config.api_key_env.is_empty() {
         return Ok(Vec::new());
     }
-    let key = non_empty_env(&config.api_key_env)
+    let key = secret_env(&config.api_key_env)?
         .with_context(|| format!("{} is not set (chat.local.api_key_env)", config.api_key_env))?;
     Ok(vec![("authorization".into(), format!("Bearer {key}"))])
 }
@@ -171,11 +171,15 @@ impl Backend for LocalBackend {
             };
             // Servers re-parse the arguments in the history, so broken ones go back as {}.
             let arguments = if invalid_input.is_some() { "{}".to_string() } else { c.arguments };
-            wire_calls.push(json!({
+            let mut wire = json!({
                 "id": id,
                 "type": "function",
                 "function": { "name": c.name, "arguments": arguments },
-            }));
+            });
+            if let Some(extra) = c.extra_content {
+                wire["extra_content"] = extra;
+            }
+            wire_calls.push(wire);
             calls.push(ToolCall { id, name: c.name, input, invalid_input });
         }
         let mut message = json!({ "role": "assistant", "content": done.content });
@@ -231,6 +235,9 @@ struct PartialCall {
     id: Option<String>,
     name: String,
     arguments: String,
+    /// Opaque data the server wants back with the call, such as Gemini's
+    /// `{"google": {"thought_signature": …}}`.
+    extra_content: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -299,6 +306,9 @@ fn parse_stream(reader: impl BufRead, on: &mut dyn FnMut(Event)) -> Result<Compl
             let call = &mut done.calls[index];
             if let Some(id) = tc["id"].as_str().filter(|s| !s.is_empty()) {
                 call.id = Some(id.to_string());
+            }
+            if let Some(extra) = tc.get("extra_content").filter(|v| !v.is_null()) {
+                call.extra_content = Some(extra.clone());
             }
             let f = &tc["function"];
             if let Some(name) = f["name"].as_str() {
@@ -434,6 +444,27 @@ mod tests {
         let done = parse_stream(stream.as_bytes(), &mut |_| {}).unwrap();
         assert_eq!(done.calls.len(), 1);
         assert_eq!(serde_json::from_str::<Value>(&done.calls[0].arguments).unwrap(), json!({"sort":"memory"}));
+    }
+
+    #[test]
+    fn keeps_gemini_thought_signatures() {
+        let signature = json!({"google": {"thought_signature": "c2ln"}});
+        let first = chunks(&[
+            delta(json!({"tool_calls":[{"index":0,"id":"g1","type":"function","extra_content":signature,
+                "function":{"name":"system_info","arguments":"{}"}}]})),
+            finish("tool_calls"),
+        ]);
+        let second = chunks(&[delta(json!({"content":"Fine."})), finish("stop")]);
+        let (url, requests) = fake_server(vec![first, second]);
+        let orion = orion();
+        let config = LocalConfig { base_url: format!("{url}/v1"), model: "gemini".into(), ..Default::default() };
+        let backend = LocalBackend::connect(config, "system".into(), &offered_tools(&orion)).unwrap();
+        let mut session = Session::with_backends(&orion, Mode::Local, None, Some(Box::new(backend)));
+        session.turn("how is it?", &mut Recorder::default()).unwrap();
+
+        requests.recv().unwrap();
+        let (_, req2) = requests.recv().unwrap();
+        assert_eq!(req2["messages"][2]["tool_calls"][0]["extra_content"], signature);
     }
 
     #[test]

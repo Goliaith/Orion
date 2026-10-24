@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
 use super::{shell, shell_quote, TempPath, VoiceConfig};
-use crate::chat::http::{non_empty_env, Http};
+use crate::chat::http::{secret_env, Http};
 
 #[derive(Clone)]
 pub enum Transcriber {
@@ -25,7 +25,7 @@ impl Transcriber {
         }
         let mut headers = Vec::new();
         if !config.api_key_env.is_empty() {
-            let key = non_empty_env(&config.api_key_env).with_context(|| format!("{} is not set", config.api_key_env))?;
+            let key = secret_env(&config.api_key_env)?.with_context(|| format!("{} is not set", config.api_key_env))?;
             headers.push(("authorization".to_string(), format!("Bearer {key}")));
         }
         Ok(Self::Http {
