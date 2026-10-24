@@ -12,6 +12,8 @@
 //! - package manager commands, on valid package names, whose dry run (as
 //!   root) removes no protected or essential package;
 //! - `systemctl` actions on units that aren't protected;
+//! - `flatpak install` and `uninstall` of app ids, from the remotes in its
+//!   own `[flatpak] remotes`;
 //! - GPU pins (`50-orion-gpu.conf` drop-ins) holding only GPU variables;
 //! - mounts under the mount roots, always `nosuid,nodev`, of disks the
 //!   system doesn't run from, and unmounts of anything but the system's;

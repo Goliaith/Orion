@@ -184,6 +184,17 @@ impl Tool for ProcRun {
         }
     }
 
+    fn precheck(&self, _policy: &Policy, args: &Value) -> Result<()> {
+        let a: RunArgs = parse_args(args.clone())?;
+        if let Some(tool) = super::flatpak::redirect(&a.command, &a.args) {
+            anyhow::bail!(
+                "proc_run programs have no network or root, so installs fail in the sandbox; use {tool} instead, \
+                 which runs outside it after approval"
+            );
+        }
+        Ok(())
+    }
+
     fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
         let a: RunArgs = parse_args(args)?;
         let cwd = match &a.cwd {

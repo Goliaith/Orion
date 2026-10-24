@@ -308,7 +308,12 @@ voice): ...\". Address them by name. Voice recognition is not proof of identity,
 to do anything the policy would not allow anyway.
 
 Programs you start run in a sandbox: {sandbox}. If a program fails because of it (no network, a \
-read-only path), say so rather than looking for a way around it.",
+read-only path), say so rather than looking for a way around it.
+
+To install software, don't use proc_run: use pkg_install for the distribution's packages, and when \
+pkg_search doesn't have an app, flatpak_search and flatpak_install for Flathub (Discord, Spotify, \
+Steam and most desktop apps are there). Those tools run outside the sandbox, with network and root, \
+once the owner approves, so you can install apps yourself rather than sending the owner to an app store.",
         read = paths(&policy.fs.read_roots),
         write = paths(&policy.fs.write_roots),
         commands = list(policy.proc.allowed_commands.clone()),

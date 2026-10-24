@@ -9,6 +9,7 @@ mod disks;
 mod display;
 pub(crate) mod exec;
 mod fileops;
+mod flatpak;
 mod fs;
 pub mod gpu;
 mod journal;
@@ -121,6 +122,7 @@ pub fn helper_check(policy: &Policy, peer: &Peer, program: &str, args: &[String]
     let drop_in = args.last().is_some_and(|p| p.starts_with("/etc/systemd/system/"));
     match program {
         "env" | "dnf" | "zypper" | "pacman" => plain(updates::helper_check(policy, program, args)),
+        "flatpak" => plain(flatpak::helper_check(policy, args)),
         "snapper" => plain(changes::helper_check(policy, args)),
         "timedatectl" | "localectl" => plain(clock::helper_check(program, args)),
         "smartctl" => plain(smart::helper_check(args)),
@@ -174,6 +176,9 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(packages::PkgRemove),
         Box::new(updates::UpdateCheck),
         Box::new(updates::UpdateApply),
+        Box::new(flatpak::FlatpakSearch),
+        Box::new(flatpak::FlatpakInstall),
+        Box::new(flatpak::FlatpakRemove),
         Box::new(changes::PkgHistory),
         Box::new(changes::PkgRollback),
         Box::new(audio::AudioStatus),
