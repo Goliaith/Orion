@@ -36,6 +36,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Let bubblewrap make its namespaces
+        # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor,
+        # which bwrap needs (a desktop install has a profile for it).
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: A systemd user manager, for the sandbox's scopes
         run: |
           sudo loginctl enable-linger "$USER"
