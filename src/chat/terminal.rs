@@ -757,6 +757,7 @@ pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style
             say!(out, "  /exit                   leave (Ctrl-D works too)");
             say!(out, "  /voice [speak on|off|test]  voice setup; Ctrl-T talks");
             say!(out, "  /memory [forget <id>|clear]  what the AI remembers about whoever this conversation is with");
+            say!(out, "  /journal [topic|search <words>]  the AI's journal for whoever this conversation is with");
             say!(out, "  /keys                   the hotkeys");
         }
         "keys" => {
@@ -865,6 +866,43 @@ pub(super) fn command(cmd: &str, orion: &Orion, session: &mut Session, s: &Style
                         say!(out, "  {:>3}. {}{private}", n.id, n.text);
                     }
                     say!(out, "  {}", s.dim("/memory forget <id> removes one"));
+                }
+            }
+        }
+        "journal" => {
+            let name = crate::voice::capitalize(session.person());
+            let Some(j) = session.journal() else {
+                say!(out, "  {}", s.dim("the journal is off (chat.journal.enabled)"));
+                return true;
+            };
+            let (topic, query) = match arg.split_once(char::is_whitespace) {
+                Some(("search", words)) => (None, words.trim()),
+                _ if arg.is_empty() => {
+                    let topics = j.topics();
+                    if topics.is_empty() {
+                        say!(out, "  {}", s.dim(&format!("nothing in the journal for {name} yet")));
+                    } else {
+                        say!(out, "  {}", s.bold(&format!("Orion's journal for {name}")));
+                        for t in &topics {
+                            say!(out, "  {:<30} {} entries", t.name, t.entries);
+                        }
+                        for l in j.links().iter().take(5) {
+                            say!(out, "  {}", s.dim(&format!("{} ↔ {} ({:.2})", l.from, l.to, l.strength)));
+                        }
+                        say!(out, "  {}", s.dim("/journal <topic> shows one; /journal search <words> searches them all"));
+                    }
+                    return true;
+                }
+                _ => (Some(arg.trim()), ""),
+            };
+            match j.search(topic, query, 10, true) {
+                Err(e) => say!(out, "  {}", s.red(&format!("{e:#}"))),
+                Ok(hits) if hits.is_empty() => say!(out, "  {}", s.dim("nothing found")),
+                Ok(hits) => {
+                    for h in hits {
+                        let private = if h.private { s.dim(" (private: this machine only)") } else { String::new() };
+                        say!(out, "  {} {}{private}", s.dim(&format!("[{}]", h.topic)), h.text);
+                    }
                 }
             }
         }

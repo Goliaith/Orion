@@ -12,6 +12,7 @@ use anyhow::{bail, Result};
 use super::classifier::LocalClassifier;
 use super::router::{self, Classifier, Route, RouteContext, Router, Strategy};
 use super::{connect, Backend, Event, Mode, Provider, Stop, ToolCall, ToolResult, Ui, UiApprover};
+use super::journal::{self, Journal};
 use super::memory::{self, Memory};
 use super::store::{self, Conversation, SavedBackend, Turn};
 use crate::{interrupt, Orion};
@@ -95,6 +96,12 @@ pub struct Session<'a> {
     /// What is remembered about them (when `chat.memory` is on).
     memory: Option<Memory>,
     memory_dir: Option<PathBuf>,
+    /// Their journal (when `chat.journal.enabled` is on).
+    journal: Option<Journal>,
+    journal_home: Option<PathBuf>,
+    /// Whether the local backend runs on this machine, so that what is
+    /// private may go to it. A hosted API behind it (Gemini) does not.
+    local_on_machine: bool,
     /// The memory part of the system prompt, fixed for a conversation so a
     /// note saved mid-way doesn't upset prompt caching: (Claude, local).
     context: (String, String),
@@ -131,7 +138,8 @@ impl<'a> Session<'a> {
 
     fn build_classifier(&self) -> Option<Box<dyn Classifier>> {
         let chat = &self.orion.policy().chat;
-        if chat.router.strategy != Strategy::Model {
+        // It sees every message that isn't private, so it must be here.
+        if chat.router.strategy != Strategy::Model || !self.local_on_machine {
             return None;
         }
         let local = self.local.backend.as_ref()?;
@@ -177,6 +185,9 @@ impl<'a> Session<'a> {
             person: owner_name(),
             memory: None,
             memory_dir: chat.memory.then(memory::default_dir).flatten(),
+            journal: None,
+            journal_home: chat.journal.enabled.then(|| chat.journal.home()).flatten(),
+            local_on_machine: chat.local.on_machine(),
             context: Default::default(),
         }
     }
@@ -201,6 +212,23 @@ impl<'a> Session<'a> {
         self.refresh_context();
     }
 
+    pub fn journal(&self) -> Option<&Journal> {
+        self.journal.as_ref()
+    }
+
+    /// Keep the journal somewhere else (tests), or nowhere (`None`).
+    pub fn set_journal_home(&mut self, home: Option<PathBuf>) {
+        self.journal_home = home;
+        self.journal = None;
+        self.refresh_context();
+    }
+
+    /// Whether `p` may be given what is private: only a model on this
+    /// machine.
+    fn keeps_private(&self, p: Provider) -> bool {
+        p == Provider::Local && self.local_on_machine
+    }
+
     /// Make this `person`'s conversation: their memory, in the prompt.
     pub fn set_person(&mut self, person: &str) {
         self.person = person.to_string();
@@ -219,11 +247,21 @@ impl<'a> Session<'a> {
                 }
             });
         }
+        self.journal = self.journal_home.as_ref().map(|h| Journal::open(h, &self.person));
         let name = crate::voice::capitalize(&self.person);
-        self.context = match &self.memory {
-            Some(m) => (m.prompt(&name, false), m.prompt(&name, true)),
+        let (mut for_claude, mut for_local) = match &self.memory {
+            Some(m) => (m.prompt(&name, false), m.prompt(&name, self.local_on_machine)),
             None => Default::default(),
         };
+        if let Some(j) = &self.journal {
+            for (text, private) in [(&mut for_claude, false), (&mut for_local, self.local_on_machine)] {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&j.prompt(&name, private));
+            }
+        }
+        self.context = (for_claude, for_local);
         for p in [Provider::Claude, Provider::Local] {
             let system = self.system_for(p);
             if let Some(b) = self.slot_mut(p).backend.as_mut() {
@@ -403,7 +441,7 @@ impl<'a> Session<'a> {
     pub fn explain_route(&self, text: &str) -> String {
         match self.decide(text) {
             Route::To { provider, reason } => format!("{} ({reason})", router::name(provider)),
-            Route::PrivateButNoLocal { reason } => format!("would ask you first ({reason}; no local model)"),
+            Route::PrivateButNoLocal { reason } => format!("would ask you first ({reason}; no model on this machine)"),
         }
     }
 
@@ -414,7 +452,13 @@ impl<'a> Session<'a> {
             claude_available: self.claude.backend.is_some(),
             local_available: self.local.backend.is_some(),
         };
-        self.router.route(text, &ctx, self.classifier.as_deref())
+        match self.router.route(text, &ctx, self.classifier.as_deref()) {
+            // The local backend is a hosted API: nothing here can keep it.
+            Route::To { provider: Provider::Local, reason } if !self.local_on_machine && reason.starts_with("private") => {
+                Route::PrivateButNoLocal { reason }
+            }
+            route => route,
+        }
     }
 
     /// Send one user message and run tools until the model is done. A
@@ -435,11 +479,16 @@ impl<'a> Session<'a> {
             (None, Mode::Auto) => match self.decide(text) {
                 Route::To { provider, reason } => (provider, reason, true),
                 Route::PrivateButNoLocal { reason } => {
-                    if !ui.confirm(&format!("This looks private ({reason}) and no local model is available. Send it to Claude?")) {
+                    // The configured local model, even if it's hosted, else Claude.
+                    let (to, name) = match self.local.backend.as_ref() {
+                        Some(b) => (Provider::Local, b.model()),
+                        None => (Provider::Claude, "Claude".to_string()),
+                    };
+                    if !ui.confirm(&format!("This looks private ({reason}) and no model on this machine is available. Send it to {name}?")) {
                         ui.notice("Not sent.");
                         return Ok(());
                     }
-                    (Provider::Claude, "you confirmed".to_string(), false)
+                    (to, "you confirmed".to_string(), false)
                 }
             },
         };
@@ -454,9 +503,9 @@ impl<'a> Session<'a> {
         if self.mode == Mode::Auto || forced.is_some() {
             ui.route(router::name(provider), &self.describe(provider), &reason);
         }
-        // Private only while it stays on this machine; sending it to Claude
+        // Private only while it stays on this machine; sending it elsewhere
         // anyway (on purpose) makes it ordinary history.
-        let private = private_reason.is_some() && provider == Provider::Local;
+        let private = private_reason.is_some() && self.keeps_private(provider);
 
         let (record, result) = self.run_on(provider, text, private, ui);
         let started = !record.reply.is_empty() || !record.tools.is_empty();
@@ -470,12 +519,12 @@ impl<'a> Session<'a> {
         // In auto mode, a model that fails before saying anything hands the
         // message to the other one, but private messages never go to Claude.
         let other = router::other(provider);
-        if !routed || started || self.slot(other).backend.is_none() || (private_reason.is_some() && other == Provider::Claude) {
+        if !routed || started || self.slot(other).backend.is_none() || (private_reason.is_some() && !self.keeps_private(other)) {
             return Err(e);
         }
         ui.notice(&format!("{} failed ({e:#}); trying {}.", capitalized(router::name(provider)), router::name(other)));
         ui.route(router::name(other), &self.describe(other), "fallback");
-        let (record, result) = self.run_on(other, text, private_reason.is_some(), ui);
+        let (record, result) = self.run_on(other, text, private_reason.is_some() && self.keeps_private(other), ui);
         self.finish(record);
         match result {
             Err(e) if interrupt::is_interrupt(&e) => {
@@ -499,6 +548,7 @@ impl<'a> Session<'a> {
 
     /// Tell `provider`'s backend about turns the other model handled.
     fn sync(&mut self, provider: Provider) {
+        let keeps_private = self.keeps_private(provider);
         let Self { log, claude, local, .. } = self;
         let slot = match provider {
             Provider::Claude => claude,
@@ -506,7 +556,7 @@ impl<'a> Session<'a> {
         };
         let Some(backend) = slot.backend.as_mut() else { return };
         for rec in &log[slot.synced..] {
-            if rec.provider != provider && !(rec.private && provider == Provider::Claude) {
+            if rec.provider != provider && !(rec.private && !keeps_private) {
                 backend.push_user(&rec.user);
                 backend.push_assistant_text(&rec.render());
             }
@@ -518,18 +568,36 @@ impl<'a> Session<'a> {
         self.sync(provider);
         let mut record =
             TurnRecord { user: text.to_string(), provider, private, reply: String::new(), tools: Vec::new() };
-        let result = self.tool_loop(provider, &mut record, ui);
+        // What the journal holds on this, added to what the model is sent
+        // (the transcript keeps the message as written).
+        let sent = match self.recall(provider, text) {
+            Some(note) => {
+                ui.thinking(&format!("recalled from the journal: {}", note.lines().count() - 1));
+                format!("{text}\n\n{note}")
+            }
+            None => text.to_string(),
+        };
+        let result = self.tool_loop(provider, &sent, &mut record, ui);
         (record, result)
     }
 
-    fn tool_loop(&mut self, provider: Provider, record: &mut TurnRecord, ui: &mut dyn Ui) -> Result<()> {
-        let Self { orion, router, claude, local, max_tool_rounds, memory, .. } = self;
+    /// The journal entries that match `text`, as a note for `provider`.
+    fn recall(&self, provider: Provider, text: &str) -> Option<String> {
+        let config = &self.orion.policy().chat.journal;
+        let journal = self.journal.as_ref().filter(|_| config.auto_recall)?;
+        let hits = journal.recall(text, config.recall_limit, self.keeps_private(provider));
+        (!hits.is_empty()).then(|| journal::recall_note(&hits))
+    }
+
+    fn tool_loop(&mut self, provider: Provider, sent: &str, record: &mut TurnRecord, ui: &mut dyn Ui) -> Result<()> {
+        let keeps_private = self.keeps_private(provider);
+        let Self { orion, router, claude, local, max_tool_rounds, memory, journal, .. } = self;
         let backend = match provider {
             Provider::Claude => claude.backend.as_mut(),
             Provider::Local => local.backend.as_mut(),
         }
         .expect("checked by turn");
-        backend.push_user(&record.user);
+        backend.push_user(sent);
         for _ in 0..*max_tool_rounds {
             let reply = backend.respond(&mut |ev| match ev {
                 Event::Text(t) => {
@@ -574,7 +642,8 @@ impl<'a> Session<'a> {
                     } else if reply.stop == Stop::Truncated {
                         ("Not run: the tool input was cut off by the output limit.".to_string(), true)
                     } else {
-                        run_tool(orion, router, provider, call, memory.as_mut(), ui)
+                        let mine = Mine { memory: memory.as_mut(), journal: journal.as_ref(), keeps_private };
+                        run_tool(orion, router, call, mine, ui)
                     };
                     let input = orion.tools().find(|(t, _)| t.name() == call.name).map_or_else(|| call.input.clone(), |(t, _)| t.redact(&call.input));
                     record.tools.push(summarize(&call.name, &input, &content, is_error));
@@ -589,24 +658,30 @@ impl<'a> Session<'a> {
     }
 }
 
-fn run_tool(
-    orion: &Orion,
-    router: &Router,
-    provider: Provider,
-    call: &ToolCall,
-    memory: Option<&mut Memory>,
-    ui: &mut dyn Ui,
-) -> (String, bool) {
+/// What a tool call may touch of Orion's own: the person's memory and
+/// journal, and whether the model may see what is private.
+struct Mine<'m> {
+    memory: Option<&'m mut Memory>,
+    journal: Option<&'m Journal>,
+    keeps_private: bool,
+}
+
+fn run_tool(orion: &Orion, router: &Router, call: &ToolCall, mine: Mine, ui: &mut dyn Ui) -> (String, bool) {
+    let Mine { memory, journal, keeps_private } = mine;
     let shown = orion.tools().find(|(t, _)| t.name() == call.name).map_or_else(|| call.input.clone(), |(t, _)| t.redact(&call.input));
     ui.tool_start(&call.name, &shown);
     let start = Instant::now();
-    if memory::is_memory_tool(&call.name) {
+    if memory::is_memory_tool(&call.name) || journal::is_journal_tool(&call.name) {
         // Orion's own memory of the person, not the machine: no policy, but
         // it goes in the audit log like everything else.
-        let result = match memory {
-            Some(m) => memory::call(m, &call.name, &call.input, |t| router.private_reason(t)).map_err(|e| format!("{e:#}")),
-            None => Err("memory is off (chat.memory)".to_string()),
-        };
+        let private_reason = |t: &str| router.private_reason(t);
+        let result = match (memory, journal) {
+            (Some(m), _) if memory::is_memory_tool(&call.name) => memory::call(m, &call.name, &call.input, private_reason),
+            (_, Some(j)) if journal::is_journal_tool(&call.name) => journal::call(j, &call.name, &call.input, private_reason, keeps_private),
+            _ if memory::is_memory_tool(&call.name) => Err(anyhow::anyhow!("memory is off (chat.memory)")),
+            _ => Err(anyhow::anyhow!("the journal is off (chat.journal.enabled)")),
+        }
+        .map_err(|e| format!("{e:#}"));
         orion.record(&call.name, &call.input, ui.caller().as_deref(), result.as_ref().err().map(String::as_str));
         ui.tool_end(&call.name, &result, start.elapsed());
         return match result {
@@ -619,9 +694,9 @@ fn run_tool(
     let refused = risk.and_then(|r| ui.refuses(&call.name, r));
     let result = match (router.private_path_in(&call.input), refused) {
         (_, Some(reason)) => Err(orion.refuse(&call.name, &shown, &reason, caller.as_deref()).to_string()),
-        // Private files never reach Claude, whatever the policy allows.
-        (Some(path), None) if provider == Provider::Claude => {
-            Err(format!("{path} is private: only the local model may access it (chat.router.private_paths)"))
+        // Private files never leave this machine, whatever the policy allows.
+        (Some(path), None) if !keeps_private => {
+            Err(format!("{path} is private: only a model on this machine may access it (chat.router.private_paths)"))
         }
         _ => {
             let approver = UiApprover(RefCell::new(&mut *ui));
@@ -1045,4 +1120,78 @@ mod tests {
         assert!(!results[1].contains("is private"), "{results:?}");
     }
 
+
+    #[test]
+    fn keeps_a_journal_and_recalls_it_when_it_matters() {
+        let log = Log::default();
+        let orion = orion();
+        let home = tempfile::tempdir().unwrap();
+        let write = ToolCall {
+            id: "w".into(),
+            name: "journal_write".into(),
+            input: json!({ "topic": "backups", "text": "Backups run nightly with restic to the NAS at /mnt/nas/restic." }),
+            invalid_input: None,
+        };
+        let local = Scripted::new("local", &log, vec![Ok(("Writing it down.".into(), vec![write])), say("done"), say("They ran."), say("Hi!")]);
+        let mut s = Session::with_backends(&orion, Mode::Local, None, Some(local));
+        s.set_journal_home(Some(home.path().into()));
+        s.set_person("ana");
+        assert!(s.system_for(Provider::Local).contains("Your journal for Ana is empty."));
+        s.turn("note how the backups work", &mut Recorder::default()).unwrap();
+        assert_eq!(entries(&log, "local result"), ["local result: ok"]);
+        assert!(home.path().join(".grok/state/semantic/ana_backups/memories.jsonl").is_file());
+
+        let mut ui = Recorder::default();
+        s.turn("did the restic backups run last night?", &mut ui).unwrap();
+        s.turn("hello there", &mut ui).unwrap();
+        let sent = entries(&log, "local user");
+        assert!(sent[1].contains("[From Orion's journal, matching this message:\n- (backups, today) Backups run nightly"), "{sent:?}");
+        assert_eq!(sent[2], "local user: hello there", "nothing to recall");
+        assert!(ui.out.contains("[recalled from the journal: 1]"), "{}", ui.out);
+        // The transcript keeps the message as it was written.
+        assert_eq!(s.turns()[1].user, "did the restic backups run last night?");
+        // The next conversation's prompt names the topic.
+        s.clear();
+        assert!(s.system_for(Provider::Claude).contains("topics, most recent first: backups (1)"));
+    }
+
+    #[test]
+    fn a_hosted_local_backend_gets_nothing_private() {
+        let log = Log::default();
+        let orion = Orion::new(
+            crate::Policy::from_toml(
+                "[chat.local]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta/openai\"\n[audit]\nenabled = false\n",
+            )
+            .unwrap(),
+        );
+        let (memory_dir, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut notes = Memory::load(memory_dir.path(), "ana").unwrap();
+        notes.add("Has a medical appointment on Tuesdays", true).unwrap();
+        notes.add("Prefers metric units", false).unwrap();
+        let journal = Journal::open(home.path(), "ana");
+        journal.write("health", "The physiotherapy appointment for the knee moved to Thursdays.", true).unwrap();
+
+        let read = ToolCall { id: "r".into(), name: "fs_read".into(), input: json!({ "path": "~/.ssh/id_ed25519" }), invalid_input: None };
+        let local = Scripted::new("local", &log, vec![Ok((String::new(), vec![read])), say("Blocked.")]);
+        let claude = Scripted::new("claude", &log, vec![]);
+        let mut s = Session::with_backends(&orion, Mode::Auto, Some(claude), Some(local));
+        s.set_memory_dir(Some(memory_dir.path().into()));
+        s.set_journal_home(Some(home.path().into()));
+        s.set_person("ana");
+        let prompt = s.system_for(Provider::Local);
+        assert!(prompt.contains("Prefers metric units") && !prompt.contains("medical"), "{prompt}");
+        assert!(!prompt.contains("health"), "not even the topic: {prompt}");
+
+        // A private message would go to the local model, but it's hosted: ask.
+        let mut ui = Recorder::default();
+        s.turn("my bank password is hunter2", &mut ui).unwrap();
+        assert!(ui.out.contains("!Not sent."), "{}", ui.out);
+        assert!(s.explain_route("my bank password").contains("no model on this machine"));
+
+        s.turn("@local when is the knee physiotherapy?", &mut ui).unwrap();
+        let sent = entries(&log, "local user");
+        assert!(!sent[0].contains("Thursdays"), "private entries stay here: {sent:?}");
+        let results = entries(&log, "local result");
+        assert!(results[0].starts_with("local result: ~/.ssh is private"), "{results:?}");
+    }
 }

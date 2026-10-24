@@ -30,6 +30,10 @@ pub struct LocalConfig {
     /// only), `minimal`, `low`, `medium` or `high`; OpenAI-style servers
     /// `low`, `medium` or `high`. Unset leaves it to the server.
     pub reasoning_effort: Option<String>,
+    /// Whether the server runs on this machine (or this network), so it may
+    /// see private messages, notes and files. Unset: decided from
+    /// `base_url` (loopback and private-network addresses are).
+    pub on_machine: Option<bool>,
 }
 
 impl Default for LocalConfig {
@@ -41,7 +45,43 @@ impl Default for LocalConfig {
             temperature: None,
             api_key_env: String::new(),
             reasoning_effort: None,
+            on_machine: None,
         }
+    }
+}
+
+impl LocalConfig {
+    /// Whether what is private may be sent to this server. A hosted API
+    /// behind the local backend (Gemini) is not on this machine.
+    /// Through a proxy, it isn't: the proxy sees everything.
+    pub fn on_machine(&self) -> bool {
+        self.on_machine.unwrap_or_else(|| is_on_machine(&self.base_url) && !super::http::proxied(&self.base_url))
+    }
+}
+
+/// Whether `url`'s host is this machine or a private network: localhost,
+/// loopback, RFC 1918, link-local or unique-local addresses. Names other
+/// than localhost are taken to be elsewhere.
+pub fn is_on_machine(url: &str) -> bool {
+    use std::net::IpAddr;
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit('@').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    }
+    .to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified(),
+        Ok(IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            ip.is_loopback() || ip.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
     }
 }
 
@@ -525,5 +565,26 @@ mod tests {
         assert_eq!(msgs[3]["tool_call_id"], "c1");
         assert_eq!(msgs[4]["tool_call_id"], "c2");
         assert!(msgs[4]["content"].as_str().unwrap().contains("INVALID_JSON"));
+    }
+
+    #[test]
+    fn knows_which_servers_are_on_this_machine() {
+        for url in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:8080/v1",
+            "http://[::1]:8000/v1",
+            "http://192.168.1.20:11434/v1",
+            "http://10.0.0.5/v1",
+            "https://user:pw@172.20.1.1:1234/v1",
+        ] {
+            assert!(is_on_machine(url), "{url}");
+        }
+        for url in ["https://generativelanguage.googleapis.com/v1beta/openai", "https://api.openai.com/v1", "http://8.8.8.8/v1", "http://ollama.example.com:11434/v1"] {
+            assert!(!is_on_machine(url), "{url}");
+        }
+        let gemini = LocalConfig { base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(), ..Default::default() };
+        assert!(!gemini.on_machine());
+        assert!(LocalConfig { on_machine: Some(true), ..gemini }.on_machine());
+        assert!(LocalConfig::default().on_machine());
     }
 }
