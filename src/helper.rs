@@ -16,7 +16,10 @@
 //! - mounts under the mount roots, always `nosuid,nodev`, of disks the
 //!   system doesn't run from, and unmounts of anything but the system's;
 //! - NetworkManager's Wi-Fi and connection commands, and firewall rules
-//!   that keep SSH open.
+//!   that keep SSH open;
+//! - snapper snapshots on the helper's own configuration;
+//! - the time zone, network time, locale and keyboard layout, with values
+//!   the machine has.
 //!
 //! Each command runs with a clean environment and a fixed `PATH`, is
 //! logged with who asked, and is stopped if the asker hangs up.

@@ -1,7 +1,12 @@
 //! Built-in tools. Each module groups one area of the machine.
 
+mod apps;
+mod audio;
+mod bluetooth;
 mod changes;
+mod clock;
 mod disks;
+mod display;
 pub(crate) mod exec;
 mod fileops;
 mod fs;
@@ -11,8 +16,10 @@ mod models;
 mod netconf;
 mod network;
 mod packages;
+mod power;
 mod process;
 mod services;
+pub(crate) mod session;
 mod system;
 mod timers;
 mod updates;
@@ -72,6 +79,7 @@ pub fn helper_check(policy: &Policy, peer: &Peer, program: &str, args: &[String]
     match program {
         "env" | "dnf" | "zypper" | "pacman" => plain(updates::helper_check(policy, program, args)),
         "snapper" => plain(changes::helper_check(policy, args)),
+        "timedatectl" | "localectl" => plain(clock::helper_check(program, args)),
         "systemctl" | "tee" | "rm" => plain(services::helper_check(policy, program, args, stdin)),
         "mkdir" if drop_in => plain(services::helper_check(policy, program, args, stdin)),
         "mkdir" | "mount" | "umount" | "eject" | "fuser" => plain(disks::helper_check(policy, peer.uid, peer.gid, program, args)),
@@ -124,6 +132,19 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(updates::UpdateApply),
         Box::new(changes::PkgHistory),
         Box::new(changes::PkgRollback),
+        Box::new(audio::AudioStatus),
+        Box::new(audio::AudioSet),
+        Box::new(bluetooth::BtStatus),
+        Box::new(bluetooth::BtDevice),
+        Box::new(power::PowerStatus),
+        Box::new(power::PowerSet),
+        Box::new(power::PowerAction),
+        Box::new(display::DisplayStatus),
+        Box::new(display::DisplaySet),
+        Box::new(apps::AppList),
+        Box::new(apps::AppOpen),
+        Box::new(clock::ClockStatus),
+        Box::new(clock::ClockSet),
         Box::new(models::ModelStatus),
         Box::new(models::ModelLoad),
         Box::new(models::ModelUnload),

@@ -1,6 +1,7 @@
 # Orion's checks: lint, tests, the oldest supported Rust, the package and
 # update tools (with rollbacks and unattended updates) against Fedora,
-# openSUSE, Arch and Debian in Docker, and the privileged helper as root.
+# openSUSE, Arch and Debian in Docker, the desktop tools on a headless
+# desktop, and the privileged helper as root.
 # release.yml builds and tests the release packages.
 name: CI
 
@@ -58,6 +59,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
       - run: tests/distros/run.sh
+
+  desktop:
+    name: Desktop tools on a headless desktop
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: PipeWire, sway and Xvfb
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends pipewire pipewire-pulse wireplumber pulseaudio-utils \
+            dbus sway wlr-randr xvfb x11-xserver-utils
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: tests/desktop/run.sh
 
   helper:
     name: Privileged helper, end to end

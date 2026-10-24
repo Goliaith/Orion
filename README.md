@@ -72,13 +72,26 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `update_apply` | execute | ask     | Install updates: all, security fixes only, or named packages |
 | `pkg_history`  | read    | allow   | Every package change Orion made: versions before and after, snapshots, rollbacks |
 | `pkg_rollback` | execute | ask     | Put a change back, through its snapper snapshots or by reinstalling the old versions |
+| `audio_status` | read    | allow   | Sound outputs and inputs (speakers, headphones, HDMI, Bluetooth, microphones): volume, mute, the default, and what plays |
+| `audio_set`    | write   | allow\* | Set or nudge a volume, mute, or pick the default output or microphone |
+| `display_status` | read  | allow   | Monitors (resolution, refresh rate, scale, position, on or off, modes) and the panel's brightness |
+| `display_set`  | write   | ask\*   | Brightness (pre-approved), or a monitor's mode, scale, position, on or off; never the last screen off |
+| `power_status` | read    | allow   | Batteries (charge, time left, health), the charger, the power profile, whether it can suspend |
+| `power_set`    | write   | ask     | Switch the power profile: performance, balanced, power-saver |
+| `power_action` | write   | ask\*   | Lock (pre-approved), suspend, hibernate, reboot or power off, through logind |
+| `bt_status`    | read    | allow   | The Bluetooth adapter and its devices: paired, connected, battery; scans for new ones |
+| `bt_device`    | write   | ask     | Turn Bluetooth on or off; pair, connect, disconnect or forget a device |
+| `app_list`     | read    | allow   | The desktop apps installed (Flatpak and Snap included), and what they open |
+| `app_open`     | execute | ask     | Start an app, optionally on files or links, or open them in their default apps |
+| `clock_status` | read    | allow   | Local time, time zone, network time, the system locale and keyboard layout |
+| `clock_set`    | write   | ask     | Set the time zone, network time, the system locale or keyboard layout |
 | `model_status` | read    | allow   | Local inference servers, their models (available and loaded), and the VRAM budget |
 | `model_load`   | write   | ask     | Load a model on Ollama, within the VRAM budget (optionally unloading others) |
 | `model_unload` | write   | ask     | Unload a model, freeing its VRAM |
 | `model_pull`   | write   | ask     | Download a model onto Ollama |
 | `gpu_assign`   | write   | ask     | Pin an inference server (a systemd service) to chosen GPUs |
 
-Out of the box the AI can look at the machine freely. Changing it (writing files, running programs, managing services, packages and models) needs your approval each time. With no human present (`orion serve`), "ask" means no.
+Out of the box the AI can look at the machine freely. Changing it (writing files, running programs, managing services, packages and models) needs your approval each time. With no human present (`orion serve`), "ask" means no. \* Turning the volume up or down, the panel's brightness and locking the screen are pre-approved by `[desktop] approved`, because they are harmless and easily undone; the rest of those tools ask.
 
 ## Install
 
@@ -546,6 +559,20 @@ Orion notices problems before anyone asks. The daemon checks every 15 minutes:
 - **The interfaces show them:** the line-by-line chat under its header, the full-screen chat's panel and the shell's machine panel.
 - **Settings** are under `[watch]`: the interval, the thresholds, notifications, and `ignore` for findings you don't care about, by key (`"service:backup.service"`, `"disk:/mnt/archive"`, `"reboot"`).
 
+### The desktop
+
+The desktop tools act on the session of the person logged in: its sound server, compositor and session bus. The daemon runs as a systemd user service, which doesn't inherit those, so Orion finds them in the user manager's environment (desktops put them there) or by their sockets in the runtime directory.
+
+- **Sound** goes through `pactl`, which PipeWire and PulseAudio both speak (version 16 or newer, for its JSON). Devices are named by name or by part of their description ("HDMI", "headphones"); volume goes up to 150%. The monitors of outputs, which look like microphones, are left out.
+- **Screens:** monitors are read and set with `wlr-randr` on wlroots compositors (sway, Hyprland, river, cage), `kscreen-doctor` on KDE Plasma and `xrandr` on X11. GNOME on Wayland keeps them to its own settings, so there only brightness works. A mode must be one the monitor lists, and the last screen that is on is never turned off. Brightness is the built-in panel's backlight, set through `brightnessctl` or logind (never below 5%); external monitors keep their own buttons.
+- **Power:** batteries come straight from `/sys/class/power_supply`: charge, time left from the current draw, and health (what the battery holds now against what it held new). Profiles need power-profiles-daemon or tuned-ppd. Lock, suspend, reboot and power-off go through logind, so they are allowed exactly when the person at the machine could do them.
+- **Bluetooth** goes through `bluetoothctl`. Pairing uses a no-input agent, which suits headphones, speakers and mice; a keyboard that shows a code to type isn't supported yet.
+- **Apps** come from their desktop entries, as menus list them, your own before the system's (Flatpak and Snap exports included). An app starts from its own `Exec=` line, split into arguments as the desktop entry spec says, with each file or link one argument: no shell sees them. It runs in a systemd unit of its own (`app-orion-….service`), so it outlives Orion and logs to the journal. Files must be inside the readable roots, links must be http, https or mailto, and executable files are never opened, so opening can't run something the AI wrote.
+- **The clock and language:** `timedatectl` and `localectl`, tried as you first, then as root through the [privileged helper](#the-privileged-helper) or sudo. Time zones must exist in `/usr/share/zoneinfo`, locales must be generated on the machine, and keyboard layouts must be XKB's. They are the system's defaults; GNOME and KDE keep their own per person.
+- **`[desktop] approved`** lists what needs no approval, by kind: `volume`, `brightness` and `lock` by default; also `displays`, `power_profile`, `suspend`, `hibernate`, `reboot`, `poweroff`, `bluetooth` (connecting known devices), `clock` and `open` (files and links in their default app). `[desktop] apps` pre-approves apps for `app_open` by id, with wildcards: `["firefox", "org.gnome.*"]`.
+
+`tests/desktop/run.sh` checks the sound, screen and app tools against a real headless desktop: PipeWire with dummy devices, sway on its headless backend, Xvfb, and a made-up app.
+
 ### Files
 
 `fs_list`, `fs_read` and `fs_find` look inside the readable roots; `fs_write`, `fs_mkdir`, `fs_copy`, `fs_move` and `fs_delete` change things only inside the writable roots.
@@ -827,6 +854,8 @@ src/
   mcp.rs        MCP server (initialize, ping, tools/list, tools/call)
   daemon.rs     the system service: socket, peer checks, live reload, the stdio bridge
   approvals.rs  approvals through the daemon: the broker, and `orion approvals`
+  tools/session.rs  the person's desktop session (display, compositor, session bus),
+                for the desktop tools: audio, display, power, bluetooth, apps, clock
   watch.rs      what needs attention: the checks, the daemon's watch, system_health,
                 unattended updates
   remote.rs     the chat calling tools through the daemon
@@ -877,7 +906,8 @@ tests/          end-to-end runs of the real binary: stdio.rs (MCP), daemon.rs
                 (daemon plus bridge), distros/ (package and update tools,
                 rollbacks and unattended updates on Fedora, openSUSE, Arch and
                 Debian, in Docker), helper/ (the privileged helper and its
-                snapshots, as root)
+                snapshots, as root), desktop/ (sound, screens and apps on a real
+                headless desktop)
 .github/        ci.yml: lint, tests, the oldest supported Rust, distros/ and
                 helper/, on every push and nightly; release.yml: the release
                 files, built and installed in clean containers on every push,
@@ -891,7 +921,7 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. The chat, the shell and `orion listen` call tools through it, and ~~`ask` approvals from MCP agents~~ reach you in a terminal, a notification or the shell.
 3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits, and ~~a privileged helper~~ (`orion helper`) for root work in place of sudo rules. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
-4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots), on apt, dnf, zypper and pacman. ~~Unattended updates~~, with ~~snapshots and rollback~~ under every package change, are done too. Next: a status-bar badge for pending security fixes.
+4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots), on apt, dnf, zypper and pacman. ~~Unattended updates~~, with ~~snapshots and rollback~~ under every package change, are done too, and so is ~~the desktop~~: sound, screens and brightness, power, Bluetooth, apps, the clock and language. Next: a status-bar badge for pending security fixes.
 5. ~~**Packaging.**~~ Done: release binaries for x86_64 and aarch64 (glibc 2.31 and newer), `.deb`, `.rpm`, an Arch PKGBUILD and an install script, each installed and tested in clean containers before a release is published.
 6. ~~**Proactive monitoring.**~~ Done: the daemon watches for failed services, full disks, security updates, a due reboot and low memory, notifies the desktop, and tells the AI.
 7. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.

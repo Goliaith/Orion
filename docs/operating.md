@@ -401,6 +401,25 @@ orion call gpu_assign '{"unit": "ollama", "gpus": [1]}'   # pin Ollama to GPU 1
 
 The argument names above are the common ones; `orion tools` and each tool's schema (the AI sees it, and errors name a wrong argument) have the rest.
 
+### Sound, screens, power and apps
+
+```sh
+orion call audio_set '{"change": 10}'                       # louder (pre-approved)
+orion call audio_set '{"device": "HDMI", "make_default": true}'
+orion call display_set '{"brightness": 60}'                 # the panel (pre-approved)
+orion call display_set '{"output": "DP-1", "mode": "2560x1440@144", "scale": 1.25}'
+orion call power_status                                     # charge, time left, battery health, profile
+orion call power_action '{"action": "lock"}'                # pre-approved; suspend and reboot ask
+orion call bt_status '{"scan_secs": 10}'                    # put the headphones in pairing mode first
+orion call bt_device '{"action": "pair", "address": "38:18:4C:12:34:56"}'
+orion call app_open '{"app": "firefox", "targets": ["https://example.org"]}'
+orion call clock_set '{"timezone": "Europe/Berlin"}'
+```
+
+To let the AI do more of these without asking, add kinds to `[desktop] approved` (`displays`, `power_profile`, `suspend`, `bluetooth`, `clock`, `open`, …) and apps to `[desktop] apps`. Under `orion serve`, where nobody is asked, those are the only desktop changes agents can make.
+
+When a desktop tool says no session is running, the daemon can't see your desktop: log in graphically, or check that your desktop imports its environment into systemd (`systemctl --user show-environment` should list `WAYLAND_DISPLAY` or `DISPLAY`). Most do; for a bare compositor, add `exec systemctl --user import-environment WAYLAND_DISPLAY` to its config.
+
 ## What needs attention
 
 The daemon checks the machine every 15 minutes and keeps what it finds: failed services, filesystems 90% full, pending security updates, a reboot that is due, memory under 5%.
