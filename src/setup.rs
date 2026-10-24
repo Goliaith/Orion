@@ -457,6 +457,10 @@ pub fn run(explicit: Option<&Path>, opts: Options) -> Result<()> {
             Err(e) => {
                 println!("{} doesn't load: {e:#}\n", tilde(&path));
                 if t.parse::<toml_edit::DocumentMut>().is_err() {
+                    // --trust alone answers nothing else, least of all this.
+                    if trust_only && !opts.yes {
+                        bail!("left {} as it is; fix it (`orion doctor` can help) or run `orion setup` without --trust", tilde(&path));
+                    }
                     if !ask.yes(&format!("Start it again from the example (the old one is kept as {}.bak)?", tilde(&path)), true)? {
                         bail!("left {} as it is; `orion doctor` can help find what's wrong", tilde(&path));
                     }
@@ -477,7 +481,10 @@ pub fn run(explicit: Option<&Path>, opts: Options) -> Result<()> {
     if let Some(level) = trust(&mut ask, &opts, &current, text.is_some())? {
         plan.edits.extend(level.edits(&current));
         plan.summary.push(format!("trust level {}", level.name()));
-        let extra = crate::trust::allowed_overrides(&current);
+        // As Orion runs it: with what tuning.toml pre-approved.
+        let mut effective = current.clone();
+        crate::tuning::Overlay::load().apply(&mut effective);
+        let extra = crate::trust::allowed_overrides(&effective);
         if !extra.is_empty() && level != Level::HandsOff {
             println!("  Still without asking, by [tools] or tuning.toml: {}", extra.join(", "));
         }
