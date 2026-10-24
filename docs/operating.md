@@ -567,7 +567,7 @@ The graphical shell shows the same requests as cards, naming the agent. Answer w
 | Path | What |
 |---|---|
 | `~/.config/orion/orion.toml` | the policy (`ORION_CONFIG` or `--config` override it) |
-| `~/.config/orion/env` | variables for the systemd services, such as `ANTHROPIC_API_KEY` |
+| `~/.config/orion/env` | keys such as `ANTHROPIC_API_KEY`, one `VAR=value` per line: the systemd services and every `orion` command read it (a variable your shell exports wins) |
 | `~/.local/state/orion/audit.jsonl` | the audit log |
 | `~/.local/state/orion/conversations/` | saved conversations |
 | `~/.local/state/orion/memory/` | what the AI remembers, one file per person |
@@ -595,7 +595,9 @@ The graphical shell shows the same requests as cards, naming the agent. Answer w
 
 ## Troubleshooting
 
-Start with these three; they answer most questions:
+Start with `orion doctor`. It checks, in order: which policy file Orion reads (and a misspelled one nearby), whether it loads (curly quotes, unknown keys), the env file (its permissions, `export` lines, stray characters in keys, an older key your shell exports that wins over it), each configured model with a live call (a turned-down key, a retired or misspelled model name), the microphone, the transcriber, the wake-word detector, the sandbox, the privileged helper's group and socket (including a group you were added to but haven't logged in again for), and whether the daemon has the current keys. For each problem it says what to do, and offers to do it: it asks before each fix (`--yes` takes them all, `--no-fix` only reports), keeps a `.bak` of any file it changes, and exits 1 while something is still broken.
+
+Then these three answer most other questions:
 
 ```sh
 orion tools            # what the policy allows, and the sandbox in use

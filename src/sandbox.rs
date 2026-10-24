@@ -322,6 +322,10 @@ pub fn command(
             c
         }
     };
+    // Keys Orion read from its env file are its own, not the program's.
+    for name in crate::envfile::loaded() {
+        cmd.env_remove(name);
+    }
     cmd.process_group(0);
     Ok((cmd, b, guard))
 }

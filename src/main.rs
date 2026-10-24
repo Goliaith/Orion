@@ -216,6 +216,32 @@ enum Cmd {
         #[arg(long)]
         caller: Option<String>,
     },
+    /// Connect a model: choose Claude, Gemini or a local server, paste the
+    /// key, and Orion checks it and writes orion.toml and ~/.config/orion/env.
+    Setup {
+        /// claude, gemini or local (asked otherwise).
+        #[arg(long, value_parser = ["claude", "gemini", "local"])]
+        provider: Option<String>,
+        /// The model to use (otherwise picked from what the key offers).
+        #[arg(long)]
+        model: Option<String>,
+        /// A local server's OpenAI-compatible URL, such as http://127.0.0.1:8080/v1.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Take every default, and the key already in the environment.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Check the policy, keys, models, microphone, transcriber, wake word,
+    /// sandbox and helper, and offer to fix what's wrong.
+    Doctor {
+        /// Apply every fix without asking.
+        #[arg(long, short, conflicts_with = "no_fix")]
+        yes: bool,
+        /// Only report; change nothing.
+        #[arg(long)]
+        no_fix: bool,
+    },
     /// Print the most recent audit log entries, or check the log is intact.
     Audit {
         #[arg(short = 'n', long, default_value_t = 20)]
@@ -256,6 +282,16 @@ fn main() -> Result<()> {
     // The helper has a policy of its own, which only root may change.
     if let Cmd::Helper { socket } = &cli.command {
         return orion::helper::main(cli.config.as_deref(), socket.as_deref());
+    }
+    // Keys saved by `orion setup` work at once, without a new shell.
+    orion::envfile::load();
+    // These two fix a policy that doesn't load, so they don't need it to.
+    match cli.command {
+        Cmd::Setup { provider, model, base_url, yes } => {
+            return orion::setup::run(cli.config.as_deref(), orion::setup::Options { provider, model, base_url, yes });
+        }
+        Cmd::Doctor { yes, no_fix } => return orion::doctor::run(cli.config.as_deref(), orion::doctor::Options { yes, no_fix }),
+        _ => {}
     }
     let (policy, source) = Policy::load(cli.config.as_deref())?;
     match &source {
@@ -315,7 +351,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Daemon { socket } => daemon::run(policy, source, socket),
-        Cmd::Helper { .. } => unreachable!("handled before loading the policy"),
+        Cmd::Helper { .. } | Cmd::Setup { .. } | Cmd::Doctor { .. } => unreachable!("handled before loading the policy"),
         Cmd::Approvals { notify, list } => {
             let mode = match (list, notify) {
                 (true, _) => orion::approvals::Mode::List,

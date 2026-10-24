@@ -417,7 +417,7 @@ fn user_name(uid: u32) -> Option<String> {
     Some(unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }.to_string_lossy().into_owned())
 }
 
-fn group_gid(name: &str) -> Option<u32> {
+pub(crate) fn group_gid(name: &str) -> Option<u32> {
     let c = std::ffi::CString::new(name).ok()?;
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 64 << 10];
@@ -427,7 +427,7 @@ fn group_gid(name: &str) -> Option<u32> {
     (r == 0 && !out.is_null()).then_some(grp.gr_gid)
 }
 
-fn user_groups(name: &str, primary: u32) -> Vec<u32> {
+pub(crate) fn user_groups(name: &str, primary: u32) -> Vec<u32> {
     let Ok(c) = std::ffi::CString::new(name) else { return Vec::new() };
     let mut n: libc::c_int = 64;
     loop {

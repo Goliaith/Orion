@@ -16,6 +16,8 @@
 #   --no-helper     skip the privileged helper (root work then needs sudo rules)
 #   --no-daemon     skip the background service
 #   --skip-deps     don't install build tools with the package manager
+#   --no-setup      don't run `orion setup` (it runs when there is no policy
+#                   or env file yet, and a terminal to ask on)
 set -eu
 
 repo=Goliaith/Orion
@@ -24,6 +26,7 @@ branch=main
 helper=yes
 daemon=yes
 deps=yes
+setup=yes
 while [ $# -gt 0 ]; do
     case $1 in
         --dir) dir=${2:?--dir needs a directory}; shift ;;
@@ -31,7 +34,8 @@ while [ $# -gt 0 ]; do
         --no-helper) helper=no ;;
         --no-daemon) daemon=no ;;
         --skip-deps) deps=no ;;
-        -h|--help) sed -n '2,21p' "$0" 2>/dev/null || echo "see packaging/bootstrap.sh"; exit 0 ;;
+        --no-setup) setup=no ;;
+        -h|--help) sed -n '2,23p' "$0" 2>/dev/null || echo "see packaging/bootstrap.sh"; exit 0 ;;
         *) echo "bootstrap.sh: unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -59,6 +63,8 @@ main() {
 
     [ $helper = no ] || install_helper
     [ $daemon = no ] || install_daemon
+
+    [ $setup = no ] || first_setup
 
     say "Done: $("$bin" --version)"
     "$bin" status 2>/dev/null || true
@@ -172,6 +178,18 @@ install_daemon() {
     systemctl --user try-restart orion.service
 }
 
+# The first time, connect a model: `orion setup` asks on the terminal (this
+# script's stdin is not one), checks the key and writes the files itself.
+first_setup() {
+    config=${XDG_CONFIG_HOME:-$HOME/.config}/orion
+    [ ! -f "$config/orion.toml" ] && [ ! -f "$config/env" ] || return 0
+    if ! (: </dev/tty) 2>/dev/null; then
+        return 0
+    fi
+    say "Connecting a model"
+    "$bin" setup </dev/tty || echo "(setup stopped; run it again any time: orion setup)"
+}
+
 next_steps() {
     echo
     if [ "${relogin:-}" = yes ]; then
@@ -182,11 +200,10 @@ next_steps() {
         *:"$HOME/.cargo/bin":*) ;;
         *) [ -f "$HOME/.cargo/env" ] || echo "Add ~/.cargo/bin to your PATH so the orion command is found: echo 'export PATH=\"\$HOME/.cargo/bin:\$PATH\"' >> ~/.bashrc" ;;
     esac
-    if [ ! -f "$HOME/.config/orion/orion.toml" ]; then
-        echo "Orion has no policy yet; it runs on the defaults. To start one:"
-        echo "  mkdir -p ~/.config/orion && cp $dir/orion.example.toml ~/.config/orion/orion.toml"
+    if [ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/orion/orion.toml" ]; then
+        echo "Connect a model (Claude, Gemini or one on this machine): orion setup"
     fi
-    echo "Connect a model (Claude, Gemini or Ollama): see $dir/docs/install.md, section 4."
+    echo "If something doesn't work, orion doctor checks it all and offers fixes."
     echo "To update later, run this again: sh $dir/packaging/bootstrap.sh"
 }
 
