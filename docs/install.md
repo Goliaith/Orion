@@ -292,6 +292,24 @@ orion voice test
 
 On a machine without internet, download the Resemblyzer 0.1.4 wheel elsewhere and use `orion voice model install --from <file>`.
 
+A wake-word detector, so Orion transcribes only after it hears its name. On a laptop processor this is faster and more reliable than transcribing everything:
+
+```sh
+install -Dm 755 contrib/orion-wake ~/.local/bin/orion-wake
+pip install --user vosk                 # or: openwakeword onnxruntime (see the README)
+orion-wake --verbose                    # say "Orion"; Ctrl-C to stop
+```
+
+Then set it under `[voice]` in `~/.config/orion/orion.toml`. If the file already has a `[voice]` section, this adds the line there:
+
+```sh
+sed -i '/^\[voice\]/a wake_command = "~/.local/bin/orion-wake"' ~/.config/orion/orion.toml
+```
+
+Without a `[voice]` section, add one at the end: `printf '\n[voice]\nwake_command = "~/.local/bin/orion-wake"\n' >> ~/.config/orion/orion.toml`.
+
+If noise keeps Orion listening after you stop talking, run `orion voice noise` and add the settings it prints under `[voice]`.
+
 ### The graphical shell
 
 `orion shell` needs only a browser on the same machine. To make Orion the whole desktop, install the `cage` kiosk compositor and Chromium (or Firefox), then run `contrib/orion-kiosk` as the session:
@@ -518,8 +536,8 @@ That leaves your data. To remove it too:
 
 | Path | What |
 |---|---|
-| `~/.config/orion/` | the policy and the `env` file |
-| `~/.local/state/orion/` | conversations, memory, voiceprints, the audit log, chat history, the shell's address, the package history and the last unattended update |
+| `~/.config/orion/` | the policy, the `env` file, and `voice-tuning.toml` (voice settings Orion tuned with your approval) |
+| `~/.local/state/orion/` | conversations, memory, voiceprints, the audit log, chat history, the shell's address, the package history, the last unattended update, and `voice.json` (how recent spoken requests ended, for voice tuning) |
 | `~/.local/share/orion/` | the neural speaker model |
 | `~/orion-workspace/` | files the AI wrote (the default write root) |
 | `/etc/sudoers.d/orion` | the sudoers rule, if you made one |

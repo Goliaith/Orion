@@ -451,6 +451,12 @@ impl App {
     fn finish_listening(&mut self) {
         let Some(rec) = self.listening.take() else { return };
         let Ok(transcriber) = self.voice.transcriber.clone() else { return };
+        if rec.hit_limit() && rec.heard_speech() {
+            self.entries.push(Entry::Notice(format!(
+                "voice: listening ran to the {}-second limit instead of stopping when you paused. If background noise kept it going, ask Orion to check your voice settings.",
+                self.voice.config.max_seconds
+            )));
+        }
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(rec.finish().and_then(|wav| transcriber.transcribe(&wav)));

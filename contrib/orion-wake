@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""A wake-word detector for Orion's voice.wake_command.
+
+It listens to the microphone and prints one line each time it hears the wake
+word. Orion then chimes, records the request and transcribes it, so nothing
+else said near the microphone is ever transcribed.
+
+Two engines, both offline and light enough for a laptop processor:
+
+  vosk (the default) spots the word itself, so "Orion" works with no
+  training. Set up once:  pip install --user vosk
+  The small English model (about 40 MB) downloads on first use.
+
+  openwakeword uses a trained wake-word model: a ready-made one such as
+  hey_jarvis, or your own .onnx (openWakeWord's notebook trains one for any
+  word). It hears the model's phrase, so "Hey Jarvis" with hey_jarvis, not
+  "Orion". It is the more reliable of the two in a noisy room. Set up once:
+  pip install --user openwakeword onnxruntime
+
+In ~/.config/orion/orion.toml, under [voice]:
+
+  wake_command = "~/.local/bin/orion-wake"
+  wake_command = "~/.local/bin/orion-wake --engine openwakeword --model hey_jarvis"
+
+Run it by hand with --verbose to see what it hears.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+RATE = 16000
+# 80 ms: what openWakeWord expects per call, and fine for Vosk.
+FRAME = 1280
+
+
+def recorder(command):
+    if command:
+        return command
+    for binary, cmd in (
+        ("parecord", f"parecord --raw --rate={RATE} --channels=1 --format=s16le"),
+        ("arecord", f"arecord -q -t raw -f S16_LE -r {RATE} -c 1"),
+        ("sox", f"sox -q -d -t raw -r {RATE} -c 1 -b 16 -e signed-integer -L -"),
+    ):
+        if shutil.which(binary):
+            return cmd
+    sys.exit("orion-wake: no recorder found: install pulseaudio-utils (parecord) or alsa-utils (arecord), or pass --record")
+
+
+def vosk_detector(args, log):
+    try:
+        import vosk
+    except ImportError:
+        sys.exit("orion-wake: Vosk isn't installed: pip install --user vosk")
+    vosk.SetLogLevel(-1)
+    model = vosk.Model(model_path=args.vosk_model) if args.vosk_model else vosk.Model(lang="en-us")
+    words = [w.lower() for w in args.word]
+    phrases = words + [f"{f} {w}" for w in words for f in ("hey", "ok")]
+    # Anything else is [unk], so the word has to stand out to count.
+    rec = vosk.KaldiRecognizer(model, RATE, json.dumps(phrases + ["[unk]"]))
+
+    def heard(frame):
+        if rec.AcceptWaveform(frame):
+            text = json.loads(rec.Result()).get("text", "")
+        else:
+            text = json.loads(rec.PartialResult()).get("partial", "")
+        if text and text != "[unk]":
+            log(f"heard: {text}")
+        if any(w in text.split() for w in words):
+            rec.Reset()
+            return True
+        return False
+
+    return heard
+
+
+def oww_detector(args, log):
+    try:
+        import numpy as np
+        import openwakeword
+        from openwakeword.model import Model
+    except ImportError:
+        sys.exit("orion-wake: openWakeWord isn't installed: pip install --user openwakeword onnxruntime")
+    model_arg = os.path.expanduser(args.model)
+    # Fetch, once, the models every detector needs, and a ready-made one
+    # named instead of a file ("none" matches no ready-made model).
+    openwakeword.utils.download_models([model_arg if not os.path.exists(model_arg) else "none"])
+    model = Model(wakeword_models=[model_arg], inference_framework="onnx", vad_threshold=args.vad)
+    cooldown = 0
+
+    def heard(frame):
+        nonlocal cooldown
+        scores = model.predict(np.frombuffer(frame, dtype=np.int16))
+        best = max(scores.values(), default=0.0)
+        if best > 0.1:
+            log(f"score: {best:.2f}")
+        if cooldown > 0:
+            cooldown -= 1
+            return False
+        if best >= args.threshold:
+            # About a second, so one "Orion" is one detection.
+            cooldown = 12
+            return True
+        return False
+
+    return heard
+
+
+def main():
+    p = argparse.ArgumentParser(description="Print a line each time the wake word is heard (for Orion's voice.wake_command).")
+    p.add_argument("--engine", choices=("vosk", "openwakeword"), default="vosk")
+    p.add_argument("--word", action="append", help="vosk: the wake word, repeatable (default: orion)")
+    p.add_argument("--vosk-model", help="vosk: a model directory instead of the small English one")
+    p.add_argument("--model", default="hey_jarvis", help="openwakeword: a ready-made model's name, or your own .onnx")
+    p.add_argument("--threshold", type=float, default=0.5, help="openwakeword: score needed, 0 to 1 (higher: fewer false wakes)")
+    p.add_argument("--vad", type=float, default=0.0, help="openwakeword: also require speech by Silero VAD above this, 0 to 1")
+    p.add_argument("--record", help="a command writing raw 16 kHz 16-bit mono PCM to stdout")
+    p.add_argument("--verbose", action="store_true", help="show what it hears, on stderr")
+    args = p.parse_args()
+    args.word = args.word or ["orion"]
+
+    def log(message):
+        if args.verbose:
+            print(message, file=sys.stderr, flush=True)
+
+    heard = vosk_detector(args, log) if args.engine == "vosk" else oww_detector(args, log)
+    mic = subprocess.Popen(recorder(args.record), shell=True, stdout=subprocess.PIPE)
+    try:
+        while True:
+            frame = mic.stdout.read(FRAME * 2)
+            if not frame:
+                sys.exit("orion-wake: the recorder stopped: is a microphone connected?")
+            if len(frame) % 2:
+                frame = frame[:-1]
+            if heard(frame):
+                print("wake", flush=True)
+                log("wake")
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+    finally:
+        mic.terminate()
+
+
+if __name__ == "__main__":
+    main()

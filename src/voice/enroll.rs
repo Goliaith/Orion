@@ -1,5 +1,6 @@
 //! `orion voice enroll | test | status | forget`: teach Orion the voices
-//! of the people who may wake it, check them, and undo it.
+//! of the people who may wake it, check them, and undo it. `orion voice
+//! noise` measures the room and suggests a speech threshold.
 
 use std::io::{BufRead, Write};
 use std::thread;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use super::capitalize as cap;
+use super::record::{rms, Sensitivity, CHUNK_MS};
 use super::speaker::{valid_name, Heard, Method, Voiceprint};
 use super::{Recorder, ToolAccess, Verify, VoiceConfig};
 
@@ -170,6 +172,111 @@ pub fn test(config: &VoiceConfig) -> Result<()> {
     Ok(())
 }
 
+/// Record for a fixed time, with a meter, and return each chunk's level.
+fn levels_for(recorder: &Recorder, secs: u64) -> Result<Vec<f32>> {
+    let rec = recorder.start()?;
+    let mut out = std::io::stdout();
+    while rec.elapsed() < Duration::from_secs(secs) {
+        let n = (rec.level() * 20.0) as usize;
+        let _ = write!(out, "\r  ● {:<20} {:>2}s ", "▮".repeat(n), secs.saturating_sub(rec.elapsed().as_secs()));
+        let _ = out.flush();
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = write!(out, "\r{:40}\r", "");
+    let chunk = (recorder.rate() as u64 * CHUNK_MS / 1000) as usize;
+    Ok(rec.finish_raw()?.chunks_exact(chunk).map(rms).collect())
+}
+
+fn percentile(levels: &[f32], p: f32) -> f32 {
+    let mut v = levels.to_vec();
+    v.sort_by(f32::total_cmp);
+    v.get(((v.len().saturating_sub(1)) as f32 * p).round() as usize).copied().unwrap_or(0.0)
+}
+
+/// What `orion voice noise` found.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Advice {
+    /// The current settings already tell the two apart.
+    Fine,
+    /// Set these to put the threshold between the noise and the voice.
+    Set { margin: Option<f32>, level: Option<f32> },
+    /// The noise is as loud as the voice: no threshold separates them.
+    TooLoud,
+}
+
+/// Put the threshold above the room's loudest noise and below most of the
+/// voice, moving it as little as possible.
+pub(crate) fn advise(quiet: &[f32], speech: &[f32], now: Sensitivity) -> Advice {
+    let floor = percentile(quiet, 0.1);
+    let noise = percentile(quiet, 0.95) * 1.2;
+    let voice = percentile(speech, 0.5) * 0.6;
+    if noise >= voice {
+        return Advice::TooLoud;
+    }
+    let threshold = now.threshold(Some(floor));
+    if (noise..=voice).contains(&threshold) {
+        return Advice::Fine;
+    }
+    let target = threshold.clamp(noise, voice);
+    // The margin follows the room as it gets louder or quieter, so prefer
+    // it, unless the room is nearly silent (a digital microphone, say).
+    // In half steps, within what separates the two.
+    let (lo, hi) = ((noise / floor.max(1.0) * 2.0).ceil() / 2.0, (voice / floor.max(1.0) * 2.0).floor() / 2.0);
+    if floor >= 10.0 && lo.max(1.0) <= hi {
+        let margin = ((target / floor * 2.0).round() / 2.0).clamp(lo.max(1.0), hi);
+        let level = (now.level > voice).then_some((target / 10.0).round() * 10.0);
+        Advice::Set { margin: Some(margin), level }
+    } else {
+        Advice::Set { margin: None, level: Some((target / 10.0).round() * 10.0) }
+    }
+}
+
+/// `orion voice noise`: measure the room and the voice, and suggest a
+/// threshold that keeps the room's noise from counting as speech.
+pub fn noise(config: &VoiceConfig) -> Result<()> {
+    let recorder = Recorder::detect(config)?;
+    let now = recorder.sensitivity();
+    print!("Press Enter, then stay quiet for 5 seconds, with the room as it usually is (fan, TV, typing). ");
+    std::io::stdout().flush()?;
+    wait_for_enter()?;
+    let quiet = levels_for(&recorder, 5)?;
+    print!("Now press Enter and talk to Orion for 5 seconds, from where you usually sit. ");
+    std::io::stdout().flush()?;
+    wait_for_enter()?;
+    let speech = levels_for(&recorder, 5)?;
+    let floor = percentile(&quiet, 0.1);
+    let threshold = now.threshold(Some(floor));
+    let crossed = quiet.iter().filter(|&&l| l > threshold).count() * 100 / quiet.len().max(1);
+    println!(
+        "Room: {:.0} usually, up to {:.0}. Your voice: about {:.0}. Speech threshold now: {threshold:.0} (noise_margin {}, speech_level {}).",
+        floor,
+        percentile(&quiet, 0.95),
+        percentile(&speech, 0.5),
+        now.margin,
+        now.level
+    );
+    if crossed > 0 {
+        println!("{crossed}% of the quiet part counted as speech, which keeps Orion listening after you stop.");
+    }
+    match advise(&quiet, &speech, now) {
+        Advice::Fine => println!("That's fine: the room stays under the threshold and your voice clears it."),
+        Advice::TooLoud => println!(
+            "The room is about as loud as your voice, so no threshold tells them apart. Move closer to the microphone, \
+             or quiet the noise. A wake-word detector (voice.wake_command) copes better with a noisy room."
+        ),
+        Advice::Set { margin, level } => {
+            println!("Put this under [voice] in your settings:");
+            if let Some(m) = margin {
+                println!("  noise_margin = {m:.1}");
+            }
+            if let Some(l) = level {
+                println!("  speech_level = {l:.0}");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn status(config: &VoiceConfig) -> Result<()> {
     let people = Voiceprint::all()?;
     if people.is_empty() {
@@ -270,4 +377,54 @@ pub fn model_remove() -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat(level: f32, n: usize) -> Vec<f32> {
+        vec![level; n]
+    }
+
+    #[test]
+    fn a_quiet_room_needs_nothing() {
+        assert_eq!(advise(&flat(50.0, 50), &flat(3000.0, 50), Sensitivity::default()), Advice::Fine);
+    }
+
+    #[test]
+    fn a_fan_that_crosses_the_threshold_raises_the_margin() {
+        // A floor of 200 with bursts to 900: 3x (600) lets the bursts through.
+        let mut quiet = flat(200.0, 40);
+        quiet.extend(flat(900.0, 10));
+        match advise(&quiet, &flat(5000.0, 50), Sensitivity::default()) {
+            Advice::Set { margin: Some(m), level: None } => {
+                assert!(200.0 * m > 900.0 * 1.2, "{m} still lets the fan through");
+                assert!(200.0 * m < 5000.0 * 0.6, "{m} would miss the voice");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_quiet_voice_lowers_a_high_threshold() {
+        let now = Sensitivity { margin: 3.0, level: 1500.0 };
+        match advise(&flat(100.0, 50), &flat(1000.0, 50), now) {
+            Advice::Set { level: Some(l), .. } => assert!((120.0..=600.0).contains(&l), "{l}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_silent_microphone_sets_the_level() {
+        let now = Sensitivity { margin: 3.0, level: 5.0 };
+        let mut quiet = flat(1.0, 45);
+        quiet.extend(flat(400.0, 5));
+        assert!(matches!(advise(&quiet, &flat(4000.0, 50), now), Advice::Set { margin: None, level: Some(l) } if l >= 480.0));
+    }
+
+    #[test]
+    fn noise_as_loud_as_the_voice_cannot_be_fixed() {
+        assert_eq!(advise(&flat(2000.0, 50), &flat(2500.0, 50), Sensitivity::default()), Advice::TooLoud);
+    }
 }

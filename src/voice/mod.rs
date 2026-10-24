@@ -13,6 +13,7 @@ pub mod speak;
 pub mod speaker;
 mod torch;
 pub mod transcribe;
+pub mod tuning;
 pub mod wake;
 
 use std::path::PathBuf;
@@ -39,6 +40,13 @@ pub struct VoiceConfig {
     /// only Ctrl-T stops.
     pub silence_ms: u64,
     pub max_seconds: u64,
+    /// Speech must be this many times louder than the room's noise. Raise
+    /// it if a fan or a TV keeps Orion listening; lower it if quiet speech
+    /// is missed. `orion voice noise` suggests a value.
+    pub noise_margin: f32,
+    /// The quietest sound that ever counts as speech (RMS of 16-bit
+    /// samples), however quiet the room.
+    pub speech_level: f32,
     /// OpenAI-compatible base URL serving `/audio/transcriptions`
     /// (speaches / faster-whisper-server, LocalAI, whisper.cpp's server).
     pub transcribe_url: String,
@@ -115,6 +123,8 @@ impl Default for VoiceConfig {
             sample_rate: 16_000,
             silence_ms: 1200,
             max_seconds: 60,
+            noise_margin: 3.0,
+            speech_level: 300.0,
             transcribe_url: "http://127.0.0.1:8000/v1".into(),
             transcribe_model: "Systran/faster-whisper-small".into(),
             transcribe_command: String::new(),

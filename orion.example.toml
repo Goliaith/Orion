@@ -187,6 +187,9 @@ record_command = ""
 sample_rate = 16000
 silence_ms = 1200               # a pause this long after speech ends listening (0: never)
 max_seconds = 60
+noise_margin = 3.0              # speech is this many times louder than the room; raise it if
+                                # noise keeps Orion listening (`orion voice noise` suggests one)
+speech_level = 300              # the quietest sound that ever counts as speech
 # Speech to text: an OpenAI-compatible server (speaches/faster-whisper-server
 # on :8000, LocalAI, or whisper.cpp's server with
 # --inference-path /v1/audio/transcriptions) ...
@@ -211,7 +214,8 @@ wake = false                    # listen from the start
 wake_phrase = "orion"           # "hey orion" and "ok orion" work too
 wake_aliases = []               # other spellings your transcriber writes, e.g. ["o'ryan"]
 wake_command = ""               # a wake-word detector printing a line per detection,
-                                # used instead of transcribing everything said
+                                # used instead of transcribing everything said, e.g.
+                                # "~/.local/bin/orion-wake" (contrib/orion-wake)
 wake_chime = true               # chime when woken without a request
 wake_timeout_secs = 8           # how long to wait for the request after "Orion"
 wake_approvals = false          # true: "Orion, yes" approves a tool call ("no" always declines)

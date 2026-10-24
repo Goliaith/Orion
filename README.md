@@ -31,7 +31,9 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | Tool           | Risk    | Default | What it does |
 |----------------|---------|---------|--------------|
 | `system_info`  | read    | allow   | Hostname, OS, kernel, CPU, memory, load, uptime |
-| `system_health` | read   | allow   | What needs attention: failed services, full or failing disks, security updates, a due reboot, low memory, heat, battery wear, journal errors, failed logins |
+| `system_health` | read   | allow   | What needs attention: failed services, full or failing disks, security updates, a due reboot, low memory, heat, battery wear, journal errors, failed logins, voice trouble |
+| `voice_check`  | read    | allow   | How listening is going: the voice settings, how recent spoken requests ended, what was heard in place of the wake word, and suggested changes with their reasons |
+| `voice_tune`   | write   | ask     | Change how Orion listens (noise margin, speech level, pause, time limit, wake-word spellings), and nothing else in the policy |
 | `disk_health`  | read    | allow   | Each drive's SMART health: good, warning or failing and why, wear, temperature, hours of use |
 | `sensor_status` | read   | allow   | Temperatures (CPU, GPU, drives, board) with their limits, and fan speeds |
 | `gpu_info`     | read    | allow   | Every GPU (NVIDIA, AMD, Intel) by name: memory, load, temperature, power, compute stacks, and what runs on each, down to the model |
@@ -257,6 +259,8 @@ It is local-first and uses what the machine already has:
 | Text to speech | `espeak-ng`, `espeak` or `spd-say` | [piper](https://github.com/rhasspy/piper) as a command, or an OpenAI-compatible `/audio/speech` server such as Kokoro-FastAPI (`speak_url`) |
 
 - **Listening ends on a pause.** Orion measures the room's noise floor at the start and waits for at least 0.3 s of speech before a pause can end the recording, so a click doesn't cut you off.
+- **Noisy rooms:** sound counts as speech when it is `noise_margin` times louder than the room (3 by default) and at least `speech_level`. If a fan, a TV or typing keeps Orion listening after you stop, run `orion voice noise`: it listens to the room for 5 seconds, then to you for 5, and prints the settings to use.
+- **Orion tunes itself, with your OK.** It notices when spoken requests keep running to the time limit, or when the transcriber keeps writing the wake word as something else ("Oreo"). It says what it saw and which setting would fix it, as a finding like the daemon's others ("Background noise keeps Orion listening"), or when you ask "how is my voice setup doing?". With your approval, `voice_tune` makes the change. Changes go to `~/.config/orion/voice-tuning.toml`, applied over `[voice]`. That file holds only these voice settings, so the AI can't change the rest of the policy. Delete it, or ask Orion to reset them, to go back. To notice this, Orion keeps the levels and endings of the last 20 requests and the near-miss spellings of the wake word in `~/.local/state/orion/voice.json`. It never keeps audio or anything else that was said.
 - **Transcripts are cleaned up.** Whisper's `[BLANK_AUDIO]`-style markers are removed.
 - **A spoken message is routed like a typed one,** so private speech stays on the local model.
 - **Nothing is sent off the machine** unless you point `transcribe_url` or `speak_url` at a remote server.
@@ -275,7 +279,24 @@ Turn on wake listening with **Alt-W** (or `/voice wake on`, or `wake = true` und
 How it works: the microphone stays open, and a pause detector (with a noise floor that follows the room) cuts the sound into utterances. The first 3 seconds of each utterance go to your transcriber and are checked for the wake phrase. The check allows for the ways a transcriber spells a name it doesn't know ("O'Ryan", "Orien", "Oreon"), and `wake_aliases` adds your own. Utterances are only held in memory until they are checked, and nothing is saved.
 
 - **It stays local.** Wake listening refuses to start if your transcriber is on another machine, since everything said near the microphone would go there. Set `wake_allow_remote = true` if that is really what you want.
-- **A dedicated detector:** set `wake_command` to a program that prints a line each time it hears the wake word, such as an [openWakeWord](https://github.com/dscripka/openWakeWord) or Porcupine script. It does the always-on listening, so nothing is transcribed until it fires, and Orion then records and transcribes the request.
+- **A dedicated detector:** set `wake_command` to a program that prints a line each time it hears the wake word. It does the always-on listening, so nothing is transcribed until it fires, and Orion then chimes, records and transcribes the request. [`contrib/orion-wake`](contrib/orion-wake) is one, with two offline engines:
+  - **Vosk** (the default) spots "Orion" itself, with no training: `pip install --user vosk`, and its small English model (about 40 MB) downloads on first use.
+  - **[openWakeWord](https://github.com/dscripka/openWakeWord)** runs a trained wake-word model, and copes better with a noisy room: a ready-made one such as `hey_jarvis`, or your own `.onnx` (its notebook trains one for any word). `pip install --user openwakeword onnxruntime`.
+
+  ```sh
+  install -Dm 755 contrib/orion-wake ~/.local/bin/orion-wake
+  pip install --user vosk
+  orion-wake --verbose              # say "Orion": it prints what it hears, and "wake"
+  ```
+
+  ```toml
+  [voice]
+  wake_command = "~/.local/bin/orion-wake"
+  # wake_command = "~/.local/bin/orion-wake --engine openwakeword --model hey_jarvis"
+  # wake_command = "~/.local/bin/orion-wake --engine openwakeword --model ~/models/orion.onnx"
+  ```
+
+  The detector and Orion both open the microphone, so use a sound server (PipeWire or PulseAudio, with `parecord`) rather than raw ALSA. Say the detector's word, then the request; the chime says it's listening. With Vosk that is "Orion" (or `--word`); with openWakeWord it is the model's phrase, so "Hey Jarvis" for `hey_jarvis`, and "Orion" only with a model trained for it. `voice.wake_phrase` doesn't apply to a detector.
 - **The cost:** transcribing every utterance is light with a GPU or a small Whisper model, but a dedicated detector uses far less power on a CPU.
 - **Your own phrase:** `wake_phrase` sets it, for example `"hey computer"`. A short, distinctive name works best.
 - **No leftover microphone:** the microphone is closed as soon as wake listening stops, and it can't outlive Orion even if Orion is killed.
@@ -530,6 +551,7 @@ orion shell                                   # the graphical shell (see "Graphi
 orion listen                                  # headless voice: "Orion, …" (see "Headless voice")
 orion voice model install                     # the neural speaker model (see "Speaker verification")
 orion voice enroll                            # only your voice wakes Orion
+orion voice noise                             # suggest noise_margin for a noisy room
 orion serve                                   # MCP server on stdin/stdout (through the daemon when it runs)
 orion daemon                                  # the system service (see "System service")
 orion status                                  # whether the daemon runs, and how
@@ -958,7 +980,7 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 5. ~~**Deeper monitoring.**~~ Done: drives' SMART health, temperatures, battery wear, bursts of errors and the kernel's hardware errors in the journal, and repeated failed logins, alongside the earlier checks.
 6. ~~**Packaging.**~~ Done: release binaries for x86_64 and aarch64 (glibc 2.31 and newer), `.deb`, `.rpm`, an Arch PKGBUILD and an install script, each installed and tested in clean containers before a release is published.
 7. ~~**Proactive monitoring.**~~ Done: the daemon watches for failed services, full disks, security updates, a due reboot and low memory, notifies the desktop, and tells the AI.
-8. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.
+8. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. ~~Adjustable noise sensitivity~~ (`orion voice noise`) and ~~a bundled wake-word detector~~ (`contrib/orion-wake`) are done too. Next for voice: a benchmark on real recordings, and transcription on the GPU.
 
 ## License
 
