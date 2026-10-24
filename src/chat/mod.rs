@@ -10,6 +10,7 @@
 
 mod agent;
 mod classifier;
+mod cli;
 pub mod journal;
 pub mod memory;
 pub mod listen;
