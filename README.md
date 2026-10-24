@@ -106,7 +106,13 @@ export ANTHROPIC_API_KEY=sk-ant-... # and/or run a local model with Ollama
 orion chat
 ```
 
-To build from source instead, you need Rust 1.95 or newer ([rustup](https://rustup.rs)) and a C compiler:
+From the private repository, with the GitHub CLI signed in (`gh auth login`), one command installs the build tools, Rust, Orion, its root helper and its daemon, and running it again updates them ([details](docs/install.md#from-the-private-repository-in-one-command)):
+
+```sh
+gh api -H 'Accept: application/vnd.github.raw' repos/Goliaith/Orion/contents/packaging/bootstrap.sh | sh
+```
+
+To build from source by hand instead, you need Rust 1.95 or newer ([rustup](https://rustup.rs)) and a C compiler:
 
 ```sh
 git clone https://github.com/Goliaith/Orion.git && cd Orion

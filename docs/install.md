@@ -79,6 +79,18 @@ The packages aren't signed. To check one by hand, download `SHA256SUMS` beside i
 
 With a package or the install script the systemd units are already in place, so in [7. Run it as a service](#7-run-it-as-a-service) you skip the `cp` lines.
 
+### From the private repository, in one command
+
+`packaging/bootstrap.sh` does the whole from-source install below, and the root helper and daemon from sections 6 and 7, as yourself, asking sudo only where it must. It needs the GitHub CLI signed in, because the repository is private:
+
+```sh
+sudo dnf install -y gh        # or apt, zypper, pacman
+gh auth login
+gh api -H 'Accept: application/vnd.github.raw' repos/Goliaith/Orion/contents/packaging/bootstrap.sh | sh
+```
+
+It installs the build tools and Rust if they are missing, clones the source into `~/Orion`, builds it, installs the helper (copying the binary to `/usr/local/bin`, creating the `orion` group and adding you to it) and starts the daemon. Run it again, as `sh ~/Orion/packaging/bootstrap.sh`, to update: it pulls `main`, rebuilds and restarts the helper and the daemon. A checkout with local changes is built as it is, without pulling. `--no-helper`, `--no-daemon`, `--branch NAME`, `--dir DIR` and `--skip-deps` change what it does. Then connect a model (section 4).
+
 ### From source
 
 Install the build tools. Pick your distribution:
@@ -465,7 +477,7 @@ With no human at the keyboard, `ask` means no: an MCP client is offered only the
 
 ## Upgrading
 
-A release package upgrades like any other: install the new one the same way (`sudo apt install ./orion_…deb`, `sudo dnf install ./orion-….rpm`, `makepkg -si` with the new PKGBUILD). With the install script, run it again. Then restart what runs:
+A release package upgrades like any other: install the new one the same way (`sudo apt install ./orion_…deb`, `sudo dnf install ./orion-….rpm`, `makepkg -si` with the new PKGBUILD). With the install script, run it again. Installed with `bootstrap.sh`, run `sh ~/Orion/packaging/bootstrap.sh` again: it pulls, rebuilds and restarts the helper and the daemon itself. Then restart what runs:
 
 ```sh
 systemctl --user restart orion.service orion-voice.service orion-shell.service 2>/dev/null
