@@ -635,6 +635,10 @@ pub fn run(policy: impl Fn() -> Arc<crate::Orion>, health: Shared) {
     loop {
         let orion = policy();
         let cfg = orion.policy().watch.clone();
+        // A checkpoint of the audit log with the helper, when it grew.
+        if let Err(e) = crate::audit::anchor(orion.policy()) {
+            tracing::warn!("audit checkpoint: {e:#}");
+        }
         let (unattended, ran) = unattended_round(&orion, &mut last, &health);
         if ran {
             updates_at = None; // what is still pending has changed

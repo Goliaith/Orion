@@ -48,6 +48,7 @@ cat > "$work/helper.toml" <<EOF
 [helper]
 socket = "$work/helper.sock"
 group = "$group"
+anchors = "$work/anchors"
 [packages]
 protected = ["dpkg", "apt", "curl"]   # curl: removable, but protected here
 snapper_config = "orion-hlp"
@@ -57,6 +58,7 @@ cat > "$work/user.toml" <<EOF
 elevate = "helper"
 [helper]
 socket = "$work/helper.sock"
+anchors = "$work/anchors"
 [packages]
 allowed = ["sl"]
 snapper_config = "orion-hlp"
@@ -131,6 +133,28 @@ else
 fi
 expect "curl is still installed" "$(dpkg-query -W -f '${Status}' curl 2>&1)" "install ok installed"
 expect "sl wasn't installed by any of that" "$(dpkg-query -W -f '${Status}' sl 2>&1)" "no packages found"
+
+echo "== Checkpoints of the audit log"
+cat > "$work/audited.toml" <<EOF
+[admin]
+elevate = "helper"
+[helper]
+socket = "$work/helper.sock"
+anchors = "$work/anchors"
+[audit]
+path = "/home/$user/audit.jsonl"
+EOF
+chmod 644 "$work/audited.toml"
+as "$user" "$work/orion call --config $work/audited.toml system_info >/dev/null; $work/orion call --config $work/audited.toml net_info >/dev/null"
+expect "the helper takes a checkpoint" "$(as "$user" "$work/orion audit --config $work/audited.toml --checkpoint")" "checkpointed by the helper"
+expect "the checkpoint is root's" "$(stat -c '%U %a' "$work/anchors/$(id -u "$user").jsonl")" "root 644"
+expect "verify: the chain and the checkpoint hold" "$(as "$user" "$work/orion audit --config $work/audited.toml --verify")" "1 by the helper, all hold"
+# Code running as the user rewrites its history: the checkpoint still knows.
+as "$user" "sed -i 's/\"tool\":\"system_info\"/\"tool\":\"fs_list\"/' /home/$user/audit.jsonl"
+out=$(as "$user" "$work/orion audit --config $work/audited.toml --verify; echo exit \$?")
+expect "an edited entry breaks the chain" "$out" "doesn't follow entry 1"
+expect "and verify fails" "$out" "exit 1"
+expect "the user can't touch the checkpoints" "$(as "$user" "echo x >> $work/anchors/$(id -u "$user").jsonl" 2>&1)" "Permission denied"
 
 echo "== Only the helper's group may use it"
 expect "someone outside the group can't connect" "$(as "$outsider" "$work/orion call --config $work/user.toml update_check")" "you may not use the Orion helper"

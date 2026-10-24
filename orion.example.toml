@@ -239,6 +239,9 @@ gpu = false                     # /dev/nvidia*, /dev/dri, /dev/kfd
 memory_mb = 8192                # per program; 0 for no limit
 cpu_secs = 300                  # CPU time per program
 max_file_mb = 4096              # largest file a program may write
+seccomp = true                  # refuse system calls that reach past the sandbox (ptrace, mounts, modules…)
+cgroup = true                   # a systemd scope per program: memory_mb covers page cache and all its processes
+max_processes = 512             # processes and threads per program, in its scope
 hide = ["~/.ssh", "~/.gnupg", "~/.password-store", "~/.aws", "~/.netrc", "~/.config/orion"]
 
 # `orion daemon`: one policy, audit log and sandbox for every agent. `orion

@@ -307,6 +307,7 @@ Installing packages and updates, controlling system services, changing the netwo
 - **Services:** `systemctl` start, stop, restart, reload, enable and disable of units that aren't protected. That includes the units that give a root shell on a console, such as `debug-shell.service`.
 - **GPU pins:** only Orion's `50-orion-gpu.conf` drop-in, holding only the GPU variables. A drop-in with `ExecStart=` would run anything as root.
 - **Disks:** mounts only under the mount roots, always `nosuid,nodev`, of disks the system doesn't run from; unmounts of anything but the system's own mounts.
+- **Audit checkpoints:** the helper appends the asker's audit-log checkpoints (a line count and a hash, at most one a minute) to `/var/lib/orion/audit-anchors/UID.jsonl`; no program runs. `orion audit --verify` checks them.
 - **Disk health:** only `smartctl --json=c -a --nocheck=standby` on a whole disk listed in /sys/block: reading SMART data, never changing a setting or starting a self-test.
 - **Clock and language:** `timedatectl` and `localectl` setting a time zone that exists in `/usr/share/zoneinfo`, network time on or off, a locale generated on the machine, or an XKB keyboard layout. Never the time itself.
 - **Network:** NetworkManager's Wi-Fi and connection commands as Orion makes them (no VPN imports, which can run scripts), and firewall rules that keep SSH open.

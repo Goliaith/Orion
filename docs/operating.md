@@ -462,6 +462,7 @@ Every tool call, by any model, agent or person, is one JSON line in `~/.local/st
 | `caller` | who asked: an MCP client and its pid (`"claude-code (pid 5312)"`), or a person by voice (`"ana (by voice)"`) |
 | `ok`, `error`, `duration_ms` | how it went: `ok` is false when the call was refused or failed, or when what the tool drove failed (a package manager partway), and `error` says why |
 | `ts_ms` | when, in milliseconds since 1970 |
+| `prev` | the SHA-256 of the entry before, which chains the log |
 
 ```sh
 orion audit -n 50                                          # the last 50 calls
@@ -470,7 +471,23 @@ orion audit -n 1000 | jq -c 'select(.decision == "ask") | {tool, approved, args}
 orion audit -n 1000 | jq -r '.tool' | sort | uniq -c | sort -rn   # which tools get used
 ```
 
-The log only grows. Rotate it with logrotate, or move it aside when Orion isn't running. `[audit] enabled = false` turns it off, which isn't recommended.
+### Checking nothing was changed
+
+Each entry carries the hash of the one before it, so changing, removing or inserting an entry breaks the chain at the next one. The privileged helper also keeps checkpoints, where code running as you can't reach them: as the log grows, the daemon sends it the number of entries and the last one's hash (at most once a minute), and it appends them to `/var/lib/orion/audit-anchors/UID.jsonl`, root's file. A checkpoint catches what the chain alone can't: the last entries removed, or the whole log rewritten.
+
+```sh
+orion audit --verify
+```
+
+```
+audit log:    /home/you/.local/state/orion/audit.jsonl (1532 entries)
+chain:        intact
+checkpoints:  41 by the helper, all hold; the latest 2026-10-24 09:15:02 (entry 1530)
+```
+
+When something was changed, the lines marked `!!` say which entry and how, and the command exits 1, so a timer or monitoring script notices. `orion audit --checkpoint` takes a checkpoint now, without the daemon. Without the helper there are no checkpoints, and the chain alone shows edits but not truncation. Entries written before Orion chained the log are accepted as they are.
+
+The log only grows. Rotate it with logrotate, or move it aside when Orion isn't running; a rotated log starts a new chain, and the old checkpoints then no longer hold, so verify the old log before rotating. `[audit] enabled = false` turns it off, which isn't recommended.
 
 ## Conversations and memory
 
@@ -653,5 +670,6 @@ unknown field `update`, expected one of `manager`, `allowed`, `protected`, `upda
 - **Grant root through the helper.** It does only Orion's operations, checked against a policy only root can change. A passwordless sudo rule lets anything running as you become root, not only Orion.
 - **Leave `wake_approvals` off** unless only trusted people can be heard, and enroll voices so others can't wake Orion.
 - **Keep private things private:** add your own sensitive folders to `chat.router.private_paths` (Claude never sees them) and `[sandbox] hide` (programs never see them).
-- **Read the audit log** now and then, especially after letting an agent run unattended.
+- **Read the audit log** now and then, especially after letting an agent run unattended, and run `orion audit --verify`: with the helper, nothing running as you can rewrite it unnoticed.
+- **Keep the seccomp filter and scopes on** (`[sandbox] seccomp`, `cgroup`): `orion status` should say "system calls filtered, a cgroup per program".
 - **Protect `~/.config/orion/env`** (`chmod 600`): it holds your API key.

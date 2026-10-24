@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod policy;
 pub mod remote;
 pub mod sandbox;
+pub mod seccomp;
 pub mod tool;
 pub mod tools;
 pub mod voice;
