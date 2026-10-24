@@ -42,31 +42,33 @@ w() { # w BINDIR USERUNITS SYSUNITS
     t "the orion group exists" "getent group orion"
 }'
 pkg="$works"'
-d() { t "the example policy is in the docs" "test -f /usr/share/doc/orion/orion.example.toml"; }'
+# Minimal Ubuntu, Fedora and openSUSE images install no documentation.
+e() { t "the example policy is in the docs" "test -f /usr/share/doc/orion/orion.example.toml"; }
+d() { t "the license is installed" "grep -q \"All rights reserved\" /usr/share/licenses/orion*/LICENSE"; }'
 
 check debian11 debian:bullseye "$pkg"'
 apt-get install -y -q --no-install-recommends /r/orion_${V}_amd64.deb >/dev/null 2>&1 || echo "FAIL  apt install"
-w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system; d
+w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system; d; e
 apt-get remove -y -q orion >/dev/null 2>&1; t "apt remove takes it away" "! test -e /usr/bin/orion"
 echo PASS'
 check ubuntu ubuntu:24.04 "$pkg"'
 apt-get install -y -q --no-install-recommends /r/orion_${V}_amd64.deb >/dev/null 2>&1 || echo "FAIL  apt install"
-w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system
+w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system; d
 echo PASS'
 check rocky9 rockylinux:9 "$pkg"'
 dnf install -y -q --disablerepo="*" /r/orion-${V}-1.x86_64.rpm >/dev/null 2>&1 || echo "FAIL  dnf install"
-w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system; d
+w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system; d; e
 dnf remove -y -q orion >/dev/null 2>&1; t "dnf remove takes it away" "! test -e /usr/bin/orion"
 echo PASS'
 check fedora fedora:latest "$pkg"'
 dnf install -y -q --disablerepo="*" /r/orion-${V}-1.x86_64.rpm >/dev/null 2>&1 || echo "FAIL  dnf install"
-w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system
+w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system; d
 echo PASS'
 check suse opensuse/tumbleweed "$pkg"'
 zypper -n --no-refresh install --no-recommends --allow-unsigned-rpm /r/orion-${V}-1.x86_64.rpm >/dev/null 2>&1; r=$?
 # 106: some repositories could not be refreshed (no network here)
 [ $r = 0 ] || [ $r = 106 ] || echo "FAIL  zypper install ($r)"
-w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system
+w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system; d
 echo PASS'
 # makepkg runs as a normal user, from the tarball next to the PKGBUILD.
 check arch archlinux:latest "$works"'
@@ -75,6 +77,7 @@ useradd -m b && mkdir /b && /p/pkgbuild.sh $V /r/SHA256SUMS > /b/PKGBUILD && cp 
 su b -c "cd /b && makepkg -f >/tmp/makepkg.log 2>&1" || { echo "FAIL  makepkg"; cat /tmp/makepkg.log; }
 pacman -U --noconfirm /b/orion-bin-$V-1-x86_64.pkg.tar.* >/dev/null 2>&1 || echo "FAIL  pacman -U"
 w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system
+t "the license is installed" "grep -q \"All rights reserved\" /usr/share/licenses/orion-bin/LICENSE"
 echo PASS'
 check tarball debian:bullseye "$works"'
 mkdir /x && tar -C /x -xzf /r/orion-x86_64-linux.tar.gz && sh /x/orion-x86_64-linux/install.sh >/dev/null || echo "FAIL  install.sh"
@@ -99,7 +102,7 @@ echo PASS' --network host
 if [ "$arm" = arm64 ]; then
     check arm64 debian:bullseye "$pkg"'
 apt-get install -y -q --no-install-recommends /r/orion_${V}_arm64.deb >/dev/null 2>&1 || echo "FAIL  apt install"
-w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system
+w /usr/bin /usr/lib/systemd/user /usr/lib/systemd/system; d
 echo PASS' --platform linux/arm64
 fi
 

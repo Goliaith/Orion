@@ -19,7 +19,9 @@ case $arch in
     aarch64) deb_arch=arm64 ;;
     *) echo "unknown architecture $arch (x86_64 or aarch64)" >&2; exit 2 ;;
 esac
+# An SPDX license from Cargo.toml, or proprietary with license-file.
 license=$(sed -n 's/^license *= *"\(.*\)"/\1/p' "$top/Cargo.toml")
+license=${license:-LicenseRef-Proprietary}
 summary=$(sed -n 's/^description *= *"\(.*\)"/\1/p' "$top/Cargo.toml")
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
@@ -32,7 +34,7 @@ t=$work/orion-$arch-linux
 mkdir -p "$t/systemd/user" "$t/systemd/system" "$t/docs"
 install -m 755 "$binary" "$t/orion"
 install -m 755 "$top/contrib/orion-kiosk" "$here/install.sh" "$t/"
-install -m 644 "$top/orion.example.toml" "$here/sysusers.conf" "$t/"
+install -m 644 "$top/orion.example.toml" "$here/sysusers.conf" "$top/LICENSE" "$t/"
 install -m 644 "$top/README.md" "$top/docs/install.md" "$top/docs/operating.md" "$t/docs/"
 for unit in "$top"/contrib/*.service "$top"/contrib/*.socket; do
     case $(basename "$unit") in orion-helper.*) kind=system ;; *) kind=user ;; esac
@@ -54,6 +56,8 @@ stage() { # stage ROOT
     done
     mkdir -p "$r/usr/share/doc/orion"
     install -m 644 "$t"/docs/* "$t/orion.example.toml" "$r/usr/share/doc/orion/"
+    install -m 644 "$t/LICENSE" "$r/usr/share/doc/orion/copyright"
+    install -Dm 644 "$t/LICENSE" "$r/usr/share/licenses/orion/LICENSE"
 }
 
 # The .deb.
@@ -105,7 +109,7 @@ Name: orion
 Version: $version
 Release: 1
 Summary: $summary
-License: ${license:-LicenseRef-not-specified}
+License: $license
 URL: https://github.com/Goliaith/Orion
 Requires: glibc >= 2.31
 Recommends: bubblewrap
@@ -140,6 +144,7 @@ fi
 /usr/lib/systemd/system/orion-helper.service
 /usr/lib/systemd/system/orion-helper.socket
 %doc /usr/share/doc/orion
+%license /usr/share/licenses/orion/LICENSE
 EOF
 stage "$work/tree"
 rpmbuild -bb --quiet --target "$arch-linux" \

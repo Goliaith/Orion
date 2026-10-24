@@ -895,3 +895,7 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 5. ~~**Packaging.**~~ Done: release binaries for x86_64 and aarch64 (glibc 2.31 and newer), `.deb`, `.rpm`, an Arch PKGBUILD and an install script, each installed and tested in clean containers before a release is published.
 6. ~~**Proactive monitoring.**~~ Done: the daemon watches for failed services, full disks, security updates, a due reboot and low memory, notifies the desktop, and tells the AI.
 7. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.
+
+## License
+
+Copyright (c) 2026 Goliaith. All rights reserved: Orion is proprietary, and no license is granted to use, copy, modify or distribute it without written permission. See [LICENSE](LICENSE). The third-party libraries it uses keep their own licenses.

@@ -123,6 +123,7 @@ if [ -n "$sysunits" ]; then
     getent group orion >/dev/null || groupadd --system orion
 fi
 install -m 644 "$src"/docs/* "$src/orion.example.toml" "$docdir/"
+[ ! -f "$src/LICENSE" ] || install -m 644 "$src/LICENSE" "$docdir/"
 reload
 
 echo "Installed $("$bindir/orion" --version) in $bindir."
