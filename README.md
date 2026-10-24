@@ -157,7 +157,7 @@ Firefox is using 3.1 GB of your 16 GB. I wrote the details to ~/orion-workspace/
 - **Streaming.** Replies stream as they are written. The model's progress notes and reasoning show dimmed, so long tasks don't sit silent.
 - **Every tool call is visible**, with its arguments and whether it worked.
 - **Approval prompts** show the full arguments of anything that changes the machine. `a` approves that tool for the rest of the session.
-- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/voice`, `/memory`, `/keys`, `/new`, `/history`, `/resume`, `/title`, `/exit`, plus `@claude` / `@local` prefixes and the [hotkeys](#hotkeys). Line history is kept in `~/.local/state/orion/chat_history`.
+- **Commands:** `/use`, `/route`, `/model`, `/models`, `/effort`, `/tools`, `/usage`, `/voice`, `/memory`, `/journal`, `/keys`, `/new`, `/history`, `/resume`, `/title`, `/exit`, plus `@claude` / `@local` prefixes and the [hotkeys](#hotkeys). Line history is kept in `~/.local/state/orion/chat_history`.
 - Settings live under `[chat]` in the policy file: the mode (`provider = "auto"`, `"claude"` or `"local"`) and the sections `[chat.claude]` (model, default `claude-opus-5-5`; effort; progress notes; fallbacks), `[chat.local]` and `[chat.router]`.
 
 `ANTHROPIC_AUTH_TOKEN` (an OAuth access token) also works in place of an API key.
@@ -437,7 +437,7 @@ Each person has their own conversations, and Orion remembers things about each o
   ```
 
 - **Secrets are never kept.** A note that looks like a password, key or token is refused.
-- **Private notes stay local.** A note the router would call private (health, money, private paths, …) is only given to the local model; Claude is told only that some notes are withheld.
+- **Private notes stay on this machine.** A note the router would call private (health, money, private paths, …) is only given to a local model running on this machine (or your network); Claude, or a hosted API such as Gemini behind the local backend, is told only that some notes are withheld.
 - **Limits:** at most 60 notes of 300 characters each per person, so memory stays small enough to send with every conversation.
 - **The memory part of the prompt is fixed for a conversation,** so saving a note doesn't upset Claude's prompt caching. The model knows about the new note from the tool result.
 - **You're in control:**
@@ -446,6 +446,19 @@ Each person has their own conversations, and Orion remembers things about each o
   - Memory tool calls are in the audit log, with the speaker as caller.
 - **Where it's kept:** each person's memory is one file in `~/.local/state/orion/memory/`, readable only by you. Programs the AI runs can't see it. Set `memory = false` under `[chat]` to turn memory off.
 - **On screen:** the full-screen chat and the shell show whose conversation is open and how much is remembered. `/history` and `orion conversations` show whose each conversation is.
+
+### The journal
+
+Notes are the few facts the AI should always know. The journal is for the long tail: what was done and how, what worked, where things are, and decisions with their reasons, kept by topic and found again when a message is about them. It is [HelixCore](https://github.com/Goliaith/helixcore)'s format, read and written by Orion itself, so no Python is needed, and HelixCore's package can search what Orion wrote.
+
+- **Three tools:** `journal_write` keeps an entry under a topic, `journal_decide` records a decision and why (the latest per category, as HelixCore's `persist_decision` does), and `journal_recall` searches by keywords.
+- **Recall costs no extra request.** Before each message goes to a model, Orion searches that person's journal on this machine and adds the best matches (up to 3, each sharing at least two of the message's words) to the message under "From Orion's journal". The prompt itself only names the topics, so it stays small. That matters on Gemini's free tier, where every tool round is one more request.
+- **Search is HelixCore's:** keyword overlap counts three quarters and recency one quarter, fading to nothing after 90 days. It is plain keyword matching, fast on a CPU, with no embeddings.
+- **Topics link up.** Each decision runs HelixCore's link pass, which links topics whose words overlap; `/journal` shows the strongest links.
+- **Each person's own.** A person's topics are the HelixCore slugs that start with their name (`ana_thesis-code`), and nobody else's are searched, listed or linked.
+- **Secrets are refused, and private entries stay on this machine,** as with notes.
+- **`/journal`** lists the topics, `/journal <topic>` shows one, and `/journal search <words>` searches them all. Journal tool calls are in the audit log.
+- **Where it's kept:** `~/.local/state/orion/helix/.grok/state/` (`semantic/`, `tasks/`, `synaptic/`), readable only by you and hidden from programs the AI runs. `[chat.journal]` turns it off (`enabled = false`), turns off automatic recall (`auto_recall = false`), or moves it (`home`, which the sandbox then hides too).
 
 ### Hotkeys
 

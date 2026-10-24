@@ -187,7 +187,7 @@ fn network_note(b: Backend) -> String {
 pub fn hidden_paths(policy: &Policy) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     // Orion's own state too: conversations, the audit log, the shell's
-    // token and the voiceprint are nothing a program needs.
+    // token, the voiceprint and the journal are nothing a program needs.
     let state = Policy::state_dir();
     for p in policy
         .sandbox
@@ -195,6 +195,8 @@ pub fn hidden_paths(policy: &Policy) -> Vec<PathBuf> {
         .iter()
         .chain(&policy.chat.router.private_paths)
         .chain(state.as_ref())
+        // The AI's journal, wherever it is kept.
+        .chain(policy.chat.journal.home.as_ref())
     {
         let p = expand_home(p);
         let p = p.canonicalize().unwrap_or(p);
@@ -793,6 +795,12 @@ mod tests {
         assert_ne!(sh(&p, &script).0, 0, "no TCP");
         let open = policy(dir.path(), mode, "network = true");
         assert_eq!(sh(&open, &script).0, 0, "network = true allows it");
+    }
+
+    #[test]
+    fn hides_the_journal_wherever_it_is() {
+        let p = Policy::from_toml("[chat.journal]\nhome = \"/srv/helix\"\n[audit]\nenabled = false\n").unwrap();
+        assert!(hidden_paths(&p).contains(&PathBuf::from("/srv/helix")));
     }
 
     #[test]

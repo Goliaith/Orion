@@ -10,6 +10,7 @@
 
 mod agent;
 mod classifier;
+pub mod journal;
 pub mod memory;
 pub mod listen;
 pub mod claude;
@@ -56,6 +57,7 @@ pub struct ChatConfig {
     pub claude: claude::ClaudeConfig,
     pub local: local::LocalConfig,
     pub router: router::RouterConfig,
+    pub journal: journal::JournalConfig,
 }
 
 impl Default for ChatConfig {
@@ -70,6 +72,7 @@ impl Default for ChatConfig {
             claude: Default::default(),
             local: Default::default(),
             router: Default::default(),
+            journal: Default::default(),
         }
     }
 }
@@ -250,6 +253,9 @@ pub fn connect(orion: &Orion, provider: Provider, model: Option<&str>) -> Result
     let mut tools = offered_tools(orion);
     if config.memory {
         tools.extend(memory::tool_specs());
+    }
+    if config.journal.enabled {
+        tools.extend(journal::tool_specs());
     }
     Ok(match provider {
         Provider::Claude => {

@@ -149,6 +149,9 @@ model = ""                      # empty: the first model the server lists
 # api_key_env = "LOCAL_LLM_KEY" # for servers that want a bearer token
 # reasoning_effort = "low"      # how hard a thinking model thinks; Gemini:
                                 # none (2.5 only), minimal, low, medium, high
+# on_machine = true             # unset: true for loopback and private-network
+                                # URLs. Only a server on this machine is given
+                                # private messages, notes and journal entries.
 
 # How `auto` picks a model for each message. Private messages stay local and
 # short follow-ups ("yes, do it") stay with the last model, both by rule.
@@ -176,6 +179,14 @@ complex_words = ["code", "script", "program", "debug", "refactor", "implement", 
                  "optimize", "optimise", "write", "draft", "review", "why", "strategy",
                  "algorithm", "step by step"]
 long_request_words = 60         # longer messages go to Claude
+
+# The AI's journal: entries and decisions by topic, in HelixCore's format,
+# recalled when a message is about them (see "The journal" in the README).
+[chat.journal]
+enabled = true
+auto_recall = true              # add matching entries to each message
+recall_limit = 3                # at most this many per message
+# home = "~/.local/state/orion/helix"   # HELIXCORE_HOME; hidden from programs
 
 # Voice in the chat: Ctrl-T to talk, `/voice speak on` to hear replies.
 # Everything here runs on this machine unless a URL points elsewhere.
