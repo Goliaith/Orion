@@ -17,6 +17,9 @@ execute = "ask"     # run programs
 # fs_write = "allow"
 # proc_run = "deny"
 # gpu_info = "deny"
+# settings_tune always asks, even if set to "allow" here. What it tuned with
+# your approval is in tuning.toml beside this file, which can pre-approve only
+# write tools that have no entry here.
 
 [fs]
 # Trees the AI may read (write roots are readable too).

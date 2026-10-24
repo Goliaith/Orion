@@ -3,7 +3,8 @@
 //! pending security updates, a reboot that is due, memory running out,
 //! parts running hot, a worn battery, bursts of errors and the kernel's
 //! hardware complaints in the journal, repeated failed logins, and voice
-//! listening that goes wrong (see `voice::tuning`).
+//! listening that goes wrong (see `voice::tuning`), and other settings that
+//! keep getting in the way (see `tuning`).
 //!
 //! The daemon runs the checks every `[watch] interval_mins` (updates and
 //! disk health every `updates_hours`, since they take a moment), keeps the findings,
@@ -44,7 +45,7 @@ pub struct WatchConfig {
     pub notify: bool,
     /// Findings to leave out, by key (`*` wildcards): "service:backup.service",
     /// "disk:/mnt/archive", "updates", "reboot", "memory", "health:sda",
-    /// "temp:*", "battery:*", "errors:*", "kernel:*", "logins", "voice:*".
+    /// "temp:*", "battery:*", "errors:*", "kernel:*", "logins", "voice:*", "tune:*".
     pub ignore: Vec<String>,
     /// Drives' own SMART data (needs smartctl, and root through the helper).
     pub disk_health: bool,
@@ -475,6 +476,22 @@ fn voice(policy: &Policy) -> Vec<Finding> {
         .collect()
 }
 
+/// Other settings that keep getting in the way: rate limits, slow speech to
+/// text, approvals always given (see `tuning`).
+fn tuning(policy: &Policy) -> Vec<Finding> {
+    crate::tuning::current(policy)
+        .into_iter()
+        .map(|s| {
+            let hint = if s.change.as_object().is_some_and(|c| !c.is_empty()) {
+                format!("settings_tune {{\"apply\": \"{}\"}} fixes it, with the person's go-ahead; settings_check has the details", s.key)
+            } else {
+                "settings_check has the details".to_string()
+            };
+            Finding { key: s.key, severity: "warning".into(), title: s.title, detail: s.why, hint, since: None }
+        })
+        .collect()
+}
+
 pub fn check(policy: &Policy, with_updates: bool) -> Vec<Finding> {
     let w = &policy.watch;
     let mut all = services();
@@ -485,6 +502,7 @@ pub fn check(policy: &Policy, with_updates: bool) -> Vec<Finding> {
     all.extend(batteries(w.battery_health_percent));
     all.extend(journal_checks(policy));
     all.extend(voice(policy));
+    all.extend(tuning(policy));
     if with_updates {
         all.extend(slow(policy));
     }
