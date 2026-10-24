@@ -677,7 +677,7 @@ The desktop tools act on the session of the person logged in: its sound server, 
 Many desktop apps (Discord, Spotify, Steam, Zoom) are on Flathub rather than in the distribution's repositories. `flatpak_search` finds them, `flatpak_install` installs one by app id (`com.discordapp.Discord`), and `flatpak_remove` uninstalls it; `app_open` then starts it.
 
 - **Outside the sandbox.** `proc_run` programs have no network, so a `flatpak install` (or `dnf install`) through `proc_run` is refused before you are asked, with a pointer to the right tool.
-- **System-wide by default,** as Discover and GNOME Software install. Orion runs `flatpak` as you first, which polkit allows for desktop admins on most distributions, and as root through `[admin] elevate` (the helper) if polkit says no. `scope: "user"` installs only for you, with no root.
+- **System-wide by default,** as Discover and GNOME Software install. Orion runs `flatpak` as you first, which polkit allows for desktop admins on most distributions, and as root through `[admin] elevate` (the helper) if polkit says no. Under `orion.service`, whose `NoNewPrivileges` stops the setuid `fusermount3` Flatpak needs for that, system-wide changes go straight to the helper, and without one they are refused before you are asked. `scope: "user"` installs only for you, with no root.
 - **Only from `[flatpak] remotes`** (default `["flathub"]`). The app and the remote are checked before you are asked. The helper runs only Orion's own `flatpak install` and `uninstall` lines, from the remotes in its own policy.
 - **`[flatpak] allowed`** pre-approves apps by id (wildcards work), e.g. `["com.discordapp.Discord"]`.
 
