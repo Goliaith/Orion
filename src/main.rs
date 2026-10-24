@@ -218,6 +218,7 @@ enum Cmd {
     },
     /// Connect a model: choose Claude, Gemini or a local server, paste the
     /// key, and Orion checks it and writes orion.toml and ~/.config/orion/env.
+    /// Then choose what Orion may do without asking.
     Setup {
         /// claude, gemini or local (asked otherwise).
         #[arg(long, value_parser = ["claude", "gemini", "local"])]
@@ -228,6 +229,10 @@ enum Cmd {
         /// A local server's OpenAI-compatible URL, such as http://127.0.0.1:8080/v1.
         #[arg(long)]
         base_url: Option<String>,
+        /// What Orion may do without asking: ask (ask me everything),
+        /// everyday or hands-off. Alone, it changes only that.
+        #[arg(long, value_parser = ["ask", "everyday", "hands-off"])]
+        trust: Option<String>,
         /// Take every default, and the key already in the environment.
         #[arg(long, short)]
         yes: bool,
@@ -287,8 +292,8 @@ fn main() -> Result<()> {
     orion::envfile::load();
     // These two fix a policy that doesn't load, so they don't need it to.
     match cli.command {
-        Cmd::Setup { provider, model, base_url, yes } => {
-            return orion::setup::run(cli.config.as_deref(), orion::setup::Options { provider, model, base_url, yes });
+        Cmd::Setup { provider, model, base_url, trust, yes } => {
+            return orion::setup::run(cli.config.as_deref(), orion::setup::Options { provider, model, base_url, trust, yes });
         }
         Cmd::Doctor { yes, no_fix } => return orion::doctor::run(cli.config.as_deref(), orion::doctor::Options { yes, no_fix }),
         _ => {}

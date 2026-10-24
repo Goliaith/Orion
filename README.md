@@ -102,6 +102,18 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 
 Out of the box the AI can look at the machine freely. Changing it (writing files, running programs, managing services, packages and models) needs your approval each time. With no human present (`orion serve`), "ask" means no. \* Turning the volume up or down, the panel's brightness and locking the screen are pre-approved by `[desktop] approved`, because they are harmless and easily undone; the rest of those tools ask.
 
+### Trust levels
+
+`orion setup` asks how much Orion may do without asking, and writes the matching settings into orion.toml. `orion setup --trust everyday` (or `ask`, `hands-off`) changes only that, and `orion doctor` says which level the policy is on, or which it is nearest when you've changed it by hand.
+
+| Level | Runs without asking | Writes |
+|---|---|---|
+| Ask me everything | nothing that changes the machine, not even the volume | `[defaults] write` and `execute` = `ask`; `[desktop] approved`, `apps`, `[flatpak]`, `[packages]`, `[services] allowed` and `[proc] allowed_commands` emptied; `[packages] updates = "ask"` |
+| Everyday | Flatpak installs, volume and brightness, locking the screen, opening apps and files, and starting, stopping and restarting the services in `[services] allowed` | `[desktop] approved = ["volume", "brightness", "lock", "open"]`, `apps = ["*"]`, `[flatpak] allowed = ["*"]`; your own `[services] allowed`, or `ollama.service` and `llama-server.service` when it names none. Package installs, updates and your `allowed_commands` are left as they are |
+| Hands-off | everything: files, programs, packages, services, rebooting | `[defaults] write` and `execute` = `allow`, every allow-list `["*"]`, `[packages] updates = "all"` |
+
+The hard limits are the same at every level: the writable roots, protected services, packages and mounts, the Flatpak remotes, the sandbox, and `settings_tune`, which always asks. Under Hands-off, updates that would remove packages are refused rather than run. A `[tools]` entry set to `allow` stays as it is; setup and doctor name any that let a tool run unasked beyond the level. The old file is kept as `orion.toml.bak`.
+
 ## Install
 
 Linux only, because the tools read `/proc` and `/sys` directly. Each [release](https://github.com/Goliaith/Orion/releases) has binaries for x86_64 and aarch64 that run on Debian 11, Ubuntu 20.04, RHEL 9 and anything newer, as a `.deb`, an `.rpm`, an Arch PKGBUILD, and a tarball with an install script:
@@ -556,6 +568,7 @@ Things to know:
 
 ```sh
 orion setup                                   # connect Claude, Gemini or a local model: checks the key, writes the files
+orion setup --trust everyday                  # only change what runs without asking: ask, everyday or hands-off
 orion doctor                                  # check the policy, keys, models, voice, sandbox and helper; offers fixes
 orion tools                                   # every tool, its risk, and the policy decision
 orion call system_info                        # call a tool yourself, exactly as the AI would (prompts for "ask" tools)
