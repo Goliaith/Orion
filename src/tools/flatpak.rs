@@ -206,16 +206,19 @@ fn check_install(policy: &Policy, a: &InstallArgs) -> Result<(String, String)> {
     require_flatpak()?;
     let configured = remotes(a.scope)?;
     if !configured.iter().any(|r| r == &remote) {
-        let flathub = remote == "flathub";
+        let other = if a.scope == Scope::User { Scope::System } else { Scope::User };
+        if remotes(other).is_ok_and(|r| r.contains(&remote)) {
+            bail!("{remote} is set up for the {} installation, not the {} one: install with scope {}", other.name(), a.scope.name(), other.name());
+        }
+        // Adding a remote needs the network, which proc_run doesn't have.
         bail!(
-            "there is no {} remote {remote}{}",
-            a.scope.name(),
-            if flathub {
-                " (add it with: flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo)"
-            } else {
-                ""
-            }
+            "there is no remote {remote}. The owner can add it in a terminal: flatpak remote-add {} --if-not-exists {remote} <its .flatpakrepo URL>{}",
+            a.scope.flag(),
+            if remote == "flathub" { " (https://dl.flathub.org/repo/flathub.flatpakrepo)" } else { "" }
         );
+    }
+    if a.scope == Scope::System {
+        system_route(policy)?;
     }
     if let Some(v) = installed_in(&app, a.scope) {
         bail!("{app} is already installed ({}{}); app_open starts it", a.scope.name(), if v.is_empty() { String::new() } else { format!(", {v}") });
@@ -236,24 +239,52 @@ fn uninstall_argv(app: &str) -> Vec<String> {
     ["uninstall", "--system", "--app", "--noninteractive", "-y", "--", app].map(String::from).to_vec()
 }
 
-/// Run a system-wide `flatpak` command as you, and if polkit says no, as
-/// root; user ones only as you. (finished, elevated).
+/// Whether this process may not gain privileges, as under orion.service's
+/// `NoNewPrivileges=yes`. Then setuid programs don't work: not sudo, and
+/// not the `fusermount3` that Flatpak needs to install system-wide as you.
+fn no_new_privs() -> bool {
+    std::fs::read_to_string("/proc/self/status").is_ok_and(|s| s.lines().any(|l| l.split_whitespace().eq(["NoNewPrivs:", "1"])))
+}
+
+/// How a system-wide install or removal runs: `None` as you (polkit
+/// decides), else as root through the helper. Refused, before anyone is
+/// asked, where neither can work.
+fn system_route(policy: &Policy) -> Result<Option<exec::Elevation>> {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 || !no_new_privs() {
+        return Ok(None);
+    }
+    match exec::elevation(policy)? {
+        Some(helper @ exec::Elevation::Helper(_)) => Ok(Some(helper)),
+        _ => bail!(
+            "Orion runs with NoNewPrivileges (orion.service), so Flatpak can't install system-wide as you, and \
+             there is no Orion helper to do it as root. Set up the helper (docs/install.md, root access for the \
+             machine tools), or install with scope user if the user installation has the remote"
+        ),
+    }
+}
+
+/// Run a system-wide `flatpak` command along `system_route`: as you first,
+/// and as root if polkit or FUSE says no. User ones only as you.
+/// (finished, elevated).
 fn run(policy: &Policy, scope: Scope, argv: Vec<String>) -> Result<(exec::Finished, bool)> {
     let timeout = Duration::from_secs(policy.packages.timeout_secs.max(30));
     let attempt = |how: Option<&exec::Elevation>, argv: &[String]| exec::run_as(how, "flatpak", argv, None, timeout, 256 << 10);
-    let mut direct = argv.clone();
     if scope == Scope::User {
+        let mut direct = argv;
         direct[1] = "--user".into();
         return Ok((attempt(None, &direct)?, false));
     }
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
-        return Ok((attempt(None, &argv)?, false));
+    if let Some(helper) = system_route(policy)? {
+        return Ok((attempt(Some(&helper), &argv)?, true));
     }
     let done = attempt(None, &argv)?;
     let e = done.stderr.to_lowercase();
-    let denied = e.contains("not allowed for user") || e.contains("not authorized") || e.contains("authentication");
-    if !done.success() && denied {
+    let denied = ["not allowed for user", "not authorized", "authentication", "fusermount", "operation not permitted"]
+        .iter()
+        .any(|m| e.contains(m));
+    // SAFETY: geteuid has no preconditions.
+    if !done.success() && denied && unsafe { libc::geteuid() } != 0 {
         if let Some(how) = exec::elevation(policy)? {
             return Ok((attempt(Some(&how), &argv)?, true));
         }
@@ -335,10 +366,13 @@ struct RemoveArgs {
     scope: Scope,
 }
 
-fn check_remove(a: &RemoveArgs) -> Result<String> {
+fn check_remove(policy: &Policy, a: &RemoveArgs) -> Result<String> {
     let app = app_id(&a.app)?.to_string();
     require_flatpak()?;
     ensure!(installed_in(&app, a.scope).is_some(), "{app} isn't installed ({})", a.scope.name());
+    if a.scope == Scope::System {
+        system_route(policy)?;
+    }
     Ok(app)
 }
 
@@ -369,13 +403,13 @@ impl Tool for FlatpakRemove {
         })
     }
 
-    fn precheck(&self, _policy: &Policy, args: &Value) -> Result<()> {
-        check_remove(&parse_args(args.clone())?).map(drop)
+    fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
+        check_remove(policy, &parse_args(args.clone())?).map(drop)
     }
 
     fn call(&self, policy: &Policy, args: Value) -> Result<Value> {
         let a: RemoveArgs = parse_args(args)?;
-        let app = check_remove(&a)?;
+        let app = check_remove(policy, &a)?;
         let (done, elevated) = run(policy, a.scope, uninstall_argv(&app))?;
         let mut out = json!({ "ok": done.success(), "app": app, "scope": a.scope.name(), "elevated": elevated, "output": tail(&done.stdout) });
         if !done.success() {
