@@ -58,6 +58,11 @@ protected = ["orion.*", "orion-*", "ssh.service", "sshd.service", "systemd-*", "
              "debug-shell.service", "emergency.service", "rescue.service", "serial-getty@*", "container-getty@*",
              "autovt@*", "console-getty.service"]
 
+# Flatpak apps (flatpak_search, flatpak_install, flatpak_remove).
+[flatpak]
+allowed = []                    # flatpak_install without asking, e.g. ["com.discordapp.Discord"]
+remotes = ["flathub"]           # where apps may come from; the first is the default
+
 # The package manager (pkg_list, pkg_search, pkg_info, pkg_install, pkg_remove).
 [packages]
 manager = "auto"                # apt, dnf, zypper or pacman

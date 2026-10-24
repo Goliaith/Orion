@@ -117,7 +117,11 @@ fn services() -> Vec<Finding> {
         ));
     }
     let user = crate::tools::exec::output("systemctl", &["--user", "list-units", "--state=failed", "--plain", "--no-legend", "--no-pager"]);
-    for unit in user.unwrap_or_default().lines().filter_map(|l| l.split_whitespace().next()) {
+    // Desktop autostart entries (app-…@autostart.service) often exit with an
+    // error on desktops they weren't written for, like imsettings on KDE, and
+    // nothing depends on them.
+    let autostart = |u: &&str| crate::tools::exec::glob_match("app-*@autostart.service", u);
+    for unit in user.unwrap_or_default().lines().filter_map(|l| l.split_whitespace().next()).filter(|u| !autostart(u)) {
         out.push(finding(
             format!("service:{unit}"),
             false,

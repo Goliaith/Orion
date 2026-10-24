@@ -70,6 +70,9 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `pkg_info`     | read    | allow   | One package: installed and available versions, description, dependencies |
 | `pkg_install`  | execute | ask     | Install packages, as root and outside the sandbox |
 | `pkg_remove`   | execute | ask     | Remove packages, refused if the system or the policy needs them |
+| `flatpak_search` | read  | allow   | Search Flathub (and other Flatpak remotes) for apps |
+| `flatpak_install` | execute | ask  | Install a Flatpak app, like Discord, outside the sandbox |
+| `flatpak_remove` | execute | ask   | Uninstall a Flatpak app |
 | `update_check` | read    | allow   | Pending updates (security fixes and kernels marked), services to restart, reboot needed |
 | `update_apply` | execute | ask     | Install updates: all, security fixes only, or named packages |
 | `pkg_history`  | read    | allow   | Every package change Orion made: versions before and after, snapshots, rollbacks |
@@ -646,6 +649,15 @@ The desktop tools act on the session of the person logged in: its sound server, 
 - **Removal is guarded.** A removal is refused, before you are asked, if it would take away a package the system marks essential or required, or one in `[packages] protected` (the kernel, systemd, sudo, ssh, libc, the package manager, bubblewrap, …). That holds even when the package would only go as a dependent of what you named, or be replaced by one you install.
 - **`[packages] allowed`** pre-approves installs by name (wildcards work), e.g. `["python3-*"]`.
 - **Installs run as root and outside the sandbox,** because package scripts need that. That is why both tools are `execute`. As a normal user Orion uses `sudo -n`, which needs a `NOPASSWD` rule for the package manager, or set `[admin] elevate = "pkexec"` for a graphical password prompt ([sudoers examples](docs/install.md#6-root-access-for-the-machine-tools)).
+
+### Flatpak apps
+
+Many desktop apps (Discord, Spotify, Steam, Zoom) are on Flathub rather than in the distribution's repositories. `flatpak_search` finds them, `flatpak_install` installs one by app id (`com.discordapp.Discord`), and `flatpak_remove` uninstalls it; `app_open` then starts it.
+
+- **Outside the sandbox.** `proc_run` programs have no network, so a `flatpak install` (or `dnf install`) through `proc_run` is refused before you are asked, with a pointer to the right tool.
+- **System-wide by default,** as Discover and GNOME Software install. Orion runs `flatpak` as you first, which polkit allows for desktop admins on most distributions, and as root through `[admin] elevate` (the helper) if polkit says no. `scope: "user"` installs only for you, with no root.
+- **Only from `[flatpak] remotes`** (default `["flathub"]`). The app and the remote are checked before you are asked. The helper runs only Orion's own `flatpak install` and `uninstall` lines, from the remotes in its own policy.
+- **`[flatpak] allowed`** pre-approves apps by id (wildcards work), e.g. `["com.discordapp.Discord"]`.
 
 ### System updates
 

@@ -190,6 +190,24 @@ impl Default for PackagesPolicy {
     }
 }
 
+/// `[flatpak]`: Flatpak apps (Flathub).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlatpakPolicy {
+    /// Apps `flatpak_install` may install without asking, by app id (`*`
+    /// wildcards): `["com.discordapp.Discord", "org.mozilla.*"]`.
+    pub allowed: Vec<String>,
+    /// The remotes apps may come from; the first is the default. No
+    /// approval can install from another.
+    pub remotes: Vec<String>,
+}
+
+impl Default for FlatpakPolicy {
+    fn default() -> Self {
+        Self { allowed: Vec::new(), remotes: vec!["flathub".into()] }
+    }
+}
+
 /// `[desktop]`: sound, screens, power, Bluetooth, apps and the clock.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -297,6 +315,7 @@ pub struct Policy {
     pub admin: AdminPolicy,
     pub services: ServicesPolicy,
     pub packages: PackagesPolicy,
+    pub flatpak: FlatpakPolicy,
     pub models: ModelsPolicy,
     pub disks: DisksPolicy,
     pub desktop: DesktopPolicy,

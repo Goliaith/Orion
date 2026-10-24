@@ -287,6 +287,8 @@ fn spoken_action(tool: &str, args: &Value) -> String {
         "svc_control" => format!("{} {}", s("action"), unit(s("unit"))),
         "pkg_install" => format!("install {}", list("packages")),
         "pkg_remove" => format!("remove {}", list("packages")),
+        "flatpak_install" => format!("install {}", s("app")),
+        "flatpak_remove" => format!("remove {}", s("app")),
         "model_load" => format!("load the model {}", s("model")),
         "model_unload" => format!("unload the model {}", s("model")),
         "model_pull" => format!("download the model {}", s("model")),
