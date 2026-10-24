@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::http::{non_empty_env, sse_data, Http};
+use super::http::{non_empty_env, secret_env, sse_data, Http};
 use super::{Backend, Event, Reply, Stop, ToolCall, ToolResult, ToolSpec, Usage};
 
 const API_VERSION: &str = "2023-06-01";
@@ -68,9 +68,9 @@ impl Client {
     /// (an OAuth access token). `ANTHROPIC_BASE_URL` overrides `base_url`.
     pub fn from_env(base_url: &str) -> Result<Self> {
         let base = non_empty_env("ANTHROPIC_BASE_URL").unwrap_or_else(|| base_url.to_string());
-        if let Some(key) = non_empty_env("ANTHROPIC_API_KEY") {
+        if let Some(key) = secret_env("ANTHROPIC_API_KEY")? {
             Ok(Self::with_api_key(&base, &key))
-        } else if let Some(token) = non_empty_env("ANTHROPIC_AUTH_TOKEN") {
+        } else if let Some(token) = secret_env("ANTHROPIC_AUTH_TOKEN")? {
             let headers = vec![("authorization".into(), format!("Bearer {token}"))];
             Ok(Self { http: Http::new(&base, headers), auth_betas: vec!["oauth-2025-04-20"] })
         } else {
