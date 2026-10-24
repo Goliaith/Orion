@@ -54,10 +54,16 @@ fn parse_versions(text: &str) -> Versions {
         if f.len() < 3 || !f[0].starts_with("ii") || f[1] == "gpg-pubkey" {
             continue;
         }
-        let version = f[2].strip_prefix("(none):").unwrap_or(f[2]);
-        out.entry(f[1].to_string()).or_default().insert(version.to_string());
+        out.entry(f[1].to_string()).or_default().insert(bare_epoch(f[2]).to_string());
     }
     out
+}
+
+/// A version without an empty epoch: rpm prints a missing one as "(none)"
+/// and some packages carry an explicit 0; both mean none, as dnf shows it.
+/// (Older history entries may still hold the "0:".)
+fn bare_epoch(version: &str) -> &str {
+    version.strip_prefix("(none):").or_else(|| version.strip_prefix("0:")).unwrap_or(version)
 }
 
 /// One package a change moved: installed (`from` none), removed (`to`
@@ -376,7 +382,8 @@ fn restore_plan(policy: &Policy, m: Manager, change: &Change, cache: &Path) -> R
     let protected = |name: &str| policy.packages.protected.iter().any(|p| exec::glob_match(p, name.split(':').next().unwrap_or(name)));
     let now = versions(m)?;
     for p in &change.packages {
-        match (&p.from, &p.to) {
+        let (from, to) = (p.from.as_deref().map(bare_epoch).map(String::from), p.to.as_deref().map(bare_epoch).map(String::from));
+        match (&from, &to) {
             (Some(from), _) => {
                 if now.get(&p.name).is_some_and(|v| v.contains(from)) {
                     continue; // already back
@@ -752,11 +759,12 @@ mod tests {
     #[test]
     fn notes_what_moved() {
         let before = parse_versions(
-            "ii \tcurl\t8.5.0-2\nii \tlibc6:i386\t2.39-0\nrc \told\t1.0\nii\tkernel-core\t(none):6.1-1\nii\tgpg-pubkey\tx\nii\tgone\t1.0\n",
+            "ii \tcurl\t8.5.0-2\nii \tlibc6:i386\t2.39-0\nrc \told\t1.0\nii\tkernel-core\t(none):6.1-1\nii\tgpg-pubkey\tx\nii\tgone\t1.0\nii\tperl-File-Find\t0:1.44-525\n",
         );
         assert_eq!(before["kernel-core"].iter().next().unwrap(), "6.1-1");
+        assert_eq!(before["perl-File-Find"].iter().next().unwrap(), "1.44-525");
         assert!(!before.contains_key("old") && !before.contains_key("gpg-pubkey"));
-        let after = parse_versions("ii\tcurl\t8.5.0-3\nii\tlibc6:i386\t2.39-0\nii\tkernel-core\t6.1-1\nii\tkernel-core\t6.2-1\nii\tnew\t1:2.0\n");
+        let after = parse_versions("ii\tperl-File-Find\t1.44-525\nii\tcurl\t8.5.0-3\nii\tlibc6:i386\t2.39-0\nii\tkernel-core\t6.1-1\nii\tkernel-core\t6.2-1\nii\tnew\t1:2.0\n");
         let moved = diff(&before, &after);
         let m = |n: &str, f: Option<&str>, t: Option<&str>| Moved { name: n.into(), from: f.map(String::from), to: t.map(String::from) };
         assert_eq!(

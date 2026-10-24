@@ -578,6 +578,46 @@ pub fn parse_ufw(text: &str) -> Value {
     json!({ "active": active, "defaults": defaults, "rules": rules })
 }
 
+/// `firewall-cmd --list-all`: the zone, its target, and what it lets in
+/// (services, ports, rich rules).
+pub fn parse_firewalld(text: &str) -> Value {
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or_default().trim();
+    let zone = header.split_once(" (").map_or(header, |(z, _)| z);
+    let mut out = json!({ "zone": zone });
+    let mut rich = Vec::new();
+    let mut in_rich = false;
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if in_rich && (line.starts_with('\t') || t.starts_with("rule ")) {
+            rich.push(json!(t));
+            continue;
+        }
+        in_rich = false;
+        let Some((key, value)) = t.split_once(':') else { continue };
+        let value = value.trim();
+        match key {
+            "target" => out["target"] = json!(value),
+            "interfaces" | "sources" | "services" | "ports" | "protocols" | "forward-ports" | "source-ports" | "icmp-blocks" => {
+                out[key.replace('-', "_")] = json!(value.split_whitespace().collect::<Vec<_>>());
+            }
+            "masquerade" | "forward" => out[key] = json!(value == "yes"),
+            "rich rules" => {
+                in_rich = true;
+                if !value.is_empty() {
+                    rich.push(json!(value));
+                }
+            }
+            _ => {}
+        }
+    }
+    out["rich_rules"] = json!(rich);
+    out
+}
+
 pub struct FwStatus;
 
 impl Tool for FwStatus {
@@ -618,7 +658,11 @@ impl Tool for FwStatus {
             Firewall::Firewalld => {
                 let state = admin(policy, "firewall-cmd", &["--state".to_string()], None)?;
                 let all = admin_ok(policy, "firewall-cmd", &["--list-all"]).unwrap_or_default();
-                json!({ "manager": "firewalld", "active": state.stdout.trim() == "running", "zone": all.trim(), "ssh_ports": ssh })
+                let mut v = parse_firewalld(&all);
+                v["manager"] = json!("firewalld");
+                v["active"] = json!(state.stdout.trim() == "running");
+                v["ssh_ports"] = json!(ssh);
+                v
             }
         })
     }
@@ -695,12 +739,15 @@ pub fn firewalld_args(action: &str, proto: &str, from: Option<&str>, lo: u16, hi
     match (action, from) {
         ("allow", None) => vec!["--permanent".into(), format!("--{verb}-port={port}/{proto}")],
         _ => {
-            let family = if from.is_some_and(|f| f.contains(':')) { "ipv6" } else { "ipv4" };
-            let source = from.map(|f| format!(" source address=\"{f}\"")).unwrap_or_default();
+            // A rich rule with no family covers IPv4 and IPv6 alike; one is
+            // needed only with a source address.
+            let source = from
+                .map(|f| format!(" family=\"{}\" source address=\"{f}\"", if f.contains(':') { "ipv6" } else { "ipv4" }))
+                .unwrap_or_default();
             let verdict = if action == "allow" { "accept" } else { "reject" };
             vec![
                 "--permanent".into(),
-                format!("--{verb}-rich-rule=rule family=\"{family}\"{source} port port=\"{port}\" protocol=\"{proto}\" {verdict}"),
+                format!("--{verb}-rich-rule=rule{source} port port=\"{port}\" protocol=\"{proto}\" {verdict}"),
             ]
         }
     }
@@ -934,6 +981,31 @@ mod tests {
         assert!(!ok("firewall-cmd", &["--permanent", "--add-rich-rule=rule family=\"ipv4\" port port=\"22\" protocol=\"tcp\" reject"]));
         assert!(!ok("firewall-cmd", &["--permanent", "--set-default-zone=drop"]));
         assert!(!ok("firewall-cmd", &["--panic-on"]));
+    }
+
+    #[test]
+    fn parses_firewalld() {
+        let v = parse_firewalld(
+            "FedoraWorkstation (default, active)\n  target: default\n  ingress-priority: 0\n  icmp-block-inversion: no\n  \
+             interfaces: wlo1\n  sources: \n  services: dhcpv6-client samba-client ssh\n  ports: 1025-65535/udp 1025-65535/tcp\n  \
+             protocols: \n  forward: yes\n  masquerade: no\n  forward-ports: \n  source-ports: \n  icmp-blocks: \n  rich rules: \n\t\
+             rule port port=\"5999\" protocol=\"tcp\" reject\n\trule family=\"ipv4\" source address=\"10.0.0.5\" port port=\"3306\" protocol=\"tcp\" reject\n",
+        );
+        assert_eq!(v["zone"], "FedoraWorkstation");
+        assert_eq!(v["target"], "default");
+        assert_eq!(v["interfaces"], json!(["wlo1"]));
+        assert_eq!(v["sources"], json!([]));
+        assert_eq!(v["services"], json!(["dhcpv6-client", "samba-client", "ssh"]));
+        assert_eq!(v["ports"], json!(["1025-65535/udp", "1025-65535/tcp"]));
+        assert_eq!(v["masquerade"], false);
+        assert_eq!(v["rich_rules"].as_array().unwrap().len(), 2);
+        assert_eq!(v["rich_rules"][0], "rule port port=\"5999\" protocol=\"tcp\" reject");
+        // A deny with no source covers IPv6 too: no family.
+        assert_eq!(firewalld_args("deny", "tcp", None, 5999, 5999, false)[1], "--add-rich-rule=rule port port=\"5999\" protocol=\"tcp\" reject");
+        assert_eq!(
+            firewalld_args("deny", "tcp", Some("fd00::/8"), 22, 22, false)[1],
+            "--add-rich-rule=rule family=\"ipv6\" source address=\"fd00::/8\" port port=\"22\" protocol=\"tcp\" reject"
+        );
     }
 
     #[test]
