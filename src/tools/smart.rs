@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -138,9 +138,12 @@ pub fn check(policy: &Policy) -> Result<Vec<Disk>> {
         // smartctl's exit code is a bit mask that is nonzero for a failing
         // disk too; the JSON says what happened.
         let v: Value = serde_json::from_str(&done.stdout).unwrap_or(Value::Null);
+        // No JSON at all: smartctl never ran (sudo -n wanted a password, the
+        // helper refused, permission denied). Say so rather than report no disks.
         if v.is_null() {
-            ensure!(!done.complaint().contains("Permission denied"), "reading SMART needs root: set up the privileged helper");
-            continue;
+            let why = done.complaint();
+            ensure!(!why.contains("Permission denied"), "reading SMART needs root: set up the privileged helper");
+            bail!("couldn't read {device}'s SMART data: {why} (disk health needs root: the privileged helper, or a sudo rule for smartctl)");
         }
         let messages = v["smartctl"]["messages"].to_string();
         ensure!(!messages.contains("Permission denied"), "reading SMART needs root: set up the privileged helper");

@@ -154,6 +154,10 @@ as "$user" "sed -i 's/\"tool\":\"system_info\"/\"tool\":\"fs_list\"/' /home/$use
 out=$(as "$user" "$work/orion audit --config $work/audited.toml --verify; echo exit \$?")
 expect "an edited entry breaks the chain" "$out" "doesn't follow entry 1"
 expect "and verify fails" "$out" "exit 1"
+as "$user" "rm /home/$user/audit.jsonl"
+out=$(as "$user" "$work/orion audit --config $work/audited.toml --verify; echo exit \$?")
+expect "deleting the whole log is caught too" "$out" "entries were removed"
+expect "and verify fails" "$out" "exit 1"
 expect "the user can't touch the checkpoints" "$(as "$user" "echo x >> $work/anchors/$(id -u "$user").jsonl" 2>&1)" "Permission denied"
 
 echo "== Only the helper's group may use it"

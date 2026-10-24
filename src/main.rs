@@ -420,7 +420,9 @@ fn main() -> Result<()> {
         }
         Cmd::Audit { lines, verify, checkpoint } => {
             let Some(path) = policy.audit_path() else { bail!("audit logging is disabled") };
-            if !path.exists() {
+            // A missing log is checked like an empty one: deleting the whole
+            // file is what the checkpoints are there to catch.
+            if !path.exists() && !verify {
                 println!("no audit entries yet ({})", path.display());
                 return Ok(());
             }
@@ -430,7 +432,11 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             if verify {
-                let text = std::fs::read_to_string(&path)?;
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+                };
                 let anchors_file = audit::anchors_path(&policy.helper.anchors);
                 let r = audit::check(&text, &std::fs::read_to_string(&anchors_file).unwrap_or_default());
                 println!("audit log:    {} ({} entries)", path.display(), r.lines);
