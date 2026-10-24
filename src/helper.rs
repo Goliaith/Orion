@@ -18,6 +18,9 @@
 //! - NetworkManager's Wi-Fi and connection commands, and firewall rules
 //!   that keep SSH open;
 //! - snapper snapshots on the helper's own configuration;
+//! - reading drives' SMART data;
+//! - keeping checkpoints of each user's audit log (`ANCHOR`), which runs
+//!   no program: it only appends a line to that user's file;
 //! - the time zone, network time, locale and keyboard layout, with values
 //!   the machine has.
 //!
@@ -26,7 +29,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -50,12 +53,48 @@ pub struct HelperConfig {
     pub group: String,
     /// And these login names.
     pub users: Vec<String>,
+    /// Where the helper keeps each user's audit-log checkpoints
+    /// (`UID.jsonl`, root's, readable by all).
+    pub anchors: String,
 }
 
 impl Default for HelperConfig {
     fn default() -> Self {
-        Self { socket: "/run/orion/helper.sock".into(), group: "orion".into(), users: Vec::new() }
+        Self {
+            socket: "/run/orion/helper.sock".into(),
+            group: "orion".into(),
+            users: Vec::new(),
+            anchors: "/var/lib/orion/audit-anchors".into(),
+        }
     }
+}
+
+/// The request that checkpoints the asker's audit log: `[lines, sha256]`.
+/// The helper handles it itself; no program runs.
+pub const ANCHOR: &str = "orion-audit-anchor";
+/// Checkpoints at most this often per user, and this many bytes of them.
+const ANCHOR_EVERY_SECS: u64 = 60;
+const ANCHOR_MAX_BYTES: u64 = 8 << 20;
+
+/// Append a checkpoint for `uid` to `dir/UID.jsonl`.
+fn anchor(dir: &Path, uid: u32, args: &[String]) -> Result<()> {
+    let [lines, hash] = args else { bail!("a checkpoint is a line count and a hash") };
+    let lines: u64 = lines.parse().context("the line count isn't a number")?;
+    ensure!(hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "that isn't a SHA-256 hash");
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    let path = dir.join(format!("{uid}.jsonl"));
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        ensure!(meta.file_type().is_file() && meta.uid() == 0, "{} isn't the helper's own file", path.display());
+        ensure!(meta.len() < ANCHOR_MAX_BYTES, "uid {uid} has checkpointed too much already");
+        let age = meta.modified().ok().and_then(|m| m.elapsed().ok()).unwrap_or(Duration::MAX);
+        ensure!(age >= Duration::from_secs(ANCHOR_EVERY_SECS), "one checkpoint a minute at most");
+    }
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let line = serde_json::json!({ "at": crate::tools::journal_time(secs), "uid": uid, "lines": lines, "hash": hash });
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).mode(0o644).open(&path)?;
+    writeln!(f, "{line}")?;
+    Ok(())
 }
 
 /// The helper's own policy file.
@@ -259,6 +298,15 @@ fn handle(policy: &Policy, stream: UnixStream) -> Result<()> {
         Ok(r) => r,
         Err(e) => return answer(&Response { refused: Some(format!("not a request: {e}")), ..Default::default() }),
     };
+    if req.program == ANCHOR {
+        return match anchor(Path::new(&policy.helper.anchors), peer.uid, &req.args) {
+            Ok(()) => {
+                tracing::info!("{who}: audit checkpoint at entry {}", req.args.first().map(String::as_str).unwrap_or("?"));
+                answer(&Response { stdout: "checkpointed\n".into(), ..Default::default() })
+            }
+            Err(e) => answer(&Response { refused: Some(format!("{e:#}")), ..Default::default() }),
+        };
+    }
     let checked = match check(policy, &peer, &req) {
         Ok(c) => c,
         Err(e) => {
@@ -414,6 +462,24 @@ mod tests {
         assert!(!allowed(&cfg, &nobody));
         let listed = HelperConfig { users: vec![user_name(65534).unwrap_or_default()], ..Default::default() };
         assert!(allowed(&listed, &nobody));
+    }
+
+    #[test]
+    fn keeps_checkpoints_carefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("anchors");
+        let h = "a".repeat(64);
+        // Not root here, so the file is "not the helper's own" on a second write;
+        // the checks before writing are what this tests.
+        assert!(anchor(&d, 1000, &["12".into()]).is_err());
+        assert!(anchor(&d, 1000, &["x".into(), h.clone()]).is_err());
+        assert!(anchor(&d, 1000, &["12".into(), "A".repeat(64)]).is_err());
+        assert!(anchor(&d, 1000, &["12".into(), "../x".into()]).is_err());
+        anchor(&d, 1000, &["12".into(), h.clone()]).unwrap();
+        let text = std::fs::read_to_string(d.join("1000.jsonl")).unwrap();
+        assert!(text.contains("\"lines\":12") && text.contains(&h));
+        // At most one a minute (or, unprivileged, the file isn't root's).
+        assert!(anchor(&d, 1000, &["13".into(), h]).is_err());
     }
 
     #[test]

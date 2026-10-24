@@ -214,10 +214,18 @@ enum Cmd {
         #[arg(long)]
         caller: Option<String>,
     },
-    /// Print the most recent audit log entries.
+    /// Print the most recent audit log entries, or check the log is intact.
     Audit {
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
+        /// Check every entry's link to the one before, and the privileged
+        /// helper's checkpoints; exits 1 if anything was changed.
+        #[arg(long)]
+        verify: bool,
+        /// Have the privileged helper checkpoint the log now (the daemon
+        /// does it as the log grows).
+        #[arg(long)]
+        checkpoint: bool,
     },
 }
 
@@ -410,10 +418,48 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Audit { lines } => {
+        Cmd::Audit { lines, verify, checkpoint } => {
             let Some(path) = policy.audit_path() else { bail!("audit logging is disabled") };
-            if !path.exists() {
+            // A missing log is checked like an empty one: deleting the whole
+            // file is what the checkpoints are there to catch.
+            if !path.exists() && !verify {
                 println!("no audit entries yet ({})", path.display());
+                return Ok(());
+            }
+            if checkpoint {
+                let done = audit::anchor(&policy)?;
+                println!("{}", if done { "checkpointed by the helper" } else { "nothing to checkpoint (no new entries, or no helper)" });
+                return Ok(());
+            }
+            if verify {
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+                };
+                let anchors_file = audit::anchors_path(&policy.helper.anchors);
+                let r = audit::check(&text, &std::fs::read_to_string(&anchors_file).unwrap_or_default());
+                println!("audit log:    {} ({} entries)", path.display(), r.lines);
+                match r.chained_from {
+                    None => println!("chain:        none yet (entries from before chaining)"),
+                    Some(1) if r.broken.is_empty() => println!("chain:        intact"),
+                    Some(n) if r.broken.is_empty() => println!("chain:        intact from entry {n} (the {} before predate chaining)", n - 1),
+                    Some(_) => println!("chain:        BROKEN"),
+                }
+                for b in &r.broken {
+                    println!("  !! {b}");
+                }
+                match &r.last_anchor {
+                    None => println!("checkpoints:  none (the privileged helper keeps them, in {})", anchors_file.display()),
+                    Some(last) if r.anchors_bad.is_empty() => println!("checkpoints:  {} by the helper, all hold; the latest {last}", r.anchors),
+                    Some(_) => println!("checkpoints:  {} by the helper, {} DON'T HOLD", r.anchors, r.anchors_bad.len()),
+                }
+                for b in &r.anchors_bad {
+                    println!("  !! {b}");
+                }
+                if !r.broken.is_empty() || !r.anchors_bad.is_empty() {
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
             for line in audit::tail(&path, lines)? {

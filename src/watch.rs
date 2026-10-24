@@ -1,9 +1,11 @@
 //! Watching the machine for what needs attention, so Orion can say so
-//! before anyone asks: failed services, disks filling up, pending security
-//! updates, a reboot that is due, memory running out.
+//! before anyone asks: failed services, disks filling up or failing,
+//! pending security updates, a reboot that is due, memory running out,
+//! parts running hot, a worn battery, bursts of errors and the kernel's
+//! hardware complaints in the journal, and repeated failed logins.
 //!
-//! The daemon runs the checks every `[watch] interval_mins` (updates every
-//! `updates_hours`, since listing them takes a moment), keeps the findings,
+//! The daemon runs the checks every `[watch] interval_mins` (updates and
+//! disk health every `updates_hours`, since they take a moment), keeps the findings,
 //! and notifies the desktop the first time each one appears. `orion
 //! status`, the `system_health` tool, the chat and the shell show them.
 //! Without a daemon, the interfaces run the quick checks themselves.
@@ -40,8 +42,20 @@ pub struct WatchConfig {
     /// A desktop notification the first time each finding appears.
     pub notify: bool,
     /// Findings to leave out, by key (`*` wildcards): "service:backup.service",
-    /// "disk:/mnt/archive", "updates", "reboot", "memory".
+    /// "disk:/mnt/archive", "updates", "reboot", "memory", "health:sda",
+    /// "temp:*", "battery:*", "errors:*", "kernel:*", "logins".
     pub ignore: Vec<String>,
+    /// Drives' own SMART data (needs smartctl, and root through the helper).
+    pub disk_health: bool,
+    /// Parts at or past the point where they get too hot.
+    pub temperatures: bool,
+    /// A battery that holds less than this share of its charge when new (percent; 0: off).
+    pub battery_health_percent: u64,
+    /// One program or unit logging this many errors in one interval (0: off).
+    /// The kernel's hardware errors (disk I/O, memory, GPU) count from one.
+    pub journal_errors: u64,
+    /// Failed logins (SSH, sudo, the login screen) in the last hour (0: off).
+    pub failed_logins: u64,
 }
 
 impl Default for WatchConfig {
@@ -54,6 +68,11 @@ impl Default for WatchConfig {
             memory_percent: 5,
             notify: true,
             ignore: Vec::new(),
+            disk_health: true,
+            temperatures: true,
+            battery_health_percent: 70,
+            journal_errors: 50,
+            failed_logins: 10,
         }
     }
 }
@@ -221,15 +240,230 @@ fn updates(policy: &Policy) -> Vec<Finding> {
     }
 }
 
-/// Run the checks: the quick ones always, the update list when asked.
+/// Drives that report problems in their SMART data.
+fn disk_health(policy: &Policy) -> Vec<Finding> {
+    if !policy.watch.disk_health {
+        return Vec::new();
+    }
+    let disks = crate::tools::disk_health(policy).unwrap_or_default();
+    disks
+        .into_iter()
+        .filter(|d| d.status == "warning" || d.status == "failing")
+        .map(|d| {
+            let failing = d.status == "failing";
+            let name = d.model.clone().map(|m| format!("{} ({m})", d.device)).unwrap_or(d.device.clone());
+            finding(
+                format!("health:{}", d.device),
+                failing,
+                if failing { format!("disk {name} is failing") } else { format!("disk {name} reports problems") },
+                d.problems.join("; "),
+                if failing { "back up what is on it now, and replace it" } else { "keep backups current; disk_health shows the details" },
+            )
+        })
+        .collect()
+}
+
+/// The slow checks, which the daemon runs every `updates_hours`.
+fn slow(policy: &Policy) -> Vec<Finding> {
+    let mut all = updates(policy);
+    all.extend(disk_health(policy));
+    all
+}
+
+fn temperatures(policy: &Policy) -> Vec<Finding> {
+    if !policy.watch.temperatures {
+        return Vec::new();
+    }
+    crate::tools::temperatures()
+        .into_iter()
+        .filter(|t| t.celsius >= t.hot)
+        .map(|t| {
+            let what = match t.kind.as_str() {
+                "cpu" => "the CPU",
+                "gpu" => "a GPU",
+                "disk" => "a drive",
+                "wifi" => "the Wi-Fi card",
+                _ => "a part of the board",
+            };
+            finding(
+                format!("temp:{}:{}", t.source, t.label),
+                t.celsius >= t.critical,
+                format!("{what} is running hot: {:.0} °C", t.celsius),
+                format!("{} {} (too hot from {:.0} °C, critical at {:.0} °C)", t.source, t.label, t.hot, t.critical),
+                "sensor_status shows every temperature; check the fans and vents, and what is using the CPU or GPU (proc_list, gpu_info)",
+            )
+        })
+        .collect()
+}
+
+fn batteries(percent: u64) -> Vec<Finding> {
+    if percent == 0 {
+        return Vec::new();
+    }
+    crate::tools::batteries()
+        .into_iter()
+        .filter_map(|b| {
+            let health = b["health_percent"].as_f64()?;
+            (health < percent as f64).then(|| {
+                let name = b["name"].as_str().unwrap_or("battery").to_string();
+                finding(
+                    format!("battery:{name}"),
+                    false,
+                    format!("the battery holds {health:.0}% of its original charge"),
+                    b["cycles"].as_f64().map(|c| format!("{name}, after {c:.0} charge cycles")).unwrap_or(name),
+                    "it lasts less on a charge than it did; a replacement brings that back",
+                )
+            })
+        })
+        .collect()
+}
+
+/// One journal entry, as the checks need it.
+#[derive(Debug, Clone, PartialEq)]
+struct Entry {
+    source: String,
+    message: String,
+}
+
+fn parse_entries(text: &str) -> Vec<Entry> {
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| {
+            let s = |k: &str| v[k].as_str().filter(|x| !x.is_empty()).map(String::from);
+            let message = match &v["MESSAGE"] {
+                Value::String(m) => m.clone(),
+                Value::Array(bytes) => String::from_utf8_lossy(&bytes.iter().filter_map(|b| b.as_u64().map(|b| b as u8)).collect::<Vec<_>>()).into_owned(),
+                _ => String::new(),
+            };
+            let kernel = v["_TRANSPORT"] == "kernel";
+            Entry {
+                source: if kernel { "kernel".into() } else { s("_SYSTEMD_UNIT").or(s("_SYSTEMD_USER_UNIT")).or(s("SYSLOG_IDENTIFIER")).or(s("_COMM")).unwrap_or_else(|| "unknown".into()) },
+                message,
+            }
+        })
+        .collect()
+}
+
+/// `journalctl` entries since `mins` minutes ago, with these filters.
+fn journal(mins: u64, filters: &[&str]) -> Vec<Entry> {
+    let since = format!("--since=-{mins}min");
+    let mut args = vec!["--no-pager", "--quiet", "-o", "json", "--output-fields=MESSAGE,_SYSTEMD_UNIT,_SYSTEMD_USER_UNIT,SYSLOG_IDENTIFIER,_COMM,_TRANSPORT", since.as_str()];
+    args.extend(filters);
+    crate::tools::exec::output("journalctl", &args).map(|t| parse_entries(&t)).unwrap_or_default()
+}
+
+fn short(m: &str) -> String {
+    let m = m.trim();
+    if m.chars().count() > 160 { format!("{}…", m.chars().take(160).collect::<String>()) } else { m.to_string() }
+}
+
+/// Programs or units that logged at least `threshold` errors.
+fn error_bursts(entries: &[Entry], threshold: u64, mins: u64) -> Vec<Finding> {
+    let mut by: BTreeMap<&str, (u64, &str)> = BTreeMap::new();
+    for e in entries.iter().filter(|e| e.source != "kernel") {
+        let c = by.entry(e.source.as_str()).or_insert((0, e.message.as_str()));
+        c.0 += 1;
+        c.1 = e.message.as_str();
+    }
+    by.into_iter()
+        .filter(|(_, (n, _))| *n >= threshold)
+        .map(|(source, (n, last))| {
+            finding(
+                format!("errors:{source}"),
+                false,
+                format!("{source} logged {n} errors in {mins} minutes"),
+                format!("the last: {}", short(last)),
+                "journal_read with the unit and priority err shows them",
+            )
+        })
+        .collect()
+}
+
+/// The kernel's complaints about hardware and filesystems: each counts.
+const KERNEL: [(&str, bool, &str, &[&str]); 6] = [
+    ("kernel:hardware", true, "the CPU or memory reported hardware errors", &["Hardware Error", "Machine check", "EDAC", "mce: [Hardware"]),
+    ("kernel:filesystem", true, "a filesystem reported errors", &["EXT4-fs error", "BTRFS error", "XFS (", "corrupt"]),
+    ("kernel:io", false, "a disk reported read or write errors", &["I/O error", "critical medium error", "failed command: READ", "failed command: WRITE"]),
+    ("kernel:gpu", false, "the GPU crashed or was reset", &["fallen off the bus", "GPU reset", "ring gfx timeout", "NVRM: Xid", "GPU HANG"]),
+    ("kernel:throttle", false, "the CPU slowed itself down to cool off", &["temperature above threshold", "clock throttled"]),
+    ("kernel:oom", false, "memory ran out and the kernel ended a program", &["Out of memory: Killed process", "oom-kill:"]),
+];
+
+fn kernel_problems(entries: &[Entry]) -> Vec<Finding> {
+    KERNEL
+        .iter()
+        .filter_map(|(key, critical, title, patterns)| {
+            let hits: Vec<&Entry> = entries.iter().filter(|e| e.source == "kernel" && patterns.iter().any(|p| e.message.contains(p))).collect();
+            // "XFS (" alone is any XFS message: it must say corruption or error too.
+            let hits: Vec<&Entry> = hits.into_iter().filter(|e| *key != "kernel:filesystem" || !e.message.starts_with("XFS (") || e.message.contains("rror") || e.message.contains("orrupt")).collect();
+            let last = hits.last()?;
+            Some(finding(
+                key.to_string(),
+                *critical,
+                title.to_string(),
+                format!("{} time{}; the last: {}", hits.len(), if hits.len() == 1 { "" } else { "s" }, short(&last.message)),
+                "journal_read with kernel shows them; disk_health and sensor_status may say more",
+            ))
+        })
+        .collect()
+}
+
+const FAILED: [&str; 5] = ["Failed password for", "Invalid user ", "authentication failure", "maximum authentication attempts", "FAILED SU"];
+
+/// Repeated failed logins, and where most came from.
+fn failed_logins(entries: &[Entry], threshold: u64) -> Vec<Finding> {
+    let failed: Vec<&Entry> = entries.iter().filter(|e| FAILED.iter().any(|p| e.message.contains(p))).collect();
+    if threshold == 0 || (failed.len() as u64) < threshold {
+        return Vec::new();
+    }
+    let mut from: BTreeMap<String, usize> = BTreeMap::new();
+    for e in &failed {
+        // sshd: "… from 203.0.113.9 port 51522 ssh2"
+        if let Some(addr) = e.message.split(" from ").nth(1).and_then(|r| r.split_whitespace().next()) {
+            *from.entry(addr.to_string()).or_default() += 1;
+        }
+    }
+    let top = from.iter().max_by_key(|(_, n)| **n);
+    let programs: BTreeSet<&str> = failed.iter().map(|e| e.source.as_str()).collect();
+    vec![finding(
+        "logins",
+        false,
+        format!("{} failed logins in the last hour", failed.len()),
+        match top {
+            Some((addr, n)) => format!("{n} from {addr}; through {}", programs.into_iter().collect::<Vec<_>>().join(", ")),
+            None => format!("through {}", programs.into_iter().collect::<Vec<_>>().join(", ")),
+        },
+        "someone may be guessing passwords: fw_rule can block an address, and SSH is safer with keys only",
+    )]
+}
+
+fn journal_checks(policy: &Policy) -> Vec<Finding> {
+    let w = &policy.watch;
+    let mut all = Vec::new();
+    if w.journal_errors > 0 {
+        let mins = w.interval_mins.max(1);
+        all.extend(error_bursts(&journal(mins, &["--priority=err"]), w.journal_errors, mins));
+        all.extend(kernel_problems(&journal(mins, &["--dmesg", "--priority=warning"])));
+    }
+    if w.failed_logins > 0 {
+        // The auth and authpriv facilities: sshd, sudo, su, PAM.
+        all.extend(failed_logins(&journal(60, &["SYSLOG_FACILITY=4", "SYSLOG_FACILITY=10"]), w.failed_logins));
+    }
+    all
+}
+
+/// Run the checks: the quick ones always; the update list and disk health when asked.
 pub fn check(policy: &Policy, with_updates: bool) -> Vec<Finding> {
     let w = &policy.watch;
     let mut all = services();
     all.extend(disks(w.disk_percent));
     all.extend(memory(w.memory_percent));
     all.extend(reboot(policy));
+    all.extend(temperatures(policy));
+    all.extend(batteries(w.battery_health_percent));
+    all.extend(journal_checks(policy));
     if with_updates {
-        all.extend(updates(policy));
+        all.extend(slow(policy));
     }
     all.retain(|f| !w.ignore.iter().any(|p| crate::tools::exec::glob_match(p, &f.key)));
     all
@@ -401,6 +635,10 @@ pub fn run(policy: impl Fn() -> Arc<crate::Orion>, health: Shared) {
     loop {
         let orion = policy();
         let cfg = orion.policy().watch.clone();
+        // A checkpoint of the audit log with the helper, when it grew.
+        if let Err(e) = crate::audit::anchor(orion.policy()) {
+            tracing::warn!("audit checkpoint: {e:#}");
+        }
         let (unattended, ran) = unattended_round(&orion, &mut last, &health);
         if ran {
             updates_at = None; // what is still pending has changed
@@ -408,7 +646,7 @@ pub fn run(policy: impl Fn() -> Arc<crate::Orion>, health: Shared) {
         if cfg.enabled {
             let due = updates_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(cfg.updates_hours.max(1) * 3600));
             if due {
-                updates_found = updates(orion.policy());
+                updates_found = slow(orion.policy());
                 updates_at = Some(Instant::now());
                 health.lock().unwrap_or_else(|e| e.into_inner()).updates_checked_at = Some(now());
             }
@@ -501,9 +739,10 @@ impl crate::Tool for SystemHealth {
     }
 
     fn description(&self) -> &'static str {
-        "What on this machine needs attention now: failed services, filesystems nearly full, pending security \
-         updates, a reboot that is due, memory running out. Each finding says what to do about it. Check it when \
-         asked how the machine is doing, or before big changes."
+        "What on this machine needs attention now: failed services, filesystems nearly full or drives failing, \
+         pending security updates, a reboot that is due, memory running out, parts running hot, a worn battery, \
+         bursts of errors or hardware errors in the journal, repeated failed logins. Each finding says what to do \
+         about it. Check it when asked how the machine is doing, or before big changes."
     }
 
     fn risk(&self) -> crate::tool::Risk {
@@ -514,7 +753,7 @@ impl crate::Tool for SystemHealth {
         json!({
             "type": "object",
             "properties": {
-                "updates": { "type": "boolean", "default": true, "description": "Also list pending updates (takes a moment)." }
+                "updates": { "type": "boolean", "default": true, "description": "Also list pending updates and read the drives' SMART data (takes a moment)." }
             },
             "additionalProperties": false
         })
@@ -568,6 +807,50 @@ mod tests {
         // Memory: nothing has 101% available.
         assert_eq!(memory(101).len(), 1);
         assert!(memory(0).is_empty());
+    }
+
+    #[test]
+    fn reads_the_journal() {
+        let line = |transport: &str, unit: &str, msg: &str| {
+            json!({ "MESSAGE": msg, "_TRANSPORT": transport, "_SYSTEMD_UNIT": unit, "SYSLOG_IDENTIFIER": "x" }).to_string()
+        };
+        let mut text = String::new();
+        for i in 0..60 {
+            text.push_str(&line("journal", "nginx.service", &format!("upstream timed out {i}")));
+            text.push('\n');
+        }
+        text.push_str(&line("stdout", "cron.service", "one error"));
+        text.push('\n');
+        // A message that isn't text arrives as bytes.
+        text.push_str(&json!({ "MESSAGE": [104, 105], "SYSLOG_IDENTIFIER": "app" }).to_string());
+        let e = parse_entries(&text);
+        assert_eq!((e.len(), e[61].source.as_str(), e[61].message.as_str()), (62, "app", "hi"));
+        let b = error_bursts(&e, 50, 15);
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].key.as_str(), b[0].title.as_str()), ("errors:nginx.service", "nginx.service logged 60 errors in 15 minutes"));
+        assert!(b[0].detail.contains("upstream timed out 59"));
+
+        let k = parse_entries(&[
+            line("kernel", "", "blk_update_request: I/O error, dev sda, sector 123456 op 0x0:(READ) flags 0x0"),
+            line("kernel", "", "XFS (sdb1): Mounting V5 Filesystem"),
+            line("kernel", "", "mce: [Hardware Error]: Machine check events logged"),
+            line("kernel", "", "NVRM: Xid (PCI:0000:01:00): 79, pid=1234, GPU has fallen off the bus."),
+            line("journal", "app.service", "I/O error in my own code"),
+        ].join("\n"));
+        let found = kernel_problems(&k);
+        let keys: Vec<&str> = found.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["kernel:hardware", "kernel:io", "kernel:gpu"]);
+        assert_eq!(found[0].severity, "critical");
+        assert!(found[1].detail.starts_with("1 time; the last: blk_update_request"));
+
+        let logins: Vec<String> = (0..12)
+            .map(|i| line("syslog", "ssh.service", &format!("Failed password for invalid user admin from 203.0.113.{} port 5{i} ssh2", if i < 9 { 9 } else { 7 })))
+            .chain(["pam_unix(sudo:auth): authentication failure; logname=ana uid=1000".to_string()].map(|m| line("syslog", "", &m)))
+            .collect();
+        let l = failed_logins(&parse_entries(&logins.join("\n")), 10);
+        assert_eq!((l.len(), l[0].title.as_str()), (1, "13 failed logins in the last hour"));
+        assert!(l[0].detail.starts_with("9 from 203.0.113.9"), "{}", l[0].detail);
+        assert!(failed_logins(&parse_entries(&logins[..3].join("\n")), 10).is_empty());
     }
 
     #[test]

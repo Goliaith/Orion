@@ -31,7 +31,9 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | Tool           | Risk    | Default | What it does |
 |----------------|---------|---------|--------------|
 | `system_info`  | read    | allow   | Hostname, OS, kernel, CPU, memory, load, uptime |
-| `system_health` | read   | allow   | What needs attention: failed services, full disks, security updates, a due reboot, low memory |
+| `system_health` | read   | allow   | What needs attention: failed services, full or failing disks, security updates, a due reboot, low memory, heat, battery wear, journal errors, failed logins |
+| `disk_health`  | read    | allow   | Each drive's SMART health: good, warning or failing and why, wear, temperature, hours of use |
+| `sensor_status` | read   | allow   | Temperatures (CPU, GPU, drives, board) with their limits, and fan speeds |
 | `gpu_info`     | read    | allow   | Every GPU (NVIDIA, AMD, Intel) by name: memory, load, temperature, power, compute stacks, and what runs on each, down to the model |
 | `net_info`     | read    | allow   | Interfaces and addresses, default routes, DNS, and listening ports with the process behind each |
 | `net_connections` | read | allow  | NetworkManager's devices and saved connections, marking those that carry an SSH session |
@@ -512,6 +514,7 @@ orion tools                                   # every tool, its risk, and the po
 orion call system_info                        # call a tool yourself, exactly as the AI would (prompts for "ask" tools)
 orion call fs_list '{"path": "~"}'
 orion audit -n 20                             # recent calls, as JSON lines
+orion audit --verify                          # check no entry was changed, removed or inserted
 orion conversations                           # saved chats (see "Saved conversations")
 orion memory                                  # what the AI remembers (see "People and memory")
 orion shell                                   # the graphical shell (see "Graphical shell")
@@ -552,12 +555,20 @@ Orion notices problems before anyone asks. The daemon checks every 15 minutes:
 | Updates | security updates are pending (listed every 6 hours) |
 | Reboot | the kernel was replaced, the package manager asks for one, or PID 1 runs replaced libraries |
 | Memory | under 5% is available (`memory_percent`) |
+| Disk health | a drive's SMART data says it is failing, or shows bad, pending or unreadable sectors, uncorrectable errors, or 90% of an SSD's life used (read every 6 hours; needs smartmontools, and root through the helper) |
+| Temperatures | a CPU, GPU, drive or board sensor is within 10 °C of its own critical limit, or past a default for its kind where it has none (90 °C for a CPU, 70 °C for a drive); critical within 3 °C |
+| Battery | it holds under 70% of its charge when new (`battery_health_percent`) |
+| Errors | one program or unit logs 50 errors in an interval (`journal_errors`) |
+| Hardware errors | the kernel reports any CPU or memory hardware error, filesystem error, disk I/O error, GPU crash or reset, thermal throttling, or ran out of memory and ended a program |
+| Logins | 10 failed logins in the last hour, by SSH, sudo, su or the login screen, with the address most came from (`failed_logins`) |
 
 - **A desktop notification** comes the first time each problem appears, not again while it lasts, and again if it comes back after clearing.
 - **`orion status`** lists what needs attention, with what to do about each. Without the daemon it runs the quick checks itself (all but updates).
 - **The AI knows:** each conversation starts with the findings, and the AI mentions them once when it fits ("by the way, /home is 93% full") and offers to help, without acting unasked. `system_health` checks afresh.
 - **The interfaces show them:** the line-by-line chat under its header, the full-screen chat's panel and the shell's machine panel.
-- **Settings** are under `[watch]`: the interval, the thresholds, notifications, and `ignore` for findings you don't care about, by key (`"service:backup.service"`, `"disk:/mnt/archive"`, `"reboot"`).
+- **Settings** are under `[watch]`: the interval, the thresholds, notifications, and `ignore` for findings you don't care about, by key (`"service:backup.service"`, `"disk:/mnt/archive"`, `"reboot"`, `"temp:*"`, `"errors:noisy.service"`).
+- **The system journal** is readable only to members of `systemd-journal` (or `adm` or `wheel`, by distribution). Without that, the error and login checks see only your own programs: `sudo usermod -aG systemd-journal "$USER"`.
+- **`disk_health`** and **`sensor_status`** show the details behind the disk-health and temperature findings: each drive's state, wear, temperature and hours of use; every temperature with its limits, and fan speeds.
 
 ### The desktop
 
@@ -820,11 +831,15 @@ Every program the AI starts with `proc_run` runs in a sandbox, whatever the poli
 | GPU | no devices | no devices | open |
 | Other | own PID, IPC and hostname namespaces, all capabilities dropped | can't signal or reach abstract sockets outside the sandbox (ABI 6+) | |
 | Memory, CPU time, file size, no core dumps, no privilege gain | ✓ | ✓ | ✓ |
+| System calls that reach past the sandbox refused (seccomp) | ✓ | ✓ | ✓ |
+| A cgroup per program: memory with page cache, at most 512 processes | ✓ | ✓ | ✓ |
 
 - **`mode = "auto"`** uses bubblewrap if it is installed and works (`apt install bubblewrap`), else Landlock (Linux 5.13+, no install needed), else only the limits. `require = true` refuses to run programs rather than fall back to limits only.
 - **Hidden paths** are `[sandbox] hide` (your keys, password store, cloud credentials and Orion's own config, so a program can't loosen its policy) plus `chat.router.private_paths`, and always Orion's state directory (conversations, the audit log, the shell's token, the voiceprint).
 - **`network = true`** and **`gpu = true`** open those up, for example for package installs or CUDA work. Landlock can only restrict TCP, so for a full network block install bubblewrap.
 - **Limits** are per program: `memory_mb` (default 8192), `cpu_secs` (300) and `max_file_mb` (4096); `0` turns one off. Programs also can't gain privileges through setuid binaries.
+- **A cgroup per program:** where the systemd user manager runs, each program gets a scope of its own (`systemd-run --user --scope`), so `memory_mb` holds for all of its processes together, page cache included, and `max_processes` (512) stops a fork bomb. Without a user manager the per-process limits above still apply. `cgroup = false` turns scopes off.
+- **A seccomp filter** refuses, with "operation not permitted", the system calls a program has no business making here: debugging other processes (ptrace), loading kernels, modules or eBPF, perf events, userfaultfd, io_uring, mounting, `setns` and new user namespaces, the kernel keyring, swap, reboot, setting the clock, raw I/O ports and `open_by_handle_at`. A system call from another architecture (a 32-bit call in a 64-bit program) ends the program. Built into Orion (no libseccomp), for x86_64 and aarch64. `seccomp = false` turns it off, for a program that needs `strace` or `gdb`.
 - Each result says which sandbox ran it (`"sandbox": "bubblewrap"`), and `orion tools` prints the current one.
 - Under Landlock, a directory that contains a hidden path is opened up entry by entry, so files created there later aren't readable. Bubblewrap has no such gap.
 
@@ -920,11 +935,12 @@ To add a capability, implement `Tool` in `src/tools/` and register it in `tools:
 
 1. ~~**Interactive approval.**~~ Done in `orion chat`, via the `ask` decision.
 2. ~~**System daemon.**~~ Done: `orion daemon`, socket-activated by systemd, with `orion serve` as the bridge. The chat, the shell and `orion listen` call tools through it, and ~~`ask` approvals from MCP agents~~ reach you in a terminal, a notification or the shell.
-3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits, and ~~a privileged helper~~ (`orion helper`) for root work in place of sudo rules. Next: a cgroup per call (memory including page cache, GPU memory budgets) and a seccomp filter.
+3. ~~**Isolation.**~~ Done: bubblewrap or Landlock with per-program limits, and ~~a privileged helper~~ (`orion helper`) for root work in place of sudo rules. ~~A cgroup per call~~ (memory including page cache, a process limit), ~~a seccomp filter~~ and ~~a tamper-evident audit log~~ are done too. Next: GPU memory budgets per program, which cgroups can't express yet.
 4. ~~**Richer machine model.**~~ Done: services, packages, network, and local models within a VRAM budget. ~~GPU recognition and placement~~, ~~network changes~~ (Wi-Fi, connections, firewall) and ~~disks and mounts~~ are done too, and so are ~~system updates~~ (security fixes, restarts and reboots), on apt, dnf, zypper and pacman. ~~Unattended updates~~, with ~~snapshots and rollback~~ under every package change, are done too, and so is ~~the desktop~~: sound, screens and brightness, power, Bluetooth, apps, the clock and language. Next: a status-bar badge for pending security fixes.
-5. ~~**Packaging.**~~ Done: release binaries for x86_64 and aarch64 (glibc 2.31 and newer), `.deb`, `.rpm`, an Arch PKGBUILD and an install script, each installed and tested in clean containers before a release is published.
-6. ~~**Proactive monitoring.**~~ Done: the daemon watches for failed services, full disks, security updates, a due reboot and low memory, notifies the desktop, and tells the AI.
-7. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.
+5. ~~**Deeper monitoring.**~~ Done: drives' SMART health, temperatures, battery wear, bursts of errors and the kernel's hardware errors in the journal, and repeated failed logins, alongside the earlier checks.
+6. ~~**Packaging.**~~ Done: release binaries for x86_64 and aarch64 (glibc 2.31 and newer), `.deb`, `.rpm`, an Arch PKGBUILD and an install script, each installed and tested in clean containers before a release is published.
+7. ~~**Proactive monitoring.**~~ Done: the daemon watches for failed services, full disks, security updates, a due reboot and low memory, notifies the desktop, and tells the AI.
+8. **Front-end, next steps.** ~~A terminal chat~~, ~~local models~~ and ~~automatic routing~~ (rules plus a local-model judge) are done. ~~Hotkeys~~ (Ctrl-C to interrupt, Shift-Tab, Ctrl-O), ~~saved conversations~~, ~~a full-screen TUI~~, ~~voice~~, ~~a graphical shell~~ and ~~wake-word listening~~ are done too. A ~~headless voice mode~~ (`orion listen`), ~~speaker verification~~, ~~a neural speaker model~~ and ~~several enrolled people~~ are done too. ~~Per-person conversations and memory~~ are done as well. Next for voice: a benchmark on real recordings.
 
 ## License
 

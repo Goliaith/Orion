@@ -422,7 +422,7 @@ When a desktop tool says no session is running, the daemon can't see your deskto
 
 ## What needs attention
 
-The daemon checks the machine every 15 minutes and keeps what it finds: failed services, filesystems 90% full, pending security updates, a reboot that is due, memory under 5%.
+The daemon checks the machine every 15 minutes and keeps what it finds: failed services, filesystems 90% full, pending security updates, a reboot that is due, memory under 5%, parts running hot, a battery holding under 70% of its charge, a program logging 50 errors in 15 minutes, any hardware error the kernel reports (CPU, memory, filesystem, disk I/O, GPU, throttling, out of memory), and 10 failed logins in an hour. Every 6 hours it also reads each drive's SMART data.
 
 ```sh
 orion status                                      # the findings, each with what to do about it
@@ -441,7 +441,10 @@ attention:    2 things (checked 09:14:11)
 - **The AI is told** at the start of each conversation, and brings it up once when it fits. Ask "how is the machine doing?" for a fresh check.
 - **The chat and the shell** show the findings: under the header, in the full-screen panel (Ctrl-B), in the shell's machine panel.
 - **Too noisy?** Raise `[watch] disk_percent`, or leave findings out by key with `ignore`, such as `["disk:/mnt/archive", "service:backup.service"]`. `notify = false` keeps the checks but stops the notifications; `enabled = false` stops the watch.
-- **Without the daemon,** `orion status` and the interfaces run the quick checks themselves, all but the update list.
+- **Without the daemon,** `orion status` and the interfaces run the quick checks themselves, all but the update list and disk health.
+- **Disk health needs** smartmontools, and root through the [privileged helper](install.md#the-privileged-helper-recommended), which runs only `smartctl --json=c -a --nocheck=standby` on a whole disk. Sleeping disks are left asleep. Virtual disks have no SMART data and show as unknown, which is never a finding.
+- **The error and login checks** read the system journal, which needs membership of `systemd-journal` (`adm` or `wheel` on some distributions); without it they see only your own programs.
+- **A finding about errors in the journal** lasts as long as they keep coming; once a 15-minute window is quiet, it clears, and it notifies again if they return.
 
 ## The audit log
 
@@ -459,6 +462,7 @@ Every tool call, by any model, agent or person, is one JSON line in `~/.local/st
 | `caller` | who asked: an MCP client and its pid (`"claude-code (pid 5312)"`), or a person by voice (`"ana (by voice)"`) |
 | `ok`, `error`, `duration_ms` | how it went: `ok` is false when the call was refused or failed, or when what the tool drove failed (a package manager partway), and `error` says why |
 | `ts_ms` | when, in milliseconds since 1970 |
+| `prev` | the SHA-256 of the entry before, which chains the log |
 
 ```sh
 orion audit -n 50                                          # the last 50 calls
@@ -467,7 +471,23 @@ orion audit -n 1000 | jq -c 'select(.decision == "ask") | {tool, approved, args}
 orion audit -n 1000 | jq -r '.tool' | sort | uniq -c | sort -rn   # which tools get used
 ```
 
-The log only grows. Rotate it with logrotate, or move it aside when Orion isn't running. `[audit] enabled = false` turns it off, which isn't recommended.
+### Checking nothing was changed
+
+Each entry carries the hash of the one before it, so changing, removing or inserting an entry breaks the chain at the next one. The privileged helper also keeps checkpoints, where code running as you can't reach them: as the log grows, the daemon sends it the number of entries and the last one's hash (at most once a minute), and it appends them to `/var/lib/orion/audit-anchors/UID.jsonl`, root's file. A checkpoint catches what the chain alone can't: the last entries removed, or the whole log rewritten.
+
+```sh
+orion audit --verify
+```
+
+```
+audit log:    /home/you/.local/state/orion/audit.jsonl (1532 entries)
+chain:        intact
+checkpoints:  41 by the helper, all hold; the latest 2026-10-24 09:15:02 (entry 1530)
+```
+
+When something was changed, the lines marked `!!` say which entry and how, and the command exits 1, so a timer or monitoring script notices. `orion audit --checkpoint` takes a checkpoint now, without the daemon. Without the helper there are no checkpoints, and the chain alone shows edits but not truncation. Entries written before Orion chained the log are accepted as they are.
+
+The log only grows. Rotate it with logrotate, or move it aside when Orion isn't running; a rotated log starts a new chain, and the old checkpoints then no longer hold, so verify the old log before rotating. `[audit] enabled = false` turns it off, which isn't recommended.
 
 ## Conversations and memory
 
@@ -650,5 +670,6 @@ unknown field `update`, expected one of `manager`, `allowed`, `protected`, `upda
 - **Grant root through the helper.** It does only Orion's operations, checked against a policy only root can change. A passwordless sudo rule lets anything running as you become root, not only Orion.
 - **Leave `wake_approvals` off** unless only trusted people can be heard, and enroll voices so others can't wake Orion.
 - **Keep private things private:** add your own sensitive folders to `chat.router.private_paths` (Claude never sees them) and `[sandbox] hide` (programs never see them).
-- **Read the audit log** now and then, especially after letting an agent run unattended.
+- **Read the audit log** now and then, especially after letting an agent run unattended, and run `orion audit --verify`: with the helper, nothing running as you can rewrite it unnoticed.
+- **Keep the seccomp filter and scopes on** (`[sandbox] seccomp`, `cgroup`): `orion status` should say "system calls filtered, a cgroup per program".
 - **Protect `~/.config/orion/env`** (`chmod 600`): it holds your API key.

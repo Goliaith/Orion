@@ -239,6 +239,9 @@ gpu = false                     # /dev/nvidia*, /dev/dri, /dev/kfd
 memory_mb = 8192                # per program; 0 for no limit
 cpu_secs = 300                  # CPU time per program
 max_file_mb = 4096              # largest file a program may write
+seccomp = true                  # refuse system calls that reach past the sandbox (ptrace, mounts, modules…)
+cgroup = true                   # a systemd scope per program: memory_mb covers page cache and all its processes
+max_processes = 512             # processes and threads per program, in its scope
 hide = ["~/.ssh", "~/.gnupg", "~/.password-store", "~/.aws", "~/.netrc", "~/.config/orion"]
 
 # `orion daemon`: one policy, audit log and sandbox for every agent. `orion
@@ -270,4 +273,9 @@ updates_hours = 6               # listing pending updates takes a moment
 disk_percent = 90               # a filesystem this full needs attention
 memory_percent = 5              # memory below this share available does too
 notify = true                   # a desktop notification when something new turns up
-ignore = []                     # by key, e.g. ["service:backup.service", "disk:/mnt/archive", "reboot"]
+ignore = []                     # by key, e.g. ["service:backup.service", "disk:/mnt/archive", "reboot", "temp:*"]
+disk_health = true              # drives' SMART data, every updates_hours (smartmontools; root through the helper)
+temperatures = true             # parts within 10 °C of their critical limit
+battery_health_percent = 70     # a battery holding less of its original charge (0: off)
+journal_errors = 50             # one program logging this many errors in an interval (0: off, kernel checks too)
+failed_logins = 10              # failed logins in the last hour (0: off)

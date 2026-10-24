@@ -36,8 +36,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Let bubblewrap make its namespaces
+        # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor,
+        # which bwrap needs (a desktop install has a profile for it).
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: A systemd user manager, for the sandbox's scopes
+        run: |
+          sudo loginctl enable-linger "$USER"
+          for _ in $(seq 30); do [ -S "/run/user/$(id -u)/systemd/private" ] && break; sleep 1; done
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
       - name: Tests
         run: cargo test --locked
+        env:
+          ORION_CI_SANDBOX: "1"   # the sandbox tests must run, not skip
 
   msrv:
     name: Oldest supported Rust (1.95)
@@ -83,6 +94,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Snapper and btrfs, for the snapshots
-        run: sudo apt-get update -q && sudo apt-get install -y -q snapper btrfs-progs
+        run: sudo apt-get update -q && sudo apt-get install -y -q snapper btrfs-progs smartmontools
       - run: cargo build --locked
       - run: sudo tests/helper/run.sh

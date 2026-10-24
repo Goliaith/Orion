@@ -12,7 +12,12 @@
 //!   signals or abstract sockets outside the sandbox.
 //!
 //! Either way the program gets resource limits (memory, CPU time, file
-//! size, no core dumps) and can never gain privileges (no_new_privs).
+//! size, no core dumps), can never gain privileges (no_new_privs), and
+//! runs under a seccomp filter that refuses the system calls reaching past
+//! the sandbox (see `seccomp`). Where the systemd user manager runs, each
+//! program also gets a scope of its own (a cgroup), so its memory limit
+//! covers all its processes and their page cache, and a fork bomb stops at
+//! `max_processes`.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -48,6 +53,14 @@ pub struct SandboxConfig {
     pub max_file_mb: u64,
     /// Paths programs never see. `chat.router.private_paths` are added.
     pub hide: Vec<PathBuf>,
+    /// Refuse the system calls that reach past the sandbox (ptrace, kernel
+    /// modules, mounts, new user namespaces, io_uring, …).
+    pub seccomp: bool,
+    /// Run each program in a systemd scope of its own (needs the systemd
+    /// user manager), so memory_mb covers all of it, page cache included.
+    pub cgroup: bool,
+    /// Processes and threads per program, in its scope (0: no limit).
+    pub max_processes: u64,
 }
 
 impl Default for SandboxConfig {
@@ -71,6 +84,9 @@ impl Default for SandboxConfig {
             .iter()
             .map(PathBuf::from)
             .collect(),
+            seccomp: true,
+            cgroup: true,
+            max_processes: 512,
         }
     }
 }
@@ -146,6 +162,12 @@ pub fn describe(policy: &Policy) -> String {
             });
             if !c.gpu && b != Backend::LimitsOnly {
                 parts.push("no GPU".into());
+            }
+            if c.seccomp && !crate::seccomp::program().is_empty() {
+                parts.push("system calls filtered".into());
+            }
+            if c.cgroup && scope_works() {
+                parts.push("a cgroup per program".into());
             }
             parts.join(", ")
         }
@@ -224,39 +246,69 @@ pub fn command(
         cpu: config.cpu_secs,
         file: config.max_file_mb.saturating_mul(1 << 20),
     };
-    let mut guard = Guard { _ruleset: None };
+    let mut guard = Guard {
+        _ruleset: None,
+        _seccomp: None,
+    };
+    let filter = if config.seccomp && b != Backend::Off {
+        crate::seccomp::program()
+    } else {
+        Vec::new()
+    };
+    // In a scope of its own, when the user manager can make one.
+    let scoped = config.cgroup && b != Backend::Off && scope_works();
+    let start = |program: &str, args: &[String]| -> Command {
+        if !scoped {
+            let mut c = Command::new(program);
+            c.args(args);
+            return c;
+        }
+        let mut c = Command::new("systemd-run");
+        c.args(["--user", "--scope", "--quiet", "--collect"]);
+        if config.memory_mb > 0 {
+            c.args(["-p".into(), format!("MemoryMax={}M", config.memory_mb)]);
+            c.args(["-p", "MemorySwapMax=0"]);
+        }
+        if config.max_processes > 0 {
+            c.args(["-p".into(), format!("TasksMax={}", config.max_processes)]);
+        }
+        c.arg("--").arg(program).args(args);
+        c
+    };
     let mut cmd = match b {
         Backend::Bubblewrap => {
-            let mut c = Command::new("bwrap");
-            c.args(bwrap_args(policy, cwd))
-                .arg("--")
-                .arg(program)
-                .args(args);
+            let mut a = bwrap_args(policy, cwd);
+            if !filter.is_empty() {
+                // bwrap installs it just before running the program.
+                let fd = seccomp_fd(&crate::seccomp::bytes())?;
+                a.extend(["--seccomp".into(), fd.as_raw_fd().to_string()]);
+                guard._seccomp = Some(fd);
+            }
+            a.push("--".into());
+            a.push(program.into());
+            a.extend(args.iter().cloned());
+            let mut c = start("bwrap", &a);
             // bwrap sets no_new_privs for the program itself; it may need
             // privileges (setuid builds) to set up.
-            limits.apply(&mut c, None, false);
+            limits.apply(&mut c, None, false, Vec::new());
             c
         }
         Backend::Landlock(abi) => {
             let ruleset = landlock_ruleset(policy, abi)?;
-            let mut c = Command::new(program);
-            c.args(args);
+            let mut c = start(program, args);
             if let Some(dir) = cwd {
                 c.current_dir(dir);
             }
-            limits.apply(&mut c, Some(ruleset.as_raw_fd()), true);
-            guard = Guard {
-                _ruleset: Some(ruleset),
-            };
+            limits.apply(&mut c, Some(ruleset.as_raw_fd()), true, filter);
+            guard._ruleset = Some(ruleset);
             c
         }
         Backend::LimitsOnly => {
-            let mut c = Command::new(program);
-            c.args(args);
+            let mut c = start(program, args);
             if let Some(dir) = cwd {
                 c.current_dir(dir);
             }
-            limits.apply(&mut c, None, true);
+            limits.apply(&mut c, None, true, filter);
             c
         }
         Backend::Off => {
@@ -272,9 +324,40 @@ pub fn command(
     Ok((cmd, b, guard))
 }
 
-/// Holds sandbox resources (the Landlock ruleset) until spawn.
+/// Holds sandbox resources (the Landlock ruleset, bwrap's seccomp
+/// program) until spawn.
 pub struct Guard {
     _ruleset: Option<OwnedFd>,
+    _seccomp: Option<OwnedFd>,
+}
+
+/// An inheritable memory file holding `bytes`, read from the start, for
+/// bwrap's `--seccomp FD`.
+fn seccomp_fd(bytes: &[u8]) -> Result<OwnedFd> {
+    let name = CString::new("orion-seccomp").expect("no NUL");
+    // SAFETY: a valid name; the new descriptor is owned below. No
+    // MFD_CLOEXEC: bwrap must inherit it.
+    let raw = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+    if raw < 0 {
+        bail!("memfd_create: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh descriptor nobody else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut file = std::fs::File::from(fd.try_clone()?);
+    use std::io::{Seek, Write};
+    file.write_all(bytes)?;
+    file.rewind()?;
+    Ok(fd)
+}
+
+/// Whether the systemd user manager makes scopes here (checked once).
+pub fn scope_works() -> bool {
+    static WORKS: OnceLock<bool> = OnceLock::new();
+    *WORKS.get_or_init(|| {
+        let mut c = Command::new("systemd-run");
+        c.args(["--user", "--scope", "--quiet", "--collect", "-p", "TasksMax=16", "--", "true"]);
+        crate::tools::exec::run(c, None, Duration::from_secs(10), 4096).is_ok_and(|d| d.success())
+    })
 }
 
 struct Limits {
@@ -284,7 +367,7 @@ struct Limits {
 }
 
 impl Limits {
-    fn apply(&self, cmd: &mut Command, landlock: Option<i32>, no_new_privs: bool) {
+    fn apply(&self, cmd: &mut Command, landlock: Option<i32>, no_new_privs: bool, filter: Vec<libc::sock_filter>) {
         let (memory, cpu, file) = (self.memory, self.cpu, self.file);
         // SAFETY: runs in the child between fork and exec, and only makes
         // async-signal-safe system calls.
@@ -315,6 +398,8 @@ impl Limits {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
+                // Last: the filter was built before the fork, and needs no_new_privs.
+                crate::seccomp::install(&filter)?;
                 Ok(())
             });
         }
@@ -767,6 +852,55 @@ mod tests {
             );
             assert_ne!(code, 0, "{mode}: file size limit");
         }
+    }
+
+    /// In CI (ORION_CI_SANDBOX), a test that can't run fails instead of passing quietly.
+    fn expected(what: &str) {
+        assert!(std::env::var_os("ORION_CI_SANDBOX").is_none(), "{what} isn't available, and CI expects it");
+    }
+
+    #[test]
+    fn filters_system_calls() {
+        if !Path::new("/usr/bin/python3").exists() {
+            return expected("python3");
+        }
+        let mut ran = 0;
+        let dir = setup();
+        // keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING): harmless, and refused.
+        let script = format!(
+            "python3 -c 'import ctypes; l = ctypes.CDLL(None, use_errno=True); r = l.syscall({}, 0, -3, 0); print(r, ctypes.get_errno())'",
+            libc::SYS_keyctl
+        );
+        for mode in ["landlock", "bubblewrap"] {
+            if (mode == "landlock" && landlock_abi() == 0) || (mode == "bubblewrap" && !bubblewrap_works()) {
+                continue;
+            }
+            let on = policy(dir.path(), mode, "");
+            assert_eq!(sh(&on, &script).1.trim(), "-1 1", "{mode}: keyctl fails with EPERM");
+            assert_eq!(sh(&on, "echo fine; ls / >/dev/null && echo still"), (0, "fine\nstill\n".into()), "{mode}: ordinary programs run");
+            let off = policy(dir.path(), mode, "seccomp = false");
+            assert_ne!(sh(&off, &script).1.trim(), "-1 1", "{mode}: without the filter it works");
+            ran += 1;
+        }
+        if ran < 2 {
+            expected("landlock or bubblewrap");
+        }
+    }
+
+    #[test]
+    fn scopes_limit_memory_and_processes() {
+        if !scope_works() || landlock_abi() == 0 {
+            return expected("a systemd user manager making scopes, with Landlock");
+        }
+        let dir = setup();
+        let p = policy(dir.path(), "landlock", "memory_mb = 64\nmax_processes = 20");
+        let cg = "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)";
+        let (code, out) = sh(&p, &format!("cat {cg}/memory.max {cg}/pids.max"));
+        assert_eq!((code, out.as_str()), (0, "67108864\n20\n"));
+        // A fork bomb stops at the limit.
+        let (code, _) = sh(&p, "for i in $(seq 40); do sleep 2 & done; wait");
+        assert_ne!(code, 0);
+        assert!(describe(&p).contains("a cgroup per program"));
     }
 
     #[test]
