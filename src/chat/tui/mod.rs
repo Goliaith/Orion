@@ -26,7 +26,7 @@ use super::agent::{self, capitalize, Answer, FromAgent, Status, ToAgent};
 use super::machine::{watch_machine, Machine};
 use self::input::Input;
 use super::store::Turn;
-use super::terminal::{clip, provider_label, Saver};
+use super::terminal::{clip, turn_label, Saver};
 use super::{Mode, Session};
 use crate::voice::{is_stop_request, spoken_answer, Person, Recording, VoiceConfig, VoiceIo, WakeEvent, WakeState};
 use crate::{interrupt, Orion};
@@ -111,6 +111,9 @@ struct App {
     last_total: usize,
     last_height: usize,
     flash: Option<(String, Instant)>,
+    /// A rate limit or busy server being waited out, counted down in the
+    /// status line: what, and until when.
+    waiting: Option<(String, Instant)>,
     last_ctrl_c: Option<Instant>,
     started: Instant,
     quit: bool,
@@ -149,6 +152,7 @@ impl App {
             last_total: 0,
             last_height: 0,
             flash: None,
+            waiting: None,
             last_ctrl_c: None,
             started: Instant::now(),
             quit: false,
@@ -186,6 +190,10 @@ impl App {
     }
 
     fn apply(&mut self, ev: FromAgent) {
+        // Whatever the AI does next means the wait is over.
+        if !matches!(ev, FromAgent::Wait { .. } | FromAgent::Status(_)) {
+            self.waiting = None;
+        }
         match ev {
             FromAgent::Text(t) => {
                 self.voice.reply_text(&t);
@@ -204,7 +212,11 @@ impl App {
                 _ => self.entries.push(Entry::Thinking(t)),
             },
             FromAgent::Route { to, model, reason } => {
-                self.who = if to == "Claude" { "claude" } else { "local" };
+                self.who = match to.as_str() {
+                    "Claude" => "claude",
+                    "Orion" => "orion",
+                    _ => "local",
+                };
                 let why = if reason.is_empty() { String::new() } else { format!(" · {reason}") };
                 self.entries.push(Entry::Route(format!("→ {to} ({model}){why}")));
             }
@@ -219,6 +231,10 @@ impl App {
                 }
             }
             FromAgent::Notice(t) => self.entries.push(Entry::Notice(t)),
+            FromAgent::Wait { text, label, secs } => {
+                self.entries.push(Entry::Notice(text));
+                self.waiting = Some((label, Instant::now() + Duration::from_secs(secs)));
+            }
             FromAgent::Error(t) => self.entries.push(Entry::Error(t)),
             FromAgent::Output(t) => self.entries.push(Entry::Output(t)),
             FromAgent::Approve { tool, preview, reply } => {
@@ -738,7 +754,13 @@ impl App {
         }
         if self.busy {
             let frame = SPINNER[(self.started.elapsed().as_millis() / 100) as usize % SPINNER.len()];
-            spans.push(Span::styled(format!(" {frame} working "), Style::new().fg(Color::Magenta)));
+            match &self.waiting {
+                Some((label, until)) => {
+                    let left = until.saturating_duration_since(Instant::now()).as_secs_f64().ceil() as u64;
+                    spans.push(Span::styled(format!(" {frame} {label} · {left}s "), Style::new().fg(Color::Yellow)));
+                }
+                None => spans.push(Span::styled(format!(" {frame} working "), Style::new().fg(Color::Magenta))),
+            }
         }
         if let Some((text, at)) = &self.flash {
             if at.elapsed() < Duration::from_secs(3) {
@@ -774,7 +796,7 @@ fn transcript_entries(turns: &[Turn]) -> Vec<Entry> {
         out.push(Entry::User(t.user.clone()));
         out.extend(t.tools.iter().map(|tool| Entry::PastTool(tool.clone())));
         if !t.reply.trim().is_empty() {
-            out.push(Entry::Reply { who: provider_label(t.provider), text: t.reply.trim().to_string() });
+            out.push(Entry::Reply { who: turn_label(t), text: t.reply.trim().to_string() });
         }
     }
     out.push(Entry::Divider("now".into()));
@@ -854,7 +876,11 @@ fn conversation_lines(entries: &[Entry], width: usize, show_reasoning: bool) -> 
                 }
             }
             Entry::Reply { who, text } => {
-                let color = if *who == "claude" { CLAUDE } else { Color::Green };
+                let color = match *who {
+                    "claude" => CLAUDE,
+                    "orion" => Color::Cyan,
+                    _ => Color::Green,
+                };
                 let mut label = Some(Span::styled(*who, Style::new().fg(color).add_modifier(Modifier::BOLD)));
                 let mut code = false;
                 for src in text.trim_end().split('\n') {
@@ -1230,6 +1256,33 @@ mod tests {
     }
 
     #[test]
+    fn waits_count_down_and_direct_answers_say_orion() {
+        let (mut app, _rx) = app();
+        app.apply(FromAgent::Done);
+        app.submit("explain my firewall".into());
+        app.apply(FromAgent::Wait {
+            text: "waiting on Gemini's rate limit (12s, retry 1 of 3) · 15 requests in the last minute".into(),
+            label: "waiting on Gemini's rate limit".into(),
+            secs: 12,
+        });
+        let shown = screen_text(&mut app, 140, 30);
+        assert!(shown.contains("15 requests in the last minute"), "the notice stays in the conversation:\n{shown}");
+        assert!(shown.contains("waiting on Gemini's rate limit · 12s") || shown.contains("waiting on Gemini's rate limit · 11s"), "{shown}");
+        app.apply(FromAgent::Text("Here it is.".into()));
+        let shown = screen_text(&mut app, 140, 30);
+        assert!(!shown.contains("rate limit ·") && shown.contains(" working "), "the countdown ends when the reply starts:\n{shown}");
+        app.apply(FromAgent::Done);
+
+        app.submit("volume up".into());
+        app.apply(FromAgent::Route { to: "Orion".into(), model: "no model".into(), reason: "simple request: volume".into() });
+        app.apply(FromAgent::Text("The volume is 55%.".into()));
+        app.apply(FromAgent::Done);
+        let shown = screen_text(&mut app, 140, 30);
+        assert!(shown.contains("→ Orion (no model) · simple request: volume") && shown.contains("orion"), "{shown}");
+        assert!(matches!(app.entries.last(), Some(Entry::Reply { who: "orion", .. })));
+    }
+
+    #[test]
     fn a_turn_on_screen() {
         let (mut app, rx) = app();
         for c in "how full is my disk?".chars() {
@@ -1317,6 +1370,7 @@ mod tests {
                 private: false,
                 reply: format!("answer {i}"),
                 tools: vec![],
+                direct: false,
             })
             .collect();
         app.apply(FromAgent::Transcript(turns));

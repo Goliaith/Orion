@@ -38,6 +38,9 @@ pub enum FromAgent {
     ToolStart { name: String, args: String },
     ToolEnd { ok: bool, detail: String, took: Duration },
     Notice(String),
+    /// A rate limit or busy server being waited out: the whole notice,
+    /// what is being waited on, and for how long.
+    Wait { text: String, label: String, secs: u64 },
     Error(String),
     /// A tool call needs approval; answer on `reply`.
     Approve { tool: String, preview: String, reply: Sender<Answer> },
@@ -151,6 +154,10 @@ impl Ui for ChannelUi<'_> {
 
     fn notice(&mut self, text: &str) {
         self.send(FromAgent::Notice(text.to_string()));
+    }
+
+    fn wait(&mut self, wait: &super::http::Wait) {
+        self.send(FromAgent::Wait { text: wait.to_string(), label: wait.label(), secs: wait.secs });
     }
 
     fn approve(&mut self, tool: &dyn Tool, args: &Value) -> bool {
@@ -282,7 +289,7 @@ mod tests {
 
     fn saved(store: &Store, id: &str, owner: &str, said: &str) {
         let now = super::super::store::now_ms();
-        let turn = Turn { user: said.into(), provider: Provider::Local, private: false, reply: "ok".into(), tools: vec![] };
+        let turn = Turn { user: said.into(), provider: Provider::Local, private: false, reply: "ok".into(), tools: vec![], direct: false };
         let conv = Conversation {
             version: FORMAT_VERSION,
             id: id.into(),

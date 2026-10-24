@@ -127,6 +127,9 @@ enabled = true
 provider = "auto"               # auto: route each message; or always "claude" / "local"
                                 # (`orion chat --claude/--local/--auto` overrides)
 max_tool_rounds = 50            # model calls per message before stopping
+fast_path = true                # answer "volume up", "brightness 40%", "status" and
+                                # "open firefox" with the tool itself, no model
+                                # (same policy, approvals and audit log)
 show_reasoning = true           # reasoning and progress notes (Ctrl-O toggles)
 save_conversations = true       # save after every message; resume with --resume
 memory = true                   # remember things about each person across conversations

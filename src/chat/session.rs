@@ -14,6 +14,7 @@ use super::router::{self, Classifier, Route, RouteContext, Router, Strategy};
 use super::{connect, Backend, Event, Mode, Provider, Stop, ToolCall, ToolResult, Ui, UiApprover};
 use super::journal::{self, Journal};
 use super::memory::{self, Memory};
+use super::quick::{self, Quick};
 use super::store::{self, Conversation, SavedBackend, Turn};
 use crate::{interrupt, Orion};
 
@@ -23,7 +24,10 @@ type TurnRecord = Turn;
 impl Turn {
     /// The turn as plain text for a model that didn't handle it.
     fn render(&self) -> String {
-        let mut s = format!("[{} handled this message", capitalized(router::name(self.provider)));
+        let who = if self.direct { "Orion handled this message itself, without a model".to_string() } else {
+            format!("{} handled this message", capitalized(router::name(self.provider)))
+        };
+        let mut s = format!("[{who}");
         if self.tools.is_empty() {
             s.push_str(".]");
         } else {
@@ -439,6 +443,9 @@ impl<'a> Session<'a> {
 
     /// What the router would do with `text`, without sending it.
     pub fn explain_route(&self, text: &str) -> String {
+        if let Some(q) = self.quick(text) {
+            return format!("Orion itself, no model (simple request: {})", q.kind());
+        }
         match self.decide(text) {
             Route::To { provider, reason } => format!("{} ({reason})", router::name(provider)),
             Route::PrivateButNoLocal { reason } => format!("would ask you first ({reason}; no model on this machine)"),
@@ -461,6 +468,41 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// The fast path's reading of `text`, when it is on and the tool is
+    /// here to call.
+    fn quick(&self, text: &str) -> Option<Quick> {
+        if !self.orion.policy().chat.fast_path {
+            return None;
+        }
+        quick::parse(text, &crate::tools::apps::resolve).filter(|q| self.orion.tools().any(|(t, _)| t.name() == q.tool))
+    }
+
+    /// Answer a simple request with its tool, no model. The call goes
+    /// through the policy, approvals and audit log like a model's; both
+    /// models hear about the turn the next time they answer.
+    fn direct(&mut self, q: Quick, text: &str, ui: &mut dyn Ui) {
+        ui.route("Orion", "no model", &format!("simple request: {}", q.kind()));
+        let call = ToolCall { id: "direct".into(), name: q.tool.to_string(), input: q.args.clone(), invalid_input: None };
+        // Nothing goes to a model, so nothing private leaves the machine.
+        let mine = Mine { memory: None, journal: None, keeps_private: true };
+        let (content, is_error) = run_tool(self.orion, &self.router, &call, mine, ui);
+        let reply = if is_error {
+            q.failed(&content)
+        } else {
+            q.reply(&serde_json::from_str(&content).unwrap_or_default())
+        };
+        ui.text(&reply);
+        let input = self.orion.tools().find(|(t, _)| t.name() == q.tool).map_or(q.args.clone(), |(t, _)| t.redact(&q.args));
+        self.log.push(TurnRecord {
+            user: text.to_string(),
+            provider: self.current(),
+            private: self.router.private_reason(text).is_some(),
+            reply,
+            tools: vec![summarize(q.tool, &input, &content, is_error)],
+            direct: true,
+        });
+    }
+
     /// Send one user message and run tools until the model is done. A
     /// leading `@claude` or `@local` sends it to that model regardless of
     /// the mode.
@@ -471,6 +513,12 @@ impl<'a> Session<'a> {
             Some(("@local", rest)) => (Some(Provider::Local), rest.trim()),
             _ => (None, input),
         };
+        if forced.is_none() {
+            if let Some(q) = self.quick(text) {
+                self.direct(q, text, ui);
+                return Ok(());
+            }
+        }
         let private_reason = self.router.private_reason(text);
         let (provider, reason, routed) = match (forced, self.mode) {
             (Some(p), _) => (p, "you picked it".to_string(), false),
@@ -556,7 +604,7 @@ impl<'a> Session<'a> {
         };
         let Some(backend) = slot.backend.as_mut() else { return };
         for rec in &log[slot.synced..] {
-            if rec.provider != provider && !(rec.private && !keeps_private) {
+            if (rec.direct || rec.provider != provider) && !(rec.private && !keeps_private) {
                 backend.push_user(&rec.user);
                 backend.push_assistant_text(&rec.render());
             }
@@ -567,7 +615,7 @@ impl<'a> Session<'a> {
     fn run_on(&mut self, provider: Provider, text: &str, private: bool, ui: &mut dyn Ui) -> (TurnRecord, Result<()>) {
         self.sync(provider);
         let mut record =
-            TurnRecord { user: text.to_string(), provider, private, reply: String::new(), tools: Vec::new() };
+            TurnRecord { user: text.to_string(), provider, private, reply: String::new(), tools: Vec::new(), direct: false };
         // What the journal holds on this, added to what the model is sent
         // (the transcript keeps the message as written).
         let sent = match self.recall(provider, text) {
@@ -606,6 +654,7 @@ impl<'a> Session<'a> {
                 }
                 Event::Thinking(t) => ui.thinking(t),
                 Event::Notice(t) => ui.notice(t),
+                Event::Wait(w) => ui.wait(w),
             });
             let reply = match reply {
                 Err(e) if interrupt::is_interrupt(&e) => {
@@ -854,6 +903,45 @@ mod tests {
         fn classify(&self, _text: &str, _previous: Option<(Provider, &str)>) -> Result<router::Verdict> {
             Ok(router::Verdict { provider: self.0, reason: "said so".into() })
         }
+    }
+
+    #[test]
+    fn simple_requests_skip_the_model_but_not_the_policy() {
+        let log = Log::default();
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit.jsonl");
+        let orion = Orion::new(crate::Policy::from_toml(&format!("[desktop]\napproved = []\n[audit]\npath = {audit:?}\n")).unwrap());
+        let claude = Scripted::new("claude", &log, vec![say("Sure.")]);
+        let local = Scripted::new("local", &log, vec![say("Fine.")]);
+        let mut s = Session::with_backends(&orion, Mode::Auto, Some(claude), Some(local));
+        assert!(s.explain_route("status").starts_with("Orion itself, no model"));
+
+        let mut ui = Recorder::default();
+        s.turn("status", &mut ui).unwrap();
+        assert!(ui.out.starts_with("→Orion(simple request: status)<system_info><ok>"), "{}", ui.out);
+        assert!(log.lock().unwrap().is_empty(), "no model was asked");
+        // Changing the volume asks first (as this policy has it), as it
+        // would for a model; this UI declines.
+        let mut ui = Recorder::default();
+        s.turn("volume up", &mut ui).unwrap();
+        assert_eq!(ui.approvals, 1);
+        assert!(ui.out.ends_with("<err>Couldn't change the volume: the user declined this audio_set call"), "{}", ui.out);
+        let audited = crate::audit::tail(&audit, 10).unwrap().join("\n");
+        assert!(audited.contains("\"system_info\"") && audited.contains("\"audio_set\""), "{audited}");
+        assert!(s.turns().iter().all(|t| t.direct));
+
+        // Both models hear about it when they next answer; @local skips the fast path.
+        s.turn("@local status", &mut Recorder::default()).unwrap();
+        s.turn("@claude thanks", &mut Recorder::default()).unwrap();
+        let (l, c) = (entries(&log, "local"), entries(&log, "claude"));
+        assert!(l[1].starts_with("local assistant: [Orion handled this message itself, without a model. Its tool calls:\n- system_info"), "{l:?}");
+        assert_eq!(l.last().unwrap(), "local user: status");
+        assert!(c.iter().filter(|e| e.contains("Orion handled this message itself")).count() == 2, "{c:?}");
+
+        // It can be turned off.
+        let off = Orion::new(crate::Policy::from_toml("[chat]\nfast_path = false\n[audit]\nenabled = false\n").unwrap());
+        let s = Session::with_backends(&off, Mode::Auto, None, Some(Scripted::new("local", &log, vec![])));
+        assert!(!s.explain_route("status").starts_with("Orion"));
     }
 
     #[test]

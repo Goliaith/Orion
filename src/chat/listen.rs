@@ -220,6 +220,13 @@ impl<L: Log> Headless<L> {
                 format!("  ✗ {detail}")
             }),
             FromAgent::Notice(t) | FromAgent::Output(t) => self.log.line(&t),
+            FromAgent::Wait { text, label, secs } => {
+                self.log.line(&text);
+                // A long silence is worth explaining to someone who can't see the screen.
+                if secs >= 5 {
+                    self.say(&format!("One moment: {label}, about {secs} seconds."));
+                }
+            }
             FromAgent::Error(e) => {
                 self.log.line(&format!("error: {e}"));
                 let first = e.split(['.', '\n', ':']).next().unwrap_or_default().trim().to_string();

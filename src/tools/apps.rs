@@ -266,6 +266,13 @@ fn apps(dirs: &[PathBuf]) -> Vec<App> {
     list
 }
 
+/// The name of the installed app that `wanted` names, if exactly one
+/// does: for a request like "open firefox" that needs no model.
+pub fn resolve(wanted: &str) -> Option<String> {
+    let list = apps(&dirs());
+    find(&list, wanted).ok().filter(|a| !a.terminal).map(|a| a.name.clone())
+}
+
 /// The app `wanted` names: its id (with or without .desktop), its exact
 /// name, or the one app whose name contains it.
 fn find<'a>(list: &'a [App], wanted: &str) -> Result<&'a App> {
