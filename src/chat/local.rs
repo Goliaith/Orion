@@ -25,6 +25,11 @@ pub struct LocalConfig {
     pub temperature: Option<f64>,
     /// Environment variable holding an API key, for servers that want one.
     pub api_key_env: String,
+    /// How hard a reasoning model thinks before answering, sent as
+    /// `reasoning_effort`: Gemini takes `none` (2.5 Flash and Flash-Lite
+    /// only), `minimal`, `low`, `medium` or `high`; OpenAI-style servers
+    /// `low`, `medium` or `high`. Unset leaves it to the server.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for LocalConfig {
@@ -35,6 +40,7 @@ impl Default for LocalConfig {
             max_tokens: None,
             temperature: None,
             api_key_env: String::new(),
+            reasoning_effort: None,
         }
     }
 }
@@ -115,6 +121,9 @@ impl LocalBackend {
         if let Some(t) = self.config.temperature {
             body["temperature"] = json!(t);
         }
+        if let Some(effort) = self.config.reasoning_effort.as_deref().filter(|e| !e.is_empty()) {
+            body["reasoning_effort"] = json!(effort);
+        }
         body
     }
 }
@@ -147,7 +156,7 @@ impl Backend for LocalBackend {
     fn respond(&mut self, on: &mut dyn FnMut(Event)) -> Result<Reply> {
         let reader = self
             .http
-            .post_stream("/chat/completions", &self.request_body(), &[])
+            .post_stream("/chat/completions", &self.request_body(), &[], &mut |n| on(Event::Notice(n)))
             .with_context(|| format!("calling the local model {}", self.config.model))?;
         let done = parse_stream(reader, on)?;
         self.usage.add(&done.usage);
@@ -457,12 +466,18 @@ mod tests {
         let second = chunks(&[delta(json!({"content":"Fine."})), finish("stop")]);
         let (url, requests) = fake_server(vec![first, second]);
         let orion = orion();
-        let config = LocalConfig { base_url: format!("{url}/v1"), model: "gemini".into(), ..Default::default() };
+        let config = LocalConfig {
+            base_url: format!("{url}/v1"),
+            model: "gemini".into(),
+            reasoning_effort: Some("low".into()),
+            ..Default::default()
+        };
         let backend = LocalBackend::connect(config, "system".into(), &offered_tools(&orion)).unwrap();
         let mut session = Session::with_backends(&orion, Mode::Local, None, Some(Box::new(backend)));
         session.turn("how is it?", &mut Recorder::default()).unwrap();
 
-        requests.recv().unwrap();
+        let (_, req1) = requests.recv().unwrap();
+        assert_eq!(req1["reasoning_effort"], "low");
         let (_, req2) = requests.recv().unwrap();
         assert_eq!(req2["messages"][2]["tool_calls"][0]["extra_content"], signature);
     }

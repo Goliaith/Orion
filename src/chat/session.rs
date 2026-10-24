@@ -537,6 +537,7 @@ impl<'a> Session<'a> {
                     ui.text(t);
                 }
                 Event::Thinking(t) => ui.thinking(t),
+                Event::Notice(t) => ui.notice(t),
             });
             let reply = match reply {
                 Err(e) if interrupt::is_interrupt(&e) => {

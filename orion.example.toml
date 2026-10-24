@@ -142,6 +142,8 @@ model = ""                      # empty: the first model the server lists
 # max_tokens = 8192             # unset: the server decides
 # temperature = 0.6
 # api_key_env = "LOCAL_LLM_KEY" # for servers that want a bearer token
+# reasoning_effort = "low"      # how hard a thinking model thinks; Gemini:
+                                # none (2.5 only), minimal, low, medium, high
 
 # How `auto` picks a model for each message. Private messages stay local and
 # short follow-ups ("yes, do it") stay with the last model, both by rule.

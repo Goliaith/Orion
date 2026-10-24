@@ -94,7 +94,10 @@ impl Client {
         if !betas.is_empty() {
             headers.push(("anthropic-beta", betas.join(",")));
         }
-        let reader = self.http.post_stream("/v1/messages", body, &headers).context("calling the Claude API")?;
+        let reader = self
+            .http
+            .post_stream("/v1/messages", body, &headers, &mut |n| on(Event::Notice(n)))
+            .context("calling the Claude API")?;
         parse_sse(reader, on)
     }
 }
@@ -409,6 +412,7 @@ mod tests {
             seen.push(match e {
                 Event::Text(t) => format!("text:{t}"),
                 Event::Thinking(t) => format!("thinking:{t}"),
+                Event::Notice(t) => format!("notice:{t}"),
             })
         })
         .unwrap();

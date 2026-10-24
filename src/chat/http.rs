@@ -48,29 +48,45 @@ impl Http {
 
     /// POST a JSON body and return the response body for streaming. Retries
     /// rate limits, overload and dropped connections that happen before the
-    /// response starts; a server that refuses connections fails at once.
-    /// Ctrl-C interrupts both the wait for the response and its reads.
-    pub fn post_stream(&self, path: &str, body: &Value, extra: &[(&str, String)]) -> Result<impl BufRead> {
+    /// response starts, telling `notice` how long each wait is; a server that
+    /// refuses connections fails at once. Ctrl-C interrupts both the waits
+    /// and the reads.
+    pub fn post_stream(
+        &self,
+        path: &str,
+        body: &Value,
+        extra: &[(&str, String)],
+        notice: &mut dyn FnMut(&str),
+    ) -> Result<impl BufRead> {
         let body = serde_json::to_string(body)?;
         let extra: Vec<(String, String)> = extra.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
-        let (http, path) = (self.clone(), path.to_string());
-        let reader = interrupt::wait(move || {
-            let mut attempt = 0;
-            loop {
+        let mut attempt = 0;
+        let reader = loop {
+            let (http, path, extra, body) = (self.clone(), path.to_string(), extra.clone(), body.clone());
+            let sent = interrupt::wait(move || {
                 let req = http.request("POST", &path, &extra).set("content-type", "application/json");
-                let wait = match req.send_string(&body) {
-                    Ok(resp) => return Ok(resp.into_reader()),
+                match req.send_string(&body) {
+                    Ok(resp) => Ok(Ok(resp.into_reader())),
                     Err(ureq::Error::Status(code, resp)) if retryable(code) && attempt < MAX_RETRIES => {
-                        resp.header("retry-after").and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs)
+                        let header = resp.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok());
+                        let asked = header.or_else(|| retry_delay(&resp.into_string().unwrap_or_default()));
+                        Ok(Err((code, asked.map(Duration::from_secs))))
                     }
-                    Err(e) => return Err(http.describe(e)),
-                };
-                attempt += 1;
-                thread::sleep(wait.unwrap_or(Duration::from_secs(1 << attempt)).min(Duration::from_secs(60)));
-                // The caller may have given up on us in the meantime.
-                interrupt::check()?;
-            }
-        })?;
+                    Err(e) => Err(http.describe(e)),
+                }
+            })?;
+            let (code, asked) = match sent {
+                Ok(reader) => break reader,
+                Err(retry) => retry,
+            };
+            attempt += 1;
+            let wait = asked.unwrap_or(Duration::from_secs(1 << attempt)).min(Duration::from_secs(60));
+            notice(&retry_notice(code, wait, attempt));
+            interrupt::wait(move || {
+                thread::sleep(wait);
+                Ok(())
+            })?;
+        };
         Ok(BufReader::new(ChannelReader::spawn(reader)))
     }
 
@@ -154,6 +170,36 @@ fn retryable(code: u16) -> bool {
     matches!(code, 408 | 409 | 429 | 500..=599)
 }
 
+/// What a retry is waiting for, for the user: a free tier's rate limit
+/// otherwise looks like a hang.
+fn retry_notice(code: u16, wait: Duration, attempt: u32) -> String {
+    let why = match code {
+        429 => "rate limited".to_string(),
+        503 | 529 => "the server is busy".to_string(),
+        _ => format!("the server answered {code}"),
+    };
+    format!("{why}, retrying in {}s ({attempt} of {MAX_RETRIES})", wait.as_secs().max(1))
+}
+
+/// The wait a 429 body asks for, when there's no `retry-after` header:
+/// Google's APIs send `"retryDelay": "17s"` in the error details.
+fn retry_delay(body: &str) -> Option<u64> {
+    fn find(v: &Value) -> Option<u64> {
+        match v {
+            Value::Object(m) => m
+                .get("retryDelay")
+                .and_then(Value::as_str)
+                .and_then(|d| d.trim().strip_suffix('s'))
+                .and_then(|d| d.parse::<f64>().ok())
+                .map(|d| d.ceil() as u64)
+                .or_else(|| m.values().find_map(find)),
+            Value::Array(a) => a.iter().find_map(find),
+            _ => None,
+        }
+    }
+    find(&serde_json::from_str(body).ok()?)
+}
+
 /// The message out of an error body: `{"error": {"message": ...}}` (Claude,
 /// OpenAI style) or `{"error": "..."}` (Ollama).
 pub fn error_message(body: &str) -> String {
@@ -188,15 +234,25 @@ pub fn non_empty_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|v| !v.trim().is_empty())
 }
 
-/// A credential from the environment, trimmed: a key pasted with a stray
-/// space or line ending still works. Errors never include the value.
+/// A credential from the environment, cleaned: keys never contain spaces or
+/// invisible characters, so any that came along with a paste (a line
+/// ending, a non-breaking or zero-width space, a byte-order mark) are
+/// dropped wherever they are. Errors never include the value.
 pub fn secret_env(var: &str) -> Result<Option<String>> {
     let Some(value) = non_empty_env(var) else { return Ok(None) };
-    let value = value.trim();
-    if !value.bytes().all(|b| b.is_ascii_graphic()) {
-        bail!("{var} has a space, line break or non-ASCII character inside the key; copy the key again");
+    let value: String = value.chars().filter(|&c| !invisible(c)).collect();
+    if value.is_empty() {
+        return Ok(None);
     }
-    Ok(Some(value.to_string()))
+    if !value.bytes().all(|b| b.is_ascii_graphic()) {
+        bail!("{var} has a character that can't be part of a key (an accent, a curly quote?); copy the key again");
+    }
+    Ok(Some(value))
+}
+
+/// Whitespace, control and zero-width characters.
+fn invisible(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{ad}')
 }
 
 /// Iterate the `data:` payloads of a Server-Sent Events stream.
@@ -213,15 +269,53 @@ pub fn sse_data(reader: impl BufRead) -> impl Iterator<Item = Result<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn secret_env_trims_and_never_echoes_the_key() {
+    fn secret_env_cleans_and_never_echoes_the_key() {
         std::env::set_var("ORION_TEST_KEY_OK", " abc.DEF-123\r\n");
         assert_eq!(secret_env("ORION_TEST_KEY_OK").unwrap().as_deref(), Some("abc.DEF-123"));
-        std::env::set_var("ORION_TEST_KEY_BAD", "abc\u{a0}secret");
+        std::env::set_var("ORION_TEST_KEY_HIDDEN", "\u{feff}abc\u{a0}DEF\u{200b}-1 2\t3");
+        assert_eq!(secret_env("ORION_TEST_KEY_HIDDEN").unwrap().as_deref(), Some("abcDEF-123"));
+        std::env::set_var("ORION_TEST_KEY_BAD", "abc\u{201c}secret");
         let err = secret_env("ORION_TEST_KEY_BAD").unwrap_err().to_string();
         assert!(err.contains("ORION_TEST_KEY_BAD") && !err.contains("secret"), "{err}");
         assert_eq!(secret_env("ORION_TEST_KEY_UNSET").unwrap(), None);
+    }
+
+    #[test]
+    fn retries_say_why_and_how_long() {
+        let gemini = r#"[{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+            {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"16.4s"}]}}]"#;
+        assert_eq!(retry_delay(gemini), Some(17));
+        assert_eq!(retry_delay(r#"{"error":{"message":"slow down"}}"#), None);
+        assert_eq!(retry_notice(429, Duration::from_secs(17), 1), "rate limited, retrying in 17s (1 of 3)");
+        assert_eq!(retry_notice(503, Duration::from_secs(2), 2), "the server is busy, retrying in 2s (2 of 3)");
+    }
+
+    #[test]
+    fn rate_limits_are_retried_out_loud() {
+        // A server that rate-limits once, then answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for (i, conn) in listener.incoming().take(2).enumerate() {
+                let mut conn = conn.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut conn, &mut buf);
+                let reply = if i == 0 {
+                    "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: close\r\n\r\ndata: ok\n"
+                };
+                std::io::Write::write_all(&mut conn, reply.as_bytes()).unwrap();
+            }
+        });
+        let mut notices = Vec::new();
+        let reader = Http::new(&url, Vec::new()).post_stream("/x", &json!({}), &[], &mut |n| notices.push(n.to_string()));
+        let data: Vec<String> = sse_data(reader.unwrap()).map(Result::unwrap).collect();
+        assert_eq!(data, ["ok"]);
+        assert_eq!(notices, ["rate limited, retrying in 1s (1 of 3)"]);
     }
 
     #[test]

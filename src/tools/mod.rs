@@ -26,6 +26,8 @@ mod system;
 mod timers;
 mod updates;
 
+use std::path::Path;
+
 use anyhow::{bail, ensure, Result};
 
 use crate::helper::{Checked, Peer};
@@ -77,13 +79,37 @@ pub fn root_access(policy: &Policy) -> String {
     }
     match exec::elevation(policy) {
         Ok(Some(exec::Elevation::Helper(socket))) => match std::os::unix::net::UnixStream::connect(&socket) {
-            Ok(_) => format!("the Orion helper at {}", socket.display()),
+            Ok(_) => format!("the Orion helper at {}{}", socket.display(), stale_helper_note(Path::new(HELPER_BINARY))),
             Err(e) => format!("the Orion helper at {}, which can't be reached: {e}", socket.display()),
         },
         Ok(Some(exec::Elevation::Prefix(p))) if p[0] == "sudo" => "sudo -n (needs a passwordless sudo rule)".into(),
         Ok(Some(exec::Elevation::Prefix(_))) => "pkexec (asks for a password)".into(),
         Ok(None) => "none: no helper, and elevate is none or sudo is missing".into(),
         Err(e) => format!("{e:#}"),
+    }
+}
+
+/// Where the helper's unit runs Orion from (contrib/orion-helper.service).
+const HELPER_BINARY: &str = "/usr/local/bin/orion";
+
+/// A reminder when this `orion` was built after the copy the helper runs,
+/// as after `cargo install` without the `sudo install` that follows it.
+fn stale_helper_note(installed: &Path) -> String {
+    let Ok(this) = std::env::current_exe() else { return String::new() };
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    if std::fs::canonicalize(&this).ok() == std::fs::canonicalize(installed).ok() {
+        return String::new();
+    }
+    match (modified(&this), modified(installed)) {
+        (Some(new), Some(old)) if new > old => format!(
+            "\n  note: {} is older than this orion ({}), so the helper runs the old build. Update it with\n  \
+             sudo install -m 755 {} {} && sudo systemctl restart orion-helper.service",
+            installed.display(),
+            this.display(),
+            this.display(),
+            installed.display(),
+        ),
+        _ => String::new(),
     }
 }
 
@@ -171,4 +197,21 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(models::ModelPull),
         Box::new(gpu::GpuAssign),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notices_a_helper_left_on_an_old_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("orion");
+        let file = std::fs::File::create(&old).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH).unwrap();
+        let note = stale_helper_note(&old);
+        assert!(note.contains("sudo install -m 755") && note.contains("restart orion-helper"), "{note}");
+        assert_eq!(stale_helper_note(&std::env::current_exe().unwrap()), "", "the helper's own copy");
+        assert_eq!(stale_helper_note(&dir.path().join("missing")), "");
+    }
 }

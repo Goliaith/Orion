@@ -18,6 +18,8 @@ pub struct LocalClassifier {
     model: String,
     prefer: Provider,
     timeout: Duration,
+    /// `[chat.local] reasoning_effort`, for servers that think by default.
+    reasoning_effort: Option<String>,
     /// Set once the server has rejected the optional request fields, so they
     /// are not sent again.
     minimal: Cell<bool>,
@@ -26,7 +28,8 @@ pub struct LocalClassifier {
 impl LocalClassifier {
     pub fn new(config: &LocalConfig, model: String, prefer: Provider, timeout: Duration) -> Result<Self> {
         let http = Http::new(&config.base_url, auth_headers(config)?);
-        Ok(Self { http, model, prefer, timeout, minimal: Cell::new(false) })
+        let reasoning_effort = config.reasoning_effort.clone().filter(|e| !e.is_empty());
+        Ok(Self { http, model, prefer, timeout, reasoning_effort, minimal: Cell::new(false) })
     }
 
     fn body(&self, text: &str, previous: Option<(Provider, &str)>, minimal: bool) -> Value {
@@ -45,6 +48,10 @@ impl LocalClassifier {
             // (llama.cpp and vLLM read chat_template_kwargs; others ignore it).
             body["response_format"] = json!({ "type": "json_object" });
             body["chat_template_kwargs"] = json!({ "enable_thinking": false });
+            // Servers that ignore those (Gemini) take this.
+            if let Some(effort) = &self.reasoning_effort {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
         body
     }

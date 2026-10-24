@@ -205,6 +205,25 @@ orion chat --local
 - **Other servers:** point `[chat.local] base_url` at them. llama.cpp's `llama-server --jinja` is on `http://127.0.0.1:8080/v1`, vLLM on `:8000/v1`, LM Studio on `:1234/v1`.
 - **A small judge for routing:** `[chat.router] classifier_model = "qwen3:1.7b"` makes automatic routing faster. Pull it with `ollama pull qwen3:1.7b`.
 
+### Gemini (free tier)
+
+Google's Gemini speaks the same API, and its free tier needs no payment. Create a key at [aistudio.google.com](https://aistudio.google.com/apikey), put it in `~/.config/orion/env` as `GEMINI_API_KEY=...`, and point the local backend at Google:
+
+```toml
+[chat]
+provider = "local"
+
+[chat.local]
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+model = "gemini-3.8-flash-lite"       # list yours: curl -H "Authorization: Bearer $GEMINI_API_KEY" …/openai/models
+api_key_env = "GEMINI_API_KEY"
+reasoning_effort = "low"              # less thinking, faster answers; "minimal", "low", "medium" or "high"
+```
+
+- **Pick a chat model:** the plain `flash` or `flash-lite` ones. The `tts` and `image` variants make speech and pictures, and can't chat or use tools.
+- **Free-tier limits are tight,** a few requests a minute, and each tool Orion runs is one more. When Google says to slow down, Orion waits and says so (`rate limited, retrying in 17s (1 of 3)`). Flash-Lite has the most generous limits.
+- **A pasted key** with a stray space, line break or invisible character still works: Orion drops them.
+
 ### Check
 
 ```sh
@@ -461,6 +480,15 @@ git pull
 cargo install --path . --force
 systemctl --user restart orion.service orion-voice.service orion-shell.service 2>/dev/null
 ```
+
+The helper runs its own copy, so with the helper set up (step 6), update that too:
+
+```sh
+sudo install -m 755 ~/.cargo/bin/orion /usr/local/bin/orion
+sudo systemctl restart orion-helper.service
+```
+
+`orion tools` reminds you when the helper's copy is older than the `orion` you run.
 
 Your policy, conversations, memory, voiceprints and audit log are kept. A new version may refuse a setting it no longer knows; the error names it.
 
