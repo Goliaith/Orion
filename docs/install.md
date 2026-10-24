@@ -282,6 +282,12 @@ cage -- orion-kiosk                        # from a TTY login or a display manag
 | `disk_mount`, `disk_unmount` | `mount`, or udisks2 for desktop-style mounts without root |
 | `gpu_info` on NVIDIA | the NVIDIA driver's `nvidia-smi`. AMD and Intel need nothing extra. |
 | `model_load`, `model_pull` | Ollama |
+| `audio_status`, `audio_set` | PipeWire (with pipewire-pulse) or PulseAudio, and `pactl` 16 or newer |
+| `display_status`, `display_set` | `wlr-randr` (sway, Hyprland and other wlroots compositors), `kscreen-doctor` (KDE) or `xrandr` (X11); brightness: `brightnessctl`, or nothing extra under logind |
+| `power_set` | power-profiles-daemon, or tuned-ppd (`powerprofilesctl`) |
+| `bt_status`, `bt_device` | BlueZ (`bluetoothctl`) |
+| `app_open` without an app | `xdg-open` (xdg-utils) |
+| `clock_set` | systemd (`timedatectl`, `localectl`) |
 
 Tools whose program is missing report that when called. The others still work.
 
@@ -298,6 +304,7 @@ Installing packages and updates, controlling system services, changing the netwo
 - **Services:** `systemctl` start, stop, restart, reload, enable and disable of units that aren't protected. That includes the units that give a root shell on a console, such as `debug-shell.service`.
 - **GPU pins:** only Orion's `50-orion-gpu.conf` drop-in, holding only the GPU variables. A drop-in with `ExecStart=` would run anything as root.
 - **Disks:** mounts only under the mount roots, always `nosuid,nodev`, of disks the system doesn't run from; unmounts of anything but the system's own mounts.
+- **Clock and language:** `timedatectl` and `localectl` setting a time zone that exists in `/usr/share/zoneinfo`, network time on or off, a locale generated on the machine, or an XKB keyboard layout. Never the time itself.
 - **Network:** NetworkManager's Wi-Fi and connection commands as Orion makes them (no VPN imports, which can run scripts), and firewall rules that keep SSH open.
 
 Its protected lists come from `/etc/orion/helper.toml`, which only root may change, so code running as you can't loosen them. Everything else is refused, and every command it ran or refused is logged with who asked. Compared with a sudo rule, code running as you gets Orion's operations, not a root shell.

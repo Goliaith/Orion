@@ -93,6 +93,15 @@ discover = true                 # also look on the usual ports: 11434, 8080, 800
 vram_reserve_mb = 1024          # kept free on each GPU; models load only within the rest
 keep_alive = "30m"              # how long a loaded model stays after its last use
 
+# The desktop: sound, screens, power, Bluetooth, apps and the clock.
+[desktop]
+# Changes that need no approval, by kind: "volume", "brightness", "displays",
+# "power_profile", "lock", "suspend", "hibernate", "reboot", "poweroff",
+# "bluetooth" (connecting known devices), "clock", "open" (files and links in
+# their default app).
+approved = ["volume", "brightness", "lock"]
+apps = []                       # app_open without asking, by desktop id, e.g. ["firefox", "org.gnome.*"]
+
 # Mounting and unmounting (disk_mount, disk_unmount).
 [disks]
 # Mounts no approval can unmount; a disk holding one is never mounted again.

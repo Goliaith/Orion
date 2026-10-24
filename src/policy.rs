@@ -190,6 +190,37 @@ impl Default for PackagesPolicy {
     }
 }
 
+/// `[desktop]`: sound, screens, power, Bluetooth, apps and the clock.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DesktopPolicy {
+    /// Changes that need no approval, by kind: `volume`, `brightness`,
+    /// `displays`, `power_profile`, `lock`, `suspend`, `hibernate`,
+    /// `reboot`, `poweroff`, `bluetooth` (connecting known devices),
+    /// `clock`, `open` (files and links in their default app).
+    pub approved: Vec<String>,
+    /// Apps `app_open` may start without asking, by desktop id (`*` wildcards):
+    /// `["firefox", "org.gnome.*"]`.
+    pub apps: Vec<String>,
+}
+
+impl Default for DesktopPolicy {
+    fn default() -> Self {
+        Self { approved: ["volume", "brightness", "lock"].map(String::from).to_vec(), apps: Vec::new() }
+    }
+}
+
+impl DesktopPolicy {
+    /// Granted when `kind` is in `approved`.
+    pub fn preapproval(&self, kind: &str) -> crate::tool::Preapproval {
+        if self.approved.iter().any(|a| a == kind) {
+            crate::tool::Preapproval::Granted
+        } else {
+            crate::tool::Preapproval::NotApplicable
+        }
+    }
+}
+
 /// `[disks]`: mounting and unmounting.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -268,6 +299,7 @@ pub struct Policy {
     pub packages: PackagesPolicy,
     pub models: ModelsPolicy,
     pub disks: DisksPolicy,
+    pub desktop: DesktopPolicy,
     pub audit: AuditPolicy,
     /// Settings for the `orion chat` front-end.
     pub chat: crate::chat::ChatConfig,
