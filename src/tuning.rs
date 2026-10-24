@@ -142,8 +142,10 @@ impl Overlay {
     fn save(&self) -> Result<PathBuf> {
         let path = Self::path().context("no home directory")?;
         if *self == Self::default() {
-            let _ = std::fs::remove_file(&path);
-            return Ok(path);
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).with_context(|| format!("removing {}", path.display())),
+                _ => return Ok(path),
+            }
         }
         let text = format!(
             "# Settings Orion tuned with your approval (settings_tune), applied over orion.toml.\n\

@@ -343,11 +343,14 @@ fn watch_policy(path: &Path, shared: &Shared, stats: &Stats) {
         if now == last {
             continue;
         }
+        // orion.toml just went away, perhaps in the middle of a save.
+        let removed = now.0.is_none() && last.0.is_some();
         last = now;
-        if now.0.is_none() {
+        if removed {
             continue;
         }
-        match Policy::load(Some(path)) {
+        // Without orion.toml, the built-in defaults with the tuning over them.
+        match Policy::load(now.0.is_some().then_some(path)) {
             Ok((policy, _)) => {
                 *shared.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(Orion::new(policy));
                 stats.reloads.fetch_add(1, Ordering::Relaxed);
