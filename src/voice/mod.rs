@@ -13,6 +13,7 @@ pub mod speak;
 pub mod speaker;
 mod torch;
 pub mod transcribe;
+pub mod tuning;
 pub mod wake;
 
 use std::path::PathBuf;

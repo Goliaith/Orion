@@ -2,7 +2,8 @@
 //! before anyone asks: failed services, disks filling up or failing,
 //! pending security updates, a reboot that is due, memory running out,
 //! parts running hot, a worn battery, bursts of errors and the kernel's
-//! hardware complaints in the journal, and repeated failed logins.
+//! hardware complaints in the journal, repeated failed logins, and voice
+//! listening that goes wrong (see `voice::tuning`).
 //!
 //! The daemon runs the checks every `[watch] interval_mins` (updates and
 //! disk health every `updates_hours`, since they take a moment), keeps the findings,
@@ -43,7 +44,7 @@ pub struct WatchConfig {
     pub notify: bool,
     /// Findings to leave out, by key (`*` wildcards): "service:backup.service",
     /// "disk:/mnt/archive", "updates", "reboot", "memory", "health:sda",
-    /// "temp:*", "battery:*", "errors:*", "kernel:*", "logins".
+    /// "temp:*", "battery:*", "errors:*", "kernel:*", "logins", "voice:*".
     pub ignore: Vec<String>,
     /// Drives' own SMART data (needs smartctl, and root through the helper).
     pub disk_health: bool,
@@ -453,6 +454,23 @@ fn journal_checks(policy: &Policy) -> Vec<Finding> {
 }
 
 /// Run the checks: the quick ones always; the update list and disk health when asked.
+/// Listening that went wrong: noise keeping requests going, the wake word
+/// heard as something else. Each comes with the setting that fixes it.
+fn voice(policy: &Policy) -> Vec<Finding> {
+    let log = crate::voice::tuning::VoiceLog::load();
+    crate::voice::tuning::diagnose(&log, &policy.voice)
+        .into_iter()
+        .map(|s| {
+            let hint = if s.change.as_object().is_some_and(|c| !c.is_empty()) {
+                format!("voice_tune {} fixes it, with the person's go-ahead; voice_check has the details", s.change)
+            } else {
+                "voice_check has the details".to_string()
+            };
+            Finding { key: s.key, severity: "warning".into(), title: s.title, detail: s.why, hint, since: None }
+        })
+        .collect()
+}
+
 pub fn check(policy: &Policy, with_updates: bool) -> Vec<Finding> {
     let w = &policy.watch;
     let mut all = services();
@@ -462,6 +480,7 @@ pub fn check(policy: &Policy, with_updates: bool) -> Vec<Finding> {
     all.extend(temperatures(policy));
     all.extend(batteries(w.battery_health_percent));
     all.extend(journal_checks(policy));
+    all.extend(voice(policy));
     if with_updates {
         all.extend(slow(policy));
     }

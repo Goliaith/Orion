@@ -529,8 +529,8 @@ That leaves your data. To remove it too:
 
 | Path | What |
 |---|---|
-| `~/.config/orion/` | the policy and the `env` file |
-| `~/.local/state/orion/` | conversations, memory, voiceprints, the audit log, chat history, the shell's address, the package history and the last unattended update |
+| `~/.config/orion/` | the policy, the `env` file, and `voice-tuning.toml` (voice settings Orion tuned with your approval) |
+| `~/.local/state/orion/` | conversations, memory, voiceprints, the audit log, chat history, the shell's address, the package history, the last unattended update, and `voice.json` (how recent spoken requests ended, for voice tuning) |
 | `~/.local/share/orion/` | the neural speaker model |
 | `~/orion-workspace/` | files the AI wrote (the default write root) |
 | `/etc/sudoers.d/orion` | the sudoers rule, if you made one |

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use super::tuning::{Ended, Take, VoiceLog};
 use super::{kill_group, shell, which, VoiceConfig};
 
 /// 100 ms of audio per measurement.
@@ -221,6 +222,11 @@ impl Recording {
         self.started.elapsed()
     }
 
+    /// Whether it ran to `max_seconds` instead of ending on a pause.
+    pub fn hit_limit(&self) -> bool {
+        self.elapsed() >= self.max
+    }
+
     pub fn heard_speech(&self) -> bool {
         self.with(|c| c.speech_ms >= MIN_SPEECH_MS)
     }
@@ -258,9 +264,20 @@ impl Recording {
 
     /// Stop and return the audio as WAV.
     pub fn finish(mut self) -> Result<Vec<u8>> {
+        let ended = if self.hit_limit() {
+            Ended::Limit
+        } else if self.with(|c| self.silence_ms > 0 && c.silent_ms >= self.silence_ms) {
+            Ended::Pause
+        } else {
+            Ended::Stopped
+        };
         let samples = self.take()?;
-        if !self.with(|c| c.speech_ms >= MIN_SPEECH_MS) {
+        let (heard, floor, sensitivity) = self.with(|c| (c.speech_ms >= MIN_SPEECH_MS, c.noise_floor, c.sensitivity));
+        if !heard {
             bail!("heard nothing that sounded like speech");
+        }
+        if let Some(t) = Take::measure(&samples, self.rate, floor, sensitivity, self.silence_ms, ended) {
+            VoiceLog::add_take(t);
         }
         Ok(super::wav(&samples, self.rate))
     }

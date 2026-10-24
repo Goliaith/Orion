@@ -31,7 +31,9 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | Tool           | Risk    | Default | What it does |
 |----------------|---------|---------|--------------|
 | `system_info`  | read    | allow   | Hostname, OS, kernel, CPU, memory, load, uptime |
-| `system_health` | read   | allow   | What needs attention: failed services, full or failing disks, security updates, a due reboot, low memory, heat, battery wear, journal errors, failed logins |
+| `system_health` | read   | allow   | What needs attention: failed services, full or failing disks, security updates, a due reboot, low memory, heat, battery wear, journal errors, failed logins, voice trouble |
+| `voice_check`  | read    | allow   | How listening is going: the voice settings, how recent spoken requests ended, what was heard in place of the wake word, and suggested changes with their reasons |
+| `voice_tune`   | write   | ask     | Change how Orion listens (noise margin, speech level, pause, time limit, wake-word spellings), and nothing else in the policy |
 | `disk_health`  | read    | allow   | Each drive's SMART health: good, warning or failing and why, wear, temperature, hours of use |
 | `sensor_status` | read   | allow   | Temperatures (CPU, GPU, drives, board) with their limits, and fan speeds |
 | `gpu_info`     | read    | allow   | Every GPU (NVIDIA, AMD, Intel) by name: memory, load, temperature, power, compute stacks, and what runs on each, down to the model |
@@ -255,6 +257,7 @@ It is local-first and uses what the machine already has:
 
 - **Listening ends on a pause.** Orion measures the room's noise floor at the start and waits for at least 0.3 s of speech before a pause can end the recording, so a click doesn't cut you off.
 - **Noisy rooms:** sound counts as speech when it is `noise_margin` times louder than the room (3 by default) and at least `speech_level`. If a fan, a TV or typing keeps Orion listening after you stop, run `orion voice noise`: it listens to the room for 5 seconds, then to you for 5, and prints the settings to use.
+- **Orion tunes itself, with your OK.** It notices when spoken requests keep running to the time limit, or when the transcriber keeps writing the wake word as something else ("Oreo"). It says what it saw and which setting would fix it, as a finding like the daemon's others ("Background noise keeps Orion listening"), or when you ask "how is my voice setup doing?". With your approval, `voice_tune` makes the change. Changes go to `~/.config/orion/voice-tuning.toml`, applied over `[voice]`. That file holds only these voice settings, so the AI can't change the rest of the policy. Delete it, or ask Orion to reset them, to go back. To notice this, Orion keeps the levels and endings of the last 20 requests and the near-miss spellings of the wake word in `~/.local/state/orion/voice.json`. It never keeps audio or anything else that was said.
 - **Transcripts are cleaned up.** Whisper's `[BLANK_AUDIO]`-style markers are removed.
 - **A spoken message is routed like a typed one,** so private speech stays on the local model.
 - **Nothing is sent off the machine** unless you point `transcribe_url` or `speak_url` at a remote server.

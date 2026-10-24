@@ -24,6 +24,7 @@ use anyhow::{bail, Context, Result};
 
 use super::record::{meter, rms, Sensitivity, CHUNK_MS, MIN_SPEECH_MS};
 use super::speaker::{Heard, Judge};
+use super::tuning::{Ended, Take, VoiceLog};
 use super::{kill_group, shell, Recorder, Transcriber, VoiceConfig};
 
 /// The part of an utterance checked for the wake phrase.
@@ -260,6 +261,10 @@ fn listen(setup: &Setup, shared: &Shared, tx: &Sender<WakeEvent>) -> Result<()> 
         for utterance in done {
             if hearing.take().is_some() {
                 // The request that follows a bare wake phrase.
+                let ended = if utterance.len() as u64 >= setup.max_ms * rate as u64 / 1000 { Ended::Limit } else { Ended::Pause };
+                if let Some(t) = Take::measure(&utterance, rate, seg.floor(), setup.recorder.sensitivity(), setup.silence_ms, ended) {
+                    VoiceLog::add_take(t);
+                }
                 seg.set_limits(GAP_MS, MAX_UTTERANCE_MS);
                 let both: Vec<i16> = std::mem::take(&mut wake_audio).into_iter().chain(utterance.iter().copied()).collect();
                 let Some(speaker) = identify(setup, shared, &both, rate) else {
@@ -295,7 +300,13 @@ fn listen(setup: &Setup, shared: &Shared, tx: &Sender<WakeEvent>) -> Result<()> 
             };
             let check = &utterance[..utterance.len().min((rate as u64 * CHECK_MS / 1000) as usize)];
             let Some(start) = transcribe(setup, check, rate) else { continue };
-            let Some(rest) = match_wake(&start, &setup.phrase, &setup.aliases) else { continue };
+            let Some(rest) = match_wake(&start, &setup.phrase, &setup.aliases) else {
+                if let Some(word) = near_miss(&start, &setup.phrase) {
+                    tracing::debug!("wake: heard {word:?}, close to the wake phrase");
+                    VoiceLog::add_near_miss(&word);
+                }
+                continue;
+            };
             // Longer than the part checked: the request is in the rest of it.
             let rest = if check.len() < utterance.len() {
                 transcribe(setup, &utterance, rate)
@@ -518,6 +529,10 @@ impl Segmenter {
         self.current = None;
     }
 
+    pub fn floor(&self) -> Option<f32> {
+        self.floor
+    }
+
     pub fn in_speech(&self) -> bool {
         self.current.is_some()
     }
@@ -665,6 +680,17 @@ pub fn match_wake(text: &str, phrase: &str, aliases: &[String]) -> Option<String
     None
 }
 
+/// The first word of `text`, when it sounds close to the wake phrase but
+/// not close enough to wake: the transcriber's spelling of it, perhaps
+/// ("Oreo" for "Orion"). Only that word is kept, never the rest.
+pub fn near_miss(text: &str, phrase: &str) -> Option<String> {
+    let target: String = words(phrase).into_iter().map(|w| w.0).collect();
+    let heard = words(text);
+    let (word, ..) = heard.into_iter().find(|w| !FILLERS.contains(&w.0.as_str()))?;
+    let plausible = word.len() >= 3 && word.chars().all(char::is_alphabetic) && !sounds_like(&word, &target);
+    (plausible && (edit_distance(&word, &target) <= 2 || sound(&word) == sound(&target))).then_some(word)
+}
+
 /// "Stop", "never mind", "be quiet": a request to stop, not a question.
 pub fn is_stop_request(text: &str) -> bool {
     let w: Vec<String> = words(text).into_iter().map(|w| w.0).collect();
@@ -695,6 +721,14 @@ pub fn spoken_answer(text: &str) -> Option<bool> {
 mod tests {
     use super::super::record::tests::pcm;
     use super::*;
+
+    #[test]
+    fn notes_near_misses_of_the_wake_word() {
+        assert_eq!(near_miss("Oreo, what time is it?", "orion").as_deref(), Some("oreo"));
+        assert_eq!(near_miss("Hey, Orin, what's up", "orion"), None, "close enough to wake already");
+        assert_eq!(near_miss("What time is it?", "orion"), None);
+        assert_eq!(near_miss("", "orion"), None);
+    }
 
     #[test]
     fn hears_the_wake_phrase_as_transcribers_spell_it() {

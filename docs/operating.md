@@ -427,6 +427,7 @@ The daemon checks the machine every 15 minutes and keeps what it finds: failed s
 ```sh
 orion status                                      # the findings, each with what to do about it
 orion call system_health                          # checks afresh, including updates
+orion call voice_check                            # how listening is going, and what to change
 ```
 
 ```
@@ -654,7 +655,7 @@ unknown field `update`, expected one of `manager`, `allowed`, `protected`, `upda
 
 **Voice: `set voice.transcribe_url or voice.transcribe_command`, or nothing is heard.** Run `/voice` in the chat: it lists the microphone, transcriber and speech it found. `the recording is empty: is a microphone connected?` means the recorder got no audio: check the input device in your sound settings, or set `[voice] record_command`.
 
-**Voice: Orion keeps listening after you stop, or misses quiet speech.** Background noise is crossing the speech threshold, or your voice isn't. `orion voice noise` measures both and prints `noise_margin` and `speech_level` values to put under `[voice]`. If it says the room is as loud as your voice, move closer to the microphone, or use a wake-word detector (`contrib/orion-wake`).
+**Voice: Orion keeps listening after you stop, or misses quiet speech.** Background noise is crossing the speech threshold, or your voice isn't. Ask Orion "check my voice settings": `voice_check` looks at how your recent requests ended and suggests a change, which `voice_tune` makes once you approve it. Or `orion voice noise` measures both and prints `noise_margin` and `speech_level` values to put under `[voice]`. If it says the room is as loud as your voice, move closer to the microphone, or use a wake-word detector (`contrib/orion-wake`).
 
 **The wake detector stopped.** Run the `wake_command` by hand with `--verbose` (for `orion-wake`) to see its error: usually a missing `pip install --user vosk`, or no microphone.
 

@@ -336,10 +336,15 @@ impl Policy {
             Some(path) => {
                 let text = std::fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
-                let policy = Self::from_toml(&text).with_context(|| format!("parsing {}", path.display()))?;
+                let mut policy = Self::from_toml(&text).with_context(|| format!("parsing {}", path.display()))?;
+                crate::voice::tuning::Tuning::load().apply(&mut policy.voice);
                 Ok((policy, Some(path)))
             }
-            None => Ok((Self::from_toml("")?, None)),
+            None => {
+                let mut policy = Self::from_toml("")?;
+                crate::voice::tuning::Tuning::load().apply(&mut policy.voice);
+                Ok((policy, None))
+            }
         }
     }
 
