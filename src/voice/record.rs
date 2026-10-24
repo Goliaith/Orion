@@ -17,12 +17,38 @@ pub(crate) const CHUNK_MS: u64 = 100;
 /// click or a cough does not.
 pub(crate) const MIN_SPEECH_MS: u64 = 300;
 
+/// What counts as speech: louder than the room's noise by `margin`, and
+/// never quieter than `level`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Sensitivity {
+    pub margin: f32,
+    pub level: f32,
+}
+
+impl Default for Sensitivity {
+    fn default() -> Self {
+        Self { margin: 3.0, level: 300.0 }
+    }
+}
+
+impl Sensitivity {
+    pub fn from_config(config: &VoiceConfig) -> Self {
+        Self { margin: config.noise_margin.max(1.0), level: config.speech_level.max(0.0) }
+    }
+
+    /// Louder than this counts as speech.
+    pub fn threshold(&self, noise_floor: Option<f32>) -> f32 {
+        (noise_floor.unwrap_or(0.0) * self.margin).max(self.level)
+    }
+}
+
 #[derive(Clone)]
 pub struct Recorder {
     command: String,
     rate: u32,
     silence_ms: u64,
     max: Duration,
+    sensitivity: Sensitivity,
 }
 
 impl Recorder {
@@ -43,7 +69,13 @@ impl Recorder {
                 .map(|(_, cmd)| cmd)
                 .context("no recorder found: install pulseaudio-utils (parecord), alsa-utils (arecord), sox or ffmpeg, or set voice.record_command")?
         };
-        Ok(Self { command, rate, silence_ms: config.silence_ms, max: Duration::from_secs(config.max_seconds.max(1)) })
+        Ok(Self {
+            command,
+            rate,
+            silence_ms: config.silence_ms,
+            max: Duration::from_secs(config.max_seconds.max(1)),
+            sensitivity: Sensitivity::from_config(config),
+        })
     }
 
     pub fn describe(&self) -> String {
@@ -52,6 +84,10 @@ impl Recorder {
 
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    pub(crate) fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
     }
 
     /// The recorder process, writing raw PCM to its stdout.
@@ -73,7 +109,7 @@ impl Recorder {
     pub fn start(&self) -> Result<Recording> {
         let mut child = self.spawn()?;
         let mut stdout = child.stdout.take().context("recorder has no stdout")?;
-        let shared = Arc::new(Mutex::new(Capture::default()));
+        let shared = Arc::new(Mutex::new(Capture { sensitivity: self.sensitivity, ..Default::default() }));
         let chunk_bytes = (self.rate as u64 * 2 * CHUNK_MS / 1000) as usize;
         let reader = {
             let shared = shared.clone();
@@ -119,11 +155,6 @@ pub(crate) fn meter(rms: f32) -> f32 {
     ((db + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
-/// Louder than this counts as speech: well above the room's noise.
-pub(crate) fn speech_threshold(noise_floor: Option<f32>) -> f32 {
-    (noise_floor.unwrap_or(0.0) * 3.0).max(300.0)
-}
-
 #[derive(Default)]
 struct Capture {
     samples: Vec<i16>,
@@ -131,6 +162,7 @@ struct Capture {
     pending: Vec<i16>,
     level: f32,
     noise_floor: Option<f32>,
+    sensitivity: Sensitivity,
     chunks: u32,
     speech_ms: u64,
     silent_ms: u64,
@@ -155,7 +187,7 @@ impl Capture {
         if self.chunks <= 3 {
             self.noise_floor = Some(self.noise_floor.map_or(rms, |f| f.min(rms)));
         }
-        if rms > speech_threshold(self.noise_floor) {
+        if rms > self.sensitivity.threshold(self.noise_floor) {
             self.speech_ms += CHUNK_MS;
             self.silent_ms = 0;
         } else {
@@ -226,17 +258,27 @@ impl Recording {
 
     /// Stop and return the audio as WAV.
     pub fn finish(mut self) -> Result<Vec<u8>> {
-        if let Some(why) = self.stop_recorder() {
-            bail!("{why}: is a microphone connected?");
-        }
-        let (samples, heard) = self.with(|c| (c.samples.clone(), c.speech_ms >= MIN_SPEECH_MS));
-        if samples.len() < (self.rate / 4) as usize {
-            bail!("the recording is empty: is a microphone connected?");
-        }
-        if !heard {
+        let samples = self.take()?;
+        if !self.with(|c| c.speech_ms >= MIN_SPEECH_MS) {
             bail!("heard nothing that sounded like speech");
         }
         Ok(super::wav(&samples, self.rate))
+    }
+
+    /// Stop and return the samples, speech or not.
+    pub(crate) fn finish_raw(mut self) -> Result<Vec<i16>> {
+        self.take()
+    }
+
+    fn take(&mut self) -> Result<Vec<i16>> {
+        if let Some(why) = self.stop_recorder() {
+            bail!("{why}: is a microphone connected?");
+        }
+        let samples = self.with(|c| c.samples.clone());
+        if samples.len() < (self.rate / 4) as usize {
+            bail!("the recording is empty: is a microphone connected?");
+        }
+        Ok(samples)
     }
 
     pub fn cancel(mut self) {

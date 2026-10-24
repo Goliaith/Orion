@@ -654,6 +654,10 @@ unknown field `update`, expected one of `manager`, `allowed`, `protected`, `upda
 
 **Voice: `set voice.transcribe_url or voice.transcribe_command`, or nothing is heard.** Run `/voice` in the chat: it lists the microphone, transcriber and speech it found. `the recording is empty: is a microphone connected?` means the recorder got no audio: check the input device in your sound settings, or set `[voice] record_command`.
 
+**Voice: Orion keeps listening after you stop, or misses quiet speech.** Background noise is crossing the speech threshold, or your voice isn't. `orion voice noise` measures both and prints `noise_margin` and `speech_level` values to put under `[voice]`. If it says the room is as loud as your voice, move closer to the microphone, or use a wake-word detector (`contrib/orion-wake`).
+
+**The wake detector stopped.** Run the `wake_command` by hand with `--verbose` (for `orion-wake`) to see its error: usually a missing `pip install --user vosk`, or no microphone.
+
 **Wake listening won't start with a remote transcriber.** It would send everything said near the microphone off the machine. Run the transcriber locally, or set `wake_allow_remote = true` if that's what you want.
 
 **`… is from another version of Orion; enroll again`.** Run `orion voice enroll` (with `--name` for others) again.

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use super::record::{meter, rms, speech_threshold, CHUNK_MS, MIN_SPEECH_MS};
+use super::record::{meter, rms, Sensitivity, CHUNK_MS, MIN_SPEECH_MS};
 use super::speaker::{Heard, Judge};
 use super::{kill_group, shell, Recorder, Transcriber, VoiceConfig};
 
@@ -222,7 +222,7 @@ fn listen(setup: &Setup, shared: &Shared, tx: &Sender<WakeEvent>) -> Result<()> 
     let mut held = hold(shared, setup.recorder.spawn_tied()?);
     let stdout = held.1.stdout.take().context("the recorder has no output")?;
     let chunks = pcm_chunks(stdout, (rate as u64 * CHUNK_MS / 1000) as usize);
-    let mut seg = Segmenter::new(rate, GAP_MS, MAX_UTTERANCE_MS);
+    let mut seg = Segmenter::new(rate, GAP_MS, MAX_UTTERANCE_MS, setup.recorder.sensitivity());
     // When woke by a bare wake phrase: since when we wait for the request.
     let mut hearing: Option<Instant> = None;
     // That wake phrase's audio, to judge the voice together with the request.
@@ -480,6 +480,7 @@ pub(crate) struct Segmenter {
     current: Option<Utterance>,
     gap_ms: u64,
     max_ms: u64,
+    sensitivity: Sensitivity,
     pub level: f32,
 }
 
@@ -491,7 +492,7 @@ struct Utterance {
 }
 
 impl Segmenter {
-    pub fn new(rate: u32, gap_ms: u64, max_ms: u64) -> Self {
+    pub fn new(rate: u32, gap_ms: u64, max_ms: u64, sensitivity: Sensitivity) -> Self {
         Self {
             chunk: (rate as u64 * CHUNK_MS / 1000) as usize,
             pending: Vec::new(),
@@ -501,6 +502,7 @@ impl Segmenter {
             current: None,
             gap_ms,
             max_ms,
+            sensitivity,
             level: 0.0,
         }
     }
@@ -535,7 +537,7 @@ impl Segmenter {
         let r = rms(&chunk);
         self.level = meter(r);
         self.measured += 1;
-        let loud = self.measured > 3 && r > speech_threshold(self.floor);
+        let loud = self.measured > 3 && r > self.sensitivity.threshold(self.floor);
         if !loud {
             // The quietest of the first chunks, then a slow follow of the room.
             self.floor = Some(match self.floor {
@@ -730,7 +732,7 @@ mod tests {
 
     #[test]
     fn cuts_utterances_on_pauses() {
-        let mut seg = Segmenter::new(16_000, 600, 8000);
+        let mut seg = Segmenter::new(16_000, 600, 8000, Sensitivity::default());
         let audio = samples(&[(false, 500), (true, 700), (false, 900), (true, 100), (false, 900), (true, 1200), (false, 800)]);
         let mut out = Vec::new();
         for part in audio.chunks(1000) {
@@ -744,7 +746,7 @@ mod tests {
         assert!(!seg.in_speech());
 
         // Long speech is cut at the limit.
-        let mut seg = Segmenter::new(16_000, 600, 2000);
+        let mut seg = Segmenter::new(16_000, 600, 2000, Sensitivity::default());
         let out = seg.push(&samples(&[(false, 400), (true, 5000)]));
         assert_eq!(out.len(), 2);
         assert!(seg.in_speech());

@@ -53,6 +53,8 @@ enum VoiceCmd {
     Test,
     /// Who is enrolled, and what each may do by voice.
     Status,
+    /// Measure the room's noise and your voice, and suggest a speech threshold.
+    Noise,
     /// Forget someone's voice (or everyone's, with --all).
     Forget {
         name: Option<String>,
@@ -303,6 +305,7 @@ fn main() -> Result<()> {
                 VoiceCmd::Enroll { name } => orion::voice::enroll::enroll(v, name.as_deref()),
                 VoiceCmd::Test => orion::voice::enroll::test(v),
                 VoiceCmd::Status => orion::voice::enroll::status(v),
+                VoiceCmd::Noise => orion::voice::enroll::noise(v),
                 VoiceCmd::Forget { name, all } => orion::voice::enroll::forget(name.as_deref(), all),
                 VoiceCmd::Model { action } => match action {
                     ModelCmd::Install { from } => orion::voice::enroll::model_install(from.as_deref()),

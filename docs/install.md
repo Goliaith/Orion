@@ -292,6 +292,17 @@ orion voice test
 
 On a machine without internet, download the Resemblyzer 0.1.4 wheel elsewhere and use `orion voice model install --from <file>`.
 
+A wake-word detector, so Orion transcribes only after it hears its name. On a laptop processor this is faster and more reliable than transcribing everything:
+
+```sh
+install -Dm 755 contrib/orion-wake ~/.local/bin/orion-wake
+pip install --user vosk                 # or: openwakeword onnxruntime (see the README)
+orion-wake --verbose                    # say "Orion"; Ctrl-C to stop
+printf 'wake_command = "~/.local/bin/orion-wake"\n' >> ~/.config/orion/orion.toml   # under [voice]
+```
+
+If noise keeps Orion listening after you stop talking, run `orion voice noise` and add the settings it prints under `[voice]`.
+
 ### The graphical shell
 
 `orion shell` needs only a browser on the same machine. To make Orion the whole desktop, install the `cage` kiosk compositor and Chromium (or Firefox), then run `contrib/orion-kiosk` as the session:
