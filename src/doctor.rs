@@ -846,7 +846,7 @@ fn listen(rec: &crate::voice::record::Recorder, time: Duration) -> Result<(usize
         if data.len() % 2 == 1 {
             odd = data.pop();
         }
-        for s in data.chunks_exact(2) {
+        for s in data.as_chunks::<2>().0 {
             peak = peak.max(i16::from_le_bytes([s[0], s[1]]).unsigned_abs());
         }
     }
