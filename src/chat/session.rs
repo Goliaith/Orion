@@ -254,11 +254,11 @@ impl<'a> Session<'a> {
             None => Default::default(),
         };
         if let Some(j) = &self.journal {
-            for text in [&mut for_claude, &mut for_local] {
+            for (text, private) in [(&mut for_claude, false), (&mut for_local, self.local_on_machine)] {
                 if !text.is_empty() {
                     text.push_str("\n\n");
                 }
-                text.push_str(&j.prompt(&name));
+                text.push_str(&j.prompt(&name, private));
             }
         }
         self.context = (for_claude, for_local);
@@ -1180,6 +1180,7 @@ mod tests {
         s.set_person("ana");
         let prompt = s.system_for(Provider::Local);
         assert!(prompt.contains("Prefers metric units") && !prompt.contains("medical"), "{prompt}");
+        assert!(!prompt.contains("health"), "not even the topic: {prompt}");
 
         // A private message would go to the local model, but it's hosted: ask.
         let mut ui = Recorder::default();

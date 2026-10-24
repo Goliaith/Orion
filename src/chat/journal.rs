@@ -83,6 +83,8 @@ pub struct Hit {
 pub struct Topic {
     pub name: String,
     pub entries: usize,
+    /// Of those, the private ones.
+    pub private: usize,
     pub updated: f64,
 }
 
@@ -105,16 +107,7 @@ pub struct Journal {
 
 impl Journal {
     pub fn open(home: &Path, person: &str) -> Self {
-        let mut name: String = person
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-            .take(20)
-            .collect();
-        if !name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-            name.insert(0, 'p');
-        }
-        Self { root: home.join(".grok").join("state"), prefix: format!("{name}_") }
+        Self { root: home.join(".grok").join("state"), prefix: format!("{}_", slug_name(person)) }
     }
 
     /// The slug for one of this person's topics. Lenient about how the
@@ -157,7 +150,8 @@ impl Journal {
             .filter_map(|slug| {
                 let entries = read_jsonl(&self.memories(&slug));
                 let updated = entries.iter().map(ts).fold(0.0, f64::max);
-                Some(Topic { name: self.topic_of(&slug)?.to_string(), entries: entries.len(), updated })
+                let private = entries.iter().filter(|e| is_private(e)).count();
+                Some(Topic { name: self.topic_of(&slug)?.to_string(), entries: entries.len(), private, updated })
             })
             .collect();
         out.sort_by(|a, b| b.updated.total_cmp(&a.updated));
@@ -378,16 +372,23 @@ impl Journal {
         Ok(())
     }
 
-    /// The part of a system prompt that names this person's topics.
-    pub fn prompt(&self, name: &str) -> String {
-        let topics = self.topics();
+    /// The part of a system prompt that names this person's topics. Not
+    /// when `private` is false, their private entries: a topic of nothing
+    /// else would give away what it is about.
+    pub fn prompt(&self, name: &str, private: bool) -> String {
+        let topics: Vec<(String, usize)> = self
+            .topics()
+            .into_iter()
+            .map(|t| (t.name, if private { t.entries } else { t.entries - t.private }))
+            .filter(|(_, n)| *n > 0)
+            .collect();
         if topics.is_empty() {
             return format!(
                 "Your journal for {name} is empty. Use journal_write for things worth finding again in later \
                  conversations, and journal_decide for decisions and why they were made."
             );
         }
-        let shown: Vec<String> = topics.iter().take(PROMPT_TOPICS).map(|t| format!("{} ({})", t.name, t.entries)).collect();
+        let shown: Vec<String> = topics.iter().take(PROMPT_TOPICS).map(|(t, n)| format!("{t} ({n})")).collect();
         let more = topics.len().saturating_sub(PROMPT_TOPICS);
         let mut out = format!("Your journal for {name} has these topics, most recent first: {}", shown.join(", "));
         if more > 0 {
@@ -399,6 +400,27 @@ impl Journal {
         );
         out
     }
+}
+
+/// A person's part of a slug. Names are letters, digits, `-` and `_`, up
+/// to 32 (`voice::speaker::valid_name`); `_` ends the prefix and HelixCore
+/// takes ASCII only, so a name with anything else gets a hash of the
+/// original too, keeping `ana_b` and `ana-b` apart.
+fn slug_name(person: &str) -> String {
+    let plain = !person.is_empty()
+        && person.len() <= 32
+        && person.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && person.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if plain {
+        return person.to_string();
+    }
+    let mut name: String = person.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).take(24).collect();
+    if !name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        name.insert(0, 'p');
+    }
+    // FNV-1a: stable across builds, unlike std's hasher.
+    let hash = person.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
+    format!("{name}-{:06x}", hash & 0xff_ffff)
 }
 
 /// The hits as a note appended to the user's message.
@@ -600,6 +622,9 @@ fn append_jsonl(path: &Path, entry: &Value) -> Result<()> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
+    // A file that was already there (written by HelixCore) may be readable
+    // by others.
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     f.write_all(line(entry)?.as_bytes())?;
     Ok(())
 }
@@ -663,7 +688,7 @@ mod tests {
         let mut topics: Vec<(String, usize)> = j.topics().into_iter().map(|t| (t.name, t.entries)).collect();
         topics.sort();
         assert_eq!(topics, [("home-network".to_string(), 1), ("thesis-code".to_string(), 2)]);
-        assert!(j.prompt("Ana").contains("thesis-code (2)"), "{}", j.prompt("Ana"));
+        assert!(j.prompt("Ana", false).contains("thesis-code (2)"), "{}", j.prompt("Ana", false));
 
         assert!(j.write("x", "the key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789", false).is_err());
         assert!(j.write("!!!", "something", false).is_err());
@@ -711,6 +736,16 @@ mod tests {
         assert!(ana.search(None, "clinic thursdays", 5, true).unwrap()[0].private);
         assert!(ben.search(None, "tomato", 5, true).unwrap().iter().all(|h| h.text.starts_with("Ben")));
         assert_eq!(ben.topics().len(), 1);
+        // A topic of only private entries isn't named to a model elsewhere.
+        assert!(!ana.prompt("Ana", false).contains("health") && ana.prompt("Ana", false).contains("garden (1)"));
+        assert!(ana.prompt("Ana", true).contains("health (1)"));
+        // People whose names only differ in what a slug can't hold stay apart.
+        for (a, b) in [("ana_b", "ana-b"), ("Ana", "ana"), ("józef", "jozef"), ("ana_x", "ana")] {
+            let (ja, jb) = (Journal::open(home.path(), a), Journal::open(home.path(), b));
+            assert!(!ja.prefix.starts_with(&jb.prefix) && !jb.prefix.starts_with(&ja.prefix), "{a} {b}");
+        }
+        assert_eq!(slug_name("bea"), "bea");
+        assert!(slug_name("ana_b").starts_with("ana-b-"));
         // Writing a private entry again keeps it private, even if it's said
         // in a way that isn't.
         ana.write("health", "The physiotherapy appointment moved to Thursdays at the clinic.", false).unwrap();

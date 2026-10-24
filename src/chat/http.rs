@@ -230,6 +230,14 @@ pub fn bypass_proxy(base_url: &str) -> bool {
     })
 }
 
+/// Whether requests to `base_url` go through a proxy from the environment.
+pub fn proxied(base_url: &str) -> bool {
+    !bypass_proxy(base_url)
+        && ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+            .iter()
+            .any(|v| non_empty_env(v).is_some())
+}
+
 pub fn non_empty_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|v| !v.trim().is_empty())
 }

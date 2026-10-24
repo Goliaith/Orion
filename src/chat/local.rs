@@ -53,8 +53,9 @@ impl Default for LocalConfig {
 impl LocalConfig {
     /// Whether what is private may be sent to this server. A hosted API
     /// behind the local backend (Gemini) is not on this machine.
+    /// Through a proxy, it isn't: the proxy sees everything.
     pub fn on_machine(&self) -> bool {
-        self.on_machine.unwrap_or_else(|| is_on_machine(&self.base_url))
+        self.on_machine.unwrap_or_else(|| is_on_machine(&self.base_url) && !super::http::proxied(&self.base_url))
     }
 }
 
