@@ -288,6 +288,9 @@ cage -- orion-kiosk                        # from a TTY login or a display manag
 | `bt_status`, `bt_device` | BlueZ (`bluetoothctl`) |
 | `app_open` without an app | `xdg-open` (xdg-utils) |
 | `clock_set` | systemd (`timedatectl`, `localectl`) |
+| `disk_health`, the disk-health check | smartmontools (`smartctl`), and root: the privileged helper or sudo |
+| `sensor_status`, the temperature check | the kernel's sensor drivers (`sensors-detect` from lm-sensors finds them); NVIDIA's driver needs `nvidia-smi` |
+| The error and login checks | membership of `systemd-journal` (or `adm`/`wheel`) to read the system journal |
 
 Tools whose program is missing report that when called. The others still work.
 
@@ -304,6 +307,7 @@ Installing packages and updates, controlling system services, changing the netwo
 - **Services:** `systemctl` start, stop, restart, reload, enable and disable of units that aren't protected. That includes the units that give a root shell on a console, such as `debug-shell.service`.
 - **GPU pins:** only Orion's `50-orion-gpu.conf` drop-in, holding only the GPU variables. A drop-in with `ExecStart=` would run anything as root.
 - **Disks:** mounts only under the mount roots, always `nosuid,nodev`, of disks the system doesn't run from; unmounts of anything but the system's own mounts.
+- **Disk health:** only `smartctl --json=c -a --nocheck=standby` on a whole disk listed in /sys/block: reading SMART data, never changing a setting or starting a self-test.
 - **Clock and language:** `timedatectl` and `localectl` setting a time zone that exists in `/usr/share/zoneinfo`, network time on or off, a locale generated on the machine, or an XKB keyboard layout. Never the time itself.
 - **Network:** NetworkManager's Wi-Fi and connection commands as Orion makes them (no VPN imports, which can run scripts), and firewall rules that keep SSH open.
 

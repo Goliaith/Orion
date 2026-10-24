@@ -83,6 +83,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Snapper and btrfs, for the snapshots
-        run: sudo apt-get update -q && sudo apt-get install -y -q snapper btrfs-progs
+        run: sudo apt-get update -q && sudo apt-get install -y -q snapper btrfs-progs smartmontools
       - run: cargo build --locked
       - run: sudo tests/helper/run.sh

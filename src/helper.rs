@@ -18,6 +18,7 @@
 //! - NetworkManager's Wi-Fi and connection commands, and firewall rules
 //!   that keep SSH open;
 //! - snapper snapshots on the helper's own configuration;
+//! - reading drives' SMART data;
 //! - the time zone, network time, locale and keyboard layout, with values
 //!   the machine has.
 //!

@@ -43,6 +43,11 @@ fn supplies(root: &Path) -> (Vec<Value>, Option<bool>) {
     (batteries, on_ac)
 }
 
+/// The machine's own batteries, for the health watch.
+pub(super) fn batteries() -> Vec<Value> {
+    supplies(Path::new("/sys/class/power_supply")).0
+}
+
 fn battery(dir: &Path) -> Value {
     // Energy (µWh) or charge (µAh): drivers give one or the other.
     let (now, full, design, rate) = match number(dir, "energy_now") {

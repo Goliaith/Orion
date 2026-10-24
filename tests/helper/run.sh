@@ -117,6 +117,8 @@ expect "a snapper command Orion never makes" "$(raw "$user" '{"program":"snapper
 if [ -n "$snap" ]; then
     expect "undoing an Orion snapshot pair" "$(raw "$user" '{"program":"snapper","args":["--no-dbus","-c","orion-hlp","undochange","1..2"],"stdin":null,"timeout_secs":60}')" '"status":0'
 fi
+expect "a SMART setting change" "$(raw "$user" '{"program":"smartctl","args":["--json=c","-a","--nocheck=standby","-s","off","/dev/sda"],"stdin":null,"timeout_secs":10}')" "refused"
+expect "disk_health reads SMART through it" "$(orion disk_health)" '"disks"'
 expect "a root shell on a console" "$(raw "$user" '{"program":"systemctl","args":["--no-ask-password","start","--","debug-shell.service"],"stdin":null,"timeout_secs":10}')" "protected"
 # A real disk, so the refusal is about the options, not a missing device.
 truncate -s 32M "$work/disk.img" && mkfs.ext4 -q "$work/disk.img" && loop=$(losetup -f --show "$work/disk.img" 2>/dev/null)

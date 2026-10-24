@@ -18,8 +18,10 @@ mod network;
 mod packages;
 mod power;
 mod process;
+mod sensors;
 mod services;
 pub(crate) mod session;
+mod smart;
 mod system;
 mod timers;
 mod updates;
@@ -44,6 +46,21 @@ pub fn journal_time(secs: i64) -> String {
 /// Pending updates for the health watch: (all, security fixes, a kernel).
 pub fn pending_updates(policy: &Policy) -> Result<(usize, usize, bool)> {
     updates::summary(policy)
+}
+
+/// Every disk's SMART health, for the health watch.
+pub fn disk_health(policy: &Policy) -> Result<Vec<smart::Disk>> {
+    smart::check(policy)
+}
+
+/// Every temperature, with its limits, for the health watch.
+pub fn temperatures() -> Vec<sensors::Reading> {
+    sensors::temperatures()
+}
+
+/// The batteries (power_status's view), for the health watch.
+pub fn batteries() -> Vec<serde_json::Value> {
+    power::batteries()
 }
 
 /// Why the machine needs a reboot, for the health watch; empty if it doesn't.
@@ -80,6 +97,7 @@ pub fn helper_check(policy: &Policy, peer: &Peer, program: &str, args: &[String]
         "env" | "dnf" | "zypper" | "pacman" => plain(updates::helper_check(policy, program, args)),
         "snapper" => plain(changes::helper_check(policy, args)),
         "timedatectl" | "localectl" => plain(clock::helper_check(program, args)),
+        "smartctl" => plain(smart::helper_check(args)),
         "systemctl" | "tee" | "rm" => plain(services::helper_check(policy, program, args, stdin)),
         "mkdir" if drop_in => plain(services::helper_check(policy, program, args, stdin)),
         "mkdir" | "mount" | "umount" | "eject" | "fuser" => plain(disks::helper_check(policy, peer.uid, peer.gid, program, args)),
@@ -145,6 +163,8 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(apps::AppOpen),
         Box::new(clock::ClockStatus),
         Box::new(clock::ClockSet),
+        Box::new(smart::DiskHealth),
+        Box::new(sensors::SensorStatus),
         Box::new(models::ModelStatus),
         Box::new(models::ModelLoad),
         Box::new(models::ModelUnload),

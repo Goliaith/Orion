@@ -422,7 +422,7 @@ When a desktop tool says no session is running, the daemon can't see your deskto
 
 ## What needs attention
 
-The daemon checks the machine every 15 minutes and keeps what it finds: failed services, filesystems 90% full, pending security updates, a reboot that is due, memory under 5%.
+The daemon checks the machine every 15 minutes and keeps what it finds: failed services, filesystems 90% full, pending security updates, a reboot that is due, memory under 5%, parts running hot, a battery holding under 70% of its charge, a program logging 50 errors in 15 minutes, any hardware error the kernel reports (CPU, memory, filesystem, disk I/O, GPU, throttling, out of memory), and 10 failed logins in an hour. Every 6 hours it also reads each drive's SMART data.
 
 ```sh
 orion status                                      # the findings, each with what to do about it
@@ -441,7 +441,10 @@ attention:    2 things (checked 09:14:11)
 - **The AI is told** at the start of each conversation, and brings it up once when it fits. Ask "how is the machine doing?" for a fresh check.
 - **The chat and the shell** show the findings: under the header, in the full-screen panel (Ctrl-B), in the shell's machine panel.
 - **Too noisy?** Raise `[watch] disk_percent`, or leave findings out by key with `ignore`, such as `["disk:/mnt/archive", "service:backup.service"]`. `notify = false` keeps the checks but stops the notifications; `enabled = false` stops the watch.
-- **Without the daemon,** `orion status` and the interfaces run the quick checks themselves, all but the update list.
+- **Without the daemon,** `orion status` and the interfaces run the quick checks themselves, all but the update list and disk health.
+- **Disk health needs** smartmontools, and root through the [privileged helper](install.md#the-privileged-helper-recommended), which runs only `smartctl --json=c -a --nocheck=standby` on a whole disk. Sleeping disks are left asleep. Virtual disks have no SMART data and show as unknown, which is never a finding.
+- **The error and login checks** read the system journal, which needs membership of `systemd-journal` (`adm` or `wheel` on some distributions); without it they see only your own programs.
+- **A finding about errors in the journal** lasts as long as they keep coming; once a 15-minute window is quiet, it clears, and it notifies again if they return.
 
 ## The audit log
 
