@@ -2,6 +2,10 @@
 # ORION_CONFIG). Every key is optional; the values shown are the defaults
 # unless noted otherwise.
 
+# `orion setup --trust ask|everyday|hands-off` sets [defaults] and the
+# allow-lists below for one of three trust levels (see "Trust levels" in the
+# README); `orion doctor` says which one this file is on.
+
 # What happens to tools that have no entry under [tools], by risk level:
 #   allow  run without asking
 #   ask    stop and ask you first (in `orion chat` / `orion call`); with no

@@ -1,6 +1,7 @@
 //! `orion setup`: pick the model, paste its key, and Orion checks the key
 //! with a live call and writes `orion.toml` and the env file itself, so
-//! nobody hand-edits TOML or hunts for invisible characters in a key.
+//! nobody hand-edits TOML or hunts for invisible characters in a key. It
+//! also asks how much Orion may do without asking, and writes that level.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
@@ -12,6 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::chat::http::{clean_secret, Http, StatusError};
+use crate::trust::Level;
 use crate::{envfile, Policy};
 
 pub const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -29,6 +31,9 @@ pub struct Options {
     pub model: Option<String>,
     /// For a local server: its OpenAI-compatible URL.
     pub base_url: Option<String>,
+    /// ask, everyday or hands-off; asked when unset. Given alone, setup
+    /// changes only the trust level.
+    pub trust: Option<String>,
     /// Take the default answer to every question, and a key already in the
     /// environment without asking.
     pub yes: bool,
@@ -427,7 +432,9 @@ struct Plan {
 }
 
 pub fn run(explicit: Option<&Path>, opts: Options) -> Result<()> {
-    let mut ask = Prompt::open(opts.yes).context("orion setup asks questions, so run it in a terminal")?;
+    let trust_only = opts.trust.is_some() && opts.provider.is_none() && opts.model.is_none() && opts.base_url.is_none();
+    // With only --trust, nothing need be asked.
+    let mut ask = Prompt::open(opts.yes || trust_only).context("orion setup asks questions, so run it in a terminal")?;
     let path = explicit
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("ORION_CONFIG").map(PathBuf::from))
@@ -456,12 +463,49 @@ pub fn run(explicit: Option<&Path>, opts: Options) -> Result<()> {
                     replace(&path, Some(t), include_str!("../orion.example.toml"))?;
                     text = Some(include_str!("../orion.example.toml").to_string());
                 } else {
-                    println!("Setup will change only the model settings, and checks the result loads.\n");
+                    println!("Setup will change only the model and trust settings, and checks the result loads.\n");
                 }
             }
         }
     }
 
+    let mut plan = if trust_only {
+        Plan { edits: Vec::new(), secret: None, summary: Vec::new() }
+    } else {
+        model_plan(&mut ask, &opts, &current)?
+    };
+    if let Some(level) = trust(&mut ask, &opts, &current, text.is_some())? {
+        plan.edits.extend(level.edits(&current));
+        plan.summary.push(format!("trust level {}", level.name()));
+        let extra = crate::trust::allowed_overrides(&current);
+        if !extra.is_empty() && level != Level::HandsOff {
+            println!("  Still without asking, by [tools] or tuning.toml: {}", extra.join(", "));
+        }
+    }
+
+    // Write it all.
+    let new = edited(text.as_deref(), &plan.edits)?;
+    let backup = replace(&path, text.as_deref(), &new)?;
+    println!("{}Saved {}: {}", if trust_only { "" } else { "\n" }, tilde(&path), plan.summary.join(", "));
+    if let Some(bak) = backup {
+        println!("  (the previous one is {})", tilde(&bak));
+    }
+    if let Some((var, key)) = &plan.secret {
+        envfile::set(&env_path, var, key)?;
+        println!("Saved {var} in {}, readable only by you", tilde(&env_path));
+        shadowed(&mut ask, var, key)?;
+        // This process, and anything it starts, uses the new key.
+        std::env::set_var(var, key);
+    }
+    restart_services(&mut ask)?;
+
+    println!("\nDone. Try it: orion chat");
+    println!("`orion doctor` checks the rest: the microphone, the sandbox and the helper.");
+    Ok(())
+}
+
+/// Which model, and its key.
+fn model_plan(ask: &mut Prompt, opts: &Options, current: &Policy) -> Result<Plan> {
     let provider = match opts.provider.as_deref() {
         Some("claude") => Provider::Claude,
         Some("gemini") => Provider::Gemini,
@@ -487,32 +531,48 @@ pub fn run(explicit: Option<&Path>, opts: Options) -> Result<()> {
             chosen
         }
     };
+    match provider {
+        Provider::Claude => claude(ask, opts, current),
+        Provider::Gemini => gemini(ask, opts, current),
+        Provider::Local => local(ask, opts, current),
+    }
+}
 
-    let plan = match provider {
-        Provider::Claude => claude(&mut ask, &opts, &current)?,
-        Provider::Gemini => gemini(&mut ask, &opts, &current)?,
-        Provider::Local => local(&mut ask, &opts, &current)?,
+/// The trust level to write: `--trust`, else asked. `None` leaves the
+/// policy's own settings, as `--yes` does.
+fn trust(ask: &mut Prompt, opts: &Options, current: &Policy, had_file: bool) -> Result<Option<Level>> {
+    if let Some(id) = &opts.trust {
+        return Level::parse(id).map(Some).with_context(|| format!("--trust is ask, everyday or hands-off, not {id:?}"));
+    }
+    if ask.assume_yes {
+        return Ok(None);
+    }
+    let now = crate::trust::detect(current);
+    let mut options: Vec<String> = Level::ALL
+        .iter()
+        .map(|l| format!("{}: {}{}", l.name(), l.describe(), if now == Some(*l) { " (now)" } else { "" }))
+        .collect();
+    // Settings of its own, which no level matches.
+    let keep = had_file && now.is_none();
+    if keep {
+        options.push("Keep the settings orion.toml has now".into());
+    }
+    let default = match now {
+        Some(l) => Level::ALL.iter().position(|x| *x == l).unwrap_or(1),
+        None if keep => Level::ALL.len(),
+        None => 1,
     };
-
-    // Write it all.
-    let new = edited(text.as_deref(), &plan.edits)?;
-    let backup = replace(&path, text.as_deref(), &new)?;
-    println!("\nSaved {}: {}", tilde(&path), plan.summary.join(", "));
-    if let Some(bak) = backup {
-        println!("  (the previous one is {})", tilde(&bak));
+    println!();
+    let i = ask.choose("What may Orion do without asking you first?", &options, default)?;
+    let Some(&level) = Level::ALL.get(i) else { return Ok(None) };
+    if level == Level::HandsOff
+        && now != Some(level)
+        && !ask.yes("Hands-off lets the AI install and remove software, run programs and reboot without asking. Sure?", false)?
+    {
+        println!("  The trust settings stay as they are.");
+        return Ok(None);
     }
-    if let Some((var, key)) = &plan.secret {
-        envfile::set(&env_path, var, key)?;
-        println!("Saved {var} in {}, readable only by you", tilde(&env_path));
-        shadowed(&mut ask, var, key)?;
-        // This process, and anything it starts, uses the new key.
-        std::env::set_var(var, key);
-    }
-    restart_services(&mut ask)?;
-
-    println!("\nDone. Try it: orion chat");
-    println!("`orion doctor` checks the rest: the microphone, the sandbox and the helper.");
-    Ok(())
+    Ok(Some(level))
 }
 
 /// A key to use: the one in `var` already (when it works), or a pasted one.
@@ -855,6 +915,30 @@ mod tests {
         assert!(p.yes("?", true).unwrap());
         assert!(!p.yes("?", true).unwrap());
         assert!(p.yes("?", true).is_err(), "end of input is no answer");
+    }
+
+    #[test]
+    fn asks_for_a_trust_level() {
+        let opts = Options::default();
+        let defaults = Policy::from_toml("").unwrap();
+        let ask = |answers: &str, current: &Policy, had_file: bool| trust(&mut Prompt::scripted(answers), &opts, current, had_file).unwrap();
+        // A new policy takes Everyday; Hands-off must be confirmed.
+        assert_eq!(ask("\n", &defaults, false), Some(Level::Everyday));
+        assert_eq!(ask("3\n\n", &defaults, false), None);
+        assert_eq!(ask("3\ny\n", &defaults, false), Some(Level::HandsOff));
+        // Settings of its own are kept unless a level is picked.
+        assert_eq!(ask("\n", &defaults, true), None);
+        assert_eq!(ask("1\n", &defaults, true), Some(Level::AskEverything));
+        // The level it has comes first.
+        let hands_off = Policy::from_toml(&edited(Some(""), &Level::HandsOff.edits(&defaults)).unwrap()).unwrap();
+        assert_eq!(ask("\n", &hands_off, true), Some(Level::HandsOff));
+        // --yes leaves it; --trust names it.
+        let mut yes = Prompt::scripted("");
+        yes.assume_yes = true;
+        assert_eq!(trust(&mut yes, &opts, &defaults, true).unwrap(), None);
+        let named = Options { trust: Some("hands-off".into()), ..Options::default() };
+        assert_eq!(trust(&mut yes, &named, &defaults, true).unwrap(), Some(Level::HandsOff));
+        assert!(trust(&mut yes, &Options { trust: Some("all".into()), ..Options::default() }, &defaults, true).is_err());
     }
 
     #[test]

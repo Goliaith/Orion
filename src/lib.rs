@@ -23,6 +23,7 @@ pub mod seccomp;
 pub mod setup;
 pub mod tool;
 pub mod tools;
+pub mod trust;
 pub mod tuning;
 pub mod voice;
 pub mod watch;

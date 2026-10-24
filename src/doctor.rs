@@ -1,5 +1,5 @@
-//! `orion doctor`: check what Orion stands on, in order (the policy file,
-//! the env file and key, the models, voice, the sandbox, the privileged
+//! `orion doctor`: check what Orion stands on, in order (the policy file
+//! and its trust level, the env file and key, the models, voice, the sandbox, the privileged
 //! helper and the daemon), say what is wrong in plain words, and offer to
 //! fix each thing it can.
 
@@ -129,6 +129,7 @@ pub fn run(explicit: Option<&Path>, opts: Options) -> Result<()> {
 
     println!("policy");
     let policy = config(&mut d, explicit)?;
+    trust(&mut d, &policy)?;
     println!("\nkeys");
     env_file(&mut d)?;
     println!("\nmodels");
@@ -277,6 +278,35 @@ fn config(d: &mut Doctor, explicit: Option<&Path>) -> Result<Policy> {
     }
     // Load it as Orion does, with the tuning applied.
     Ok(Policy::load(Some(&path)).map(|(p, _)| p).unwrap_or(Policy::from_toml(&text)?))
+}
+
+/// Which trust level the policy is set to, or which it is nearest.
+fn trust(d: &mut Doctor, policy: &Policy) -> Result<()> {
+    use crate::trust::{self, Level as Trust};
+    let mut c = match trust::detect(policy) {
+        Some(t) => check(if t == Trust::HandsOff { Level::Note } else { Level::Ok }, format!("trust level {}: {}", t.name(), t.describe())),
+        None if trust::is_default(policy) => {
+            check(Level::Note, "trust level: Orion's defaults (volume, brightness and locking run without asking; the rest asks)")
+                .hint("`orion setup --trust everyday` (or ask, hands-off) picks a level")
+        }
+        None => {
+            let (near, diff) = trust::closest(policy);
+            check(Level::Note, format!("trust level: settings of your own, nearest to {}", near.name())).hint(format!(
+                "unlike {}: {}\n`orion setup --trust {}` sets that level",
+                near.name(),
+                diff.join(", "),
+                near.id()
+            ))
+        }
+    };
+    let extra = trust::allowed_overrides(policy);
+    if !extra.is_empty() {
+        if !c.hint.is_empty() {
+            c.hint.push('\n');
+        }
+        c.hint.push_str(&format!("also without asking, by [tools] or tuning.toml: {}", extra.join(", ")));
+    }
+    d.report(c).map(drop)
 }
 
 /// Characters a hand-edited file shouldn't have, and the text without them.
