@@ -415,8 +415,9 @@ pub(super) fn helper_check(policy: &Policy, uid: u32, program: &str, args: &[Str
                 };
                 let rule = rule_args(action, &port, &proto, from.as_deref(), remove)?;
                 let (lo, hi) = check_rule(&rule, &super::network::ssh_ports())?;
+                let legacy = remove && action == "deny" && rule.from.is_none() && firewalld_legacy_deny(&proto, lo, hi) == args;
                 ensure!(
-                    firewalld_args(action, &proto, rule.from.as_deref(), lo, hi, remove) == args,
+                    legacy || firewalld_args(action, &proto, rule.from.as_deref(), lo, hi, remove) == args,
                     "that isn't a firewall-cmd rule Orion makes"
                 );
                 fine()
@@ -753,6 +754,14 @@ pub fn firewalld_args(action: &str, proto: &str, from: Option<&str>, lo: u16, hi
     }
 }
 
+/// How Orion wrote a deny with no source before it covered IPv6: the same
+/// rule for IPv4 only. Removing a deny removes this form too, so rules
+/// made then can still be taken out.
+pub fn firewalld_legacy_deny(proto: &str, lo: u16, hi: u16) -> Vec<String> {
+    let port = if lo == hi { lo.to_string() } else { format!("{lo}-{hi}") };
+    vec!["--permanent".into(), format!("--remove-rich-rule=rule family=\"ipv4\" port port=\"{port}\" protocol=\"{proto}\" reject")]
+}
+
 pub struct FwRule;
 
 impl Tool for FwRule {
@@ -804,6 +813,11 @@ impl Tool for FwRule {
                 let argv = firewalld_args(action, &a.proto, a.from.as_deref(), lo, hi, a.remove);
                 let done = admin(policy, "firewall-cmd", &argv, None)?;
                 ensure!(done.success(), "firewall-cmd: {}", done.complaint());
+                if a.remove && a.action == RuleAction::Deny && a.from.is_none() {
+                    // firewall-cmd only warns when the rule isn't there.
+                    let legacy = admin(policy, "firewall-cmd", &firewalld_legacy_deny(&a.proto, lo, hi), None)?;
+                    ensure!(legacy.success(), "firewall-cmd: {}", legacy.complaint());
+                }
                 admin_ok(policy, "firewall-cmd", &["--reload"])?;
             }
         }
@@ -979,6 +993,10 @@ mod tests {
         let port = firewalld_args("allow", "tcp", None, 443, 443, false);
         assert!(ok("firewall-cmd", &port.iter().map(String::as_str).collect::<Vec<_>>()));
         assert!(!ok("firewall-cmd", &["--permanent", "--add-rich-rule=rule family=\"ipv4\" port port=\"22\" protocol=\"tcp\" reject"]));
+        // The IPv4-only deny older versions wrote can be removed, not added.
+        let legacy = firewalld_legacy_deny("tcp", 5999, 5999);
+        assert!(ok("firewall-cmd", &legacy.iter().map(String::as_str).collect::<Vec<_>>()));
+        assert!(!ok("firewall-cmd", &["--permanent", "--add-rich-rule=rule family=\"ipv4\" port port=\"5999\" protocol=\"tcp\" reject"]));
         assert!(!ok("firewall-cmd", &["--permanent", "--set-default-zone=drop"]));
         assert!(!ok("firewall-cmd", &["--panic-on"]));
     }
