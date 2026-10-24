@@ -854,11 +854,17 @@ mod tests {
         }
     }
 
+    /// In CI (ORION_CI_SANDBOX), a test that can't run fails instead of passing quietly.
+    fn expected(what: &str) {
+        assert!(std::env::var_os("ORION_CI_SANDBOX").is_none(), "{what} isn't available, and CI expects it");
+    }
+
     #[test]
     fn filters_system_calls() {
         if !Path::new("/usr/bin/python3").exists() {
-            return;
+            return expected("python3");
         }
+        let mut ran = 0;
         let dir = setup();
         // keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING): harmless, and refused.
         let script = format!(
@@ -874,13 +880,17 @@ mod tests {
             assert_eq!(sh(&on, "echo fine; ls / >/dev/null && echo still"), (0, "fine\nstill\n".into()), "{mode}: ordinary programs run");
             let off = policy(dir.path(), mode, "seccomp = false");
             assert_ne!(sh(&off, &script).1.trim(), "-1 1", "{mode}: without the filter it works");
+            ran += 1;
+        }
+        if ran < 2 {
+            expected("landlock or bubblewrap");
         }
     }
 
     #[test]
     fn scopes_limit_memory_and_processes() {
         if !scope_works() || landlock_abi() == 0 {
-            return;
+            return expected("a systemd user manager making scopes, with Landlock");
         }
         let dir = setup();
         let p = policy(dir.path(), "landlock", "memory_mb = 64\nmax_processes = 20");

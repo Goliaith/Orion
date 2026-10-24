@@ -43,6 +43,8 @@ jobs:
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
       - name: Tests
         run: cargo test --locked
+        env:
+          ORION_CI_SANDBOX: "1"   # the sandbox tests must run, not skip
 
   msrv:
     name: Oldest supported Rust (1.95)
