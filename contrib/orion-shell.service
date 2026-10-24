@@ -13,7 +13,7 @@ After=network.target
 ExecStart=%h/.cargo/bin/orion shell
 Restart=on-failure
 # Put ANTHROPIC_API_KEY here, or in ~/.config/orion/env (one VAR=value per line).
-EnvironmentFile=-%h/.config/orion/env
+EnvironmentFile=-%E/orion/env
 
 [Install]
 WantedBy=default.target

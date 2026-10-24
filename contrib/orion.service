@@ -9,7 +9,7 @@ After=orion.socket
 ExecStart=%h/.cargo/bin/orion daemon
 Restart=on-failure
 # Put ANTHROPIC_API_KEY or other variables here, one VAR=value per line.
-EnvironmentFile=-%h/.config/orion/env
+EnvironmentFile=-%E/orion/env
 
 # Everything Orion runs for the AI lives in this service's cgroup, so these
 # cap all of it together, on top of each program's own sandbox limits.

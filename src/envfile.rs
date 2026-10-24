@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 
-/// `$XDG_CONFIG_HOME/orion/env`.
+/// `$XDG_CONFIG_HOME/orion/env`, which the units read as `%E/orion/env`.
 pub fn path() -> Option<PathBuf> {
     crate::Policy::default_config_path().map(|p| p.with_file_name("env"))
 }

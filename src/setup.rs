@@ -48,13 +48,16 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    /// `None` when there is no terminal to ask on.
+    /// `None` when there is no terminal to ask on, unless `assume_yes`
+    /// means nothing need be asked.
     pub fn open(assume_yes: bool) -> Option<Self> {
         if std::io::stdin().is_terminal() {
             let input = Box::new(BufReader::new(std::io::stdin()));
             return Some(Self { input, tty: None, stdin_tty: true, assume_yes });
         }
-        let tty = File::options().read(true).write(true).open("/dev/tty").ok()?;
+        let Ok(tty) = File::options().read(true).write(true).open("/dev/tty") else {
+            return assume_yes.then(|| Self { input: Box::new(std::io::empty()), tty: None, stdin_tty: false, assume_yes });
+        };
         let input = Box::new(BufReader::new(tty.try_clone().ok()?));
         Some(Self { input, tty: Some(tty), stdin_tty: false, assume_yes })
     }
