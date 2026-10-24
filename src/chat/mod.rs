@@ -105,6 +105,9 @@ pub enum Event<'a> {
     Text(&'a str),
     /// Reasoning or progress notes, shown apart from the answer.
     Thinking(&'a str),
+    /// Something the user should know while they wait, such as a rate
+    /// limit being waited out.
+    Notice(&'a str),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
