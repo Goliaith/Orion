@@ -307,7 +307,7 @@ fn prompt(style: &Style, mode: Mode) -> String {
 
 /// Connect, and resume a saved conversation if asked: what both
 /// interfaces do before their first message.
-pub(super) fn prepare<'a>(
+pub(crate) fn prepare<'a>(
     orion: &'a Orion,
     mode: Option<Mode>,
     model: Option<&str>,
@@ -503,7 +503,7 @@ fn session_owner() -> String {
 }
 
 /// Saves the conversation after each change, if saving is on.
-pub(super) struct Saver {
+pub(crate) struct Saver {
     pub(super) store: Option<Store>,
 }
 

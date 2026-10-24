@@ -43,6 +43,13 @@ enum MemoryCmd {
 
 #[derive(Subcommand)]
 enum VoiceCmd {
+    /// Set up voice in one go: the microphone, the room's noise, the wake
+    /// word, your voice and a first request, and whether speech to text keeps up.
+    Setup {
+        /// Start at this step, skipping the ones before it.
+        #[arg(long, value_enum, default_value = "mic")]
+        from: orion::voice::setup::Step,
+    },
     /// Teach Orion someone's voice; only enrolled people can wake it.
     Enroll {
         /// Whose voice (default: your login name, for the first person).
@@ -341,8 +348,12 @@ fn main() -> Result<()> {
             },
         ),
         Cmd::Voice { action } => {
+            if let VoiceCmd::Setup { from } = action {
+                return orion::voice::setup::run(policy, source.as_deref(), cli.config.as_deref(), from);
+            }
             let v = &policy.voice;
             match action {
+                VoiceCmd::Setup { .. } => unreachable!("handled above"),
                 VoiceCmd::Enroll { name } => orion::voice::enroll::enroll(v, name.as_deref()),
                 VoiceCmd::Test => orion::voice::enroll::test(v),
                 VoiceCmd::Status => orion::voice::enroll::status(v),

@@ -297,34 +297,41 @@ With whisper.cpp and no server, for example:
 transcribe_command = "whisper-cli -m ~/models/ggml-base.en.bin -nt -np -f {wav}"
 ```
 
-Speaker verification, so only enrolled voices can wake Orion:
+Then set up the rest in one go, with the speech-to-text server running:
 
 ```sh
+orion voice setup
+```
+
+It talks you through five steps, about five minutes in all, and saves what each one finds:
+
+1. **The microphone:** count to five, and it checks the recording isn't silent or very quiet.
+2. **The room's noise:** five seconds of quiet, then five of talking, as `orion voice noise` does. The levels it suggests go to `~/.config/orion/voice-tuning.toml`, which applies over `[voice]`.
+3. **The wake word:** it installs the detector, `contrib/orion-wake`, as `~/.local/bin/orion-wake`, and Vosk with `pip install --user vosk` (and pip, if it's missing) once you say yes. Then you say "Orion" until it hears it, and it writes `wake_command` into `orion.toml` itself, keeping the old file as `orion.toml.bak`.
+4. **Your voice:** the neural speaker model if you want it, then `orion voice enroll`'s six phrases, then one real request ("Orion, what time is it?") through the model you set up with `orion setup`, answered aloud.
+5. **Speech to text:** how long transcribing took. If the pause is noticeable on your processor, it names a smaller Whisper model to use, and says whether this machine has a GPU that would do it faster.
+
+`orion voice setup --from wake` (or `noise`, `enroll`, `speed`) starts at a later step. Each step is also a command of its own:
+
+```sh
+orion voice noise             # step 2
 orion voice model install     # the neural speaker model, about 16 MB from PyPI, once
-orion voice enroll            # you: six short phrases
+orion voice enroll            # step 4: you, six short phrases
 orion voice enroll --name ana # anyone else
 orion voice test
 ```
 
 On a machine without internet, download the Resemblyzer 0.1.4 wheel elsewhere and use `orion voice model install --from <file>`.
 
-A wake-word detector, so Orion transcribes only after it hears its name. On a laptop processor this is faster and more reliable than transcribing everything:
+To set up the wake-word detector by hand instead, or to use openWakeWord (see the README):
 
 ```sh
 install -Dm 755 contrib/orion-wake ~/.local/bin/orion-wake
-pip install --user vosk                 # or: openwakeword onnxruntime (see the README)
+pip install --user vosk                 # or: openwakeword onnxruntime
 orion-wake --verbose                    # say "Orion"; Ctrl-C to stop
 ```
 
-Then set it under `[voice]` in `~/.config/orion/orion.toml`. If the file already has a `[voice]` section, this adds the line there:
-
-```sh
-sed -i '/^\[voice\]/a wake_command = "~/.local/bin/orion-wake"' ~/.config/orion/orion.toml
-```
-
-Without a `[voice]` section, add one at the end: `printf '\n[voice]\nwake_command = "~/.local/bin/orion-wake"\n' >> ~/.config/orion/orion.toml`.
-
-If noise keeps Orion listening after you stop talking, run `orion voice noise` and add the settings it prints under `[voice]`.
+and put `wake_command = "~/.local/bin/orion-wake"` under `[voice]` in `~/.config/orion/orion.toml`.
 
 ### The graphical shell
 

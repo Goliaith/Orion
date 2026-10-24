@@ -24,7 +24,7 @@ const PHRASES: [&str; 6] = [
 ];
 
 /// Record one utterance until the speaker pauses, with a meter.
-fn record(recorder: &Recorder) -> Result<Vec<i16>> {
+pub(super) fn record(recorder: &Recorder) -> Result<Vec<i16>> {
     let rec = recorder.start()?;
     let mut out = std::io::stdout();
     while !rec.should_stop() {
@@ -173,7 +173,7 @@ pub fn test(config: &VoiceConfig) -> Result<()> {
 }
 
 /// Record for a fixed time, with a meter, and return each chunk's level.
-fn levels_for(recorder: &Recorder, secs: u64) -> Result<Vec<f32>> {
+pub(super) fn levels_for(recorder: &Recorder, secs: u64) -> Result<Vec<f32>> {
     let rec = recorder.start()?;
     let mut out = std::io::stdout();
     while rec.elapsed() < Duration::from_secs(secs) {
@@ -187,7 +187,7 @@ fn levels_for(recorder: &Recorder, secs: u64) -> Result<Vec<f32>> {
     Ok(rec.finish_raw()?.chunks_exact(chunk).map(rms).collect())
 }
 
-fn percentile(levels: &[f32], p: f32) -> f32 {
+pub(super) fn percentile(levels: &[f32], p: f32) -> f32 {
     let mut v = levels.to_vec();
     v.sort_by(f32::total_cmp);
     v.get(((v.len().saturating_sub(1)) as f32 * p).round() as usize).copied().unwrap_or(0.0)
@@ -231,47 +231,66 @@ pub(crate) fn advise(quiet: &[f32], speech: &[f32], now: Sensitivity) -> Advice 
     }
 }
 
+/// The room and the voice, as `orion voice noise` hears them: each chunk's
+/// level, five seconds of each.
+pub(super) struct Room {
+    quiet: Vec<f32>,
+    speech: Vec<f32>,
+}
+
+impl Room {
+    pub(super) fn measure(recorder: &Recorder) -> Result<Self> {
+        print!("Press Enter, then stay quiet for 5 seconds, with the room as it usually is (fan, TV, typing). ");
+        std::io::stdout().flush()?;
+        wait_for_enter()?;
+        let quiet = levels_for(recorder, 5)?;
+        print!("Now press Enter and talk to Orion for 5 seconds, from where you usually sit. ");
+        std::io::stdout().flush()?;
+        wait_for_enter()?;
+        let speech = levels_for(recorder, 5)?;
+        Ok(Self { quiet, speech })
+    }
+
+    /// Say what was heard, and what would tell the two apart.
+    pub(super) fn report(&self, now: Sensitivity) -> Advice {
+        let floor = percentile(&self.quiet, 0.1);
+        let threshold = now.threshold(Some(floor));
+        let crossed = self.quiet.iter().filter(|&&l| l > threshold).count() * 100 / self.quiet.len().max(1);
+        println!(
+            "Room: {:.0} usually, up to {:.0}. Your voice: about {:.0}. Speech threshold now: {threshold:.0} (noise_margin {}, speech_level {}).",
+            floor,
+            percentile(&self.quiet, 0.95),
+            percentile(&self.speech, 0.5),
+            now.margin,
+            now.level
+        );
+        if crossed > 0 {
+            println!("{crossed}% of the quiet part counted as speech, which keeps Orion listening after you stop.");
+        }
+        let advice = advise(&self.quiet, &self.speech, now);
+        match advice {
+            Advice::Fine => println!("That's fine: the room stays under the threshold and your voice clears it."),
+            Advice::TooLoud => println!(
+                "The room is about as loud as your voice, so no threshold tells them apart. Move closer to the microphone, \
+                 or quiet the noise. A wake-word detector (voice.wake_command) copes better with a noisy room."
+            ),
+            Advice::Set { .. } => {}
+        }
+        advice
+    }
+}
+
 /// `orion voice noise`: measure the room and the voice, and suggest a
 /// threshold that keeps the room's noise from counting as speech.
 pub fn noise(config: &VoiceConfig) -> Result<()> {
     let recorder = Recorder::detect(config)?;
-    let now = recorder.sensitivity();
-    print!("Press Enter, then stay quiet for 5 seconds, with the room as it usually is (fan, TV, typing). ");
-    std::io::stdout().flush()?;
-    wait_for_enter()?;
-    let quiet = levels_for(&recorder, 5)?;
-    print!("Now press Enter and talk to Orion for 5 seconds, from where you usually sit. ");
-    std::io::stdout().flush()?;
-    wait_for_enter()?;
-    let speech = levels_for(&recorder, 5)?;
-    let floor = percentile(&quiet, 0.1);
-    let threshold = now.threshold(Some(floor));
-    let crossed = quiet.iter().filter(|&&l| l > threshold).count() * 100 / quiet.len().max(1);
-    println!(
-        "Room: {:.0} usually, up to {:.0}. Your voice: about {:.0}. Speech threshold now: {threshold:.0} (noise_margin {}, speech_level {}).",
-        floor,
-        percentile(&quiet, 0.95),
-        percentile(&speech, 0.5),
-        now.margin,
-        now.level
-    );
-    if crossed > 0 {
-        println!("{crossed}% of the quiet part counted as speech, which keeps Orion listening after you stop.");
-    }
-    match advise(&quiet, &speech, now) {
-        Advice::Fine => println!("That's fine: the room stays under the threshold and your voice clears it."),
-        Advice::TooLoud => println!(
-            "The room is about as loud as your voice, so no threshold tells them apart. Move closer to the microphone, \
-             or quiet the noise. A wake-word detector (voice.wake_command) copes better with a noisy room."
-        ),
-        Advice::Set { margin, level } => {
-            println!("Put this under [voice] in your settings:");
-            if let Some(m) = margin {
-                println!("  noise_margin = {m:.1}");
-            }
-            if let Some(l) = level {
-                println!("  speech_level = {l:.0}");
-            }
+    if let Advice::Set { margin, level } = Room::measure(&recorder)?.report(recorder.sensitivity()) {
+        println!("Put this under [voice] in your settings:");
+        if let Some(m) = margin {
+            println!("  noise_margin = {m:.1}");
+        }
+        if let Some(l) = level {
+            println!("  speech_level = {l:.0}");
         }
     }
     Ok(())

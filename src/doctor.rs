@@ -715,7 +715,7 @@ fn local_check(d: &mut Doctor, policy: &Policy, explicit: Option<&Path>, missing
 // Voice.
 
 /// The package manager's install command, as root.
-fn install_command(packages: &[(&str, &str)]) -> Option<Vec<String>> {
+pub(crate) fn install_command(packages: &[(&str, &str)]) -> Option<Vec<String>> {
     let (manager, args): (&str, &[&str]) = [
         ("dnf", &["install", "-y"][..]),
         ("apt-get", &["install", "-y"][..]),

@@ -8,7 +8,7 @@
 //! In `auto` mode the [`router`] picks one for each message, and the
 //! [`Session`] keeps both in one conversation.
 
-mod agent;
+pub(crate) mod agent;
 mod classifier;
 mod cli;
 pub mod journal;

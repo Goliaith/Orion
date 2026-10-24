@@ -264,6 +264,8 @@ Press **Ctrl-T** and talk. A live level meter shows Orion is listening. When you
 
 `/voice speak on` makes Orion **speak its replies**, sentence by sentence as they stream in. Code blocks are left on screen ("code shown on screen"), and Markdown symbols are not read out. Ctrl-C, or starting your next message, stops it mid-sentence. `/voice` shows what is set up, and `/voice test` says a test sentence.
 
+**`orion voice setup` sets it all up in one go:** it checks the microphone, measures the room's noise, installs the wake-word detector and listens for you to say "Orion", enrolls your voice, sends one spoken request to the model, and tells you whether speech to text is fast enough on this machine (and what to change if not). It saves each setting itself; see [docs/install.md](docs/install.md#voice).
+
 It is local-first and uses what the machine already has:
 
 | Part | Default | Alternatives |
@@ -296,6 +298,8 @@ How it works: the microphone stays open, and a pause detector (with a noise floo
 - **A dedicated detector:** set `wake_command` to a program that prints a line each time it hears the wake word. It does the always-on listening, so nothing is transcribed until it fires, and Orion then chimes, records and transcribes the request. [`contrib/orion-wake`](contrib/orion-wake) is one, with two offline engines:
   - **Vosk** (the default) spots "Orion" itself, with no training: `pip install --user vosk`, and its small English model (about 40 MB) downloads on first use.
   - **[openWakeWord](https://github.com/dscripka/openWakeWord)** runs a trained wake-word model, and copes better with a noisy room: a ready-made one such as `hey_jarvis`, or your own `.onnx` (its notebook trains one for any word). `pip install --user openwakeword onnxruntime`.
+
+  `orion voice setup` installs it with Vosk, checks it hears you, and sets `wake_command`. By hand:
 
   ```sh
   install -Dm 755 contrib/orion-wake ~/.local/bin/orion-wake
@@ -579,6 +583,7 @@ orion conversations                           # saved chats (see "Saved conversa
 orion memory                                  # what the AI remembers (see "People and memory")
 orion shell                                   # the graphical shell (see "Graphical shell")
 orion listen                                  # headless voice: "Orion, …" (see "Headless voice")
+orion voice setup                             # set up voice, step by step: mic, noise, wake word, your voice, speed
 orion voice model install                     # the neural speaker model (see "Speaker verification")
 orion voice enroll                            # only your voice wakes Orion
 orion voice noise                             # suggest noise_margin for a noisy room
