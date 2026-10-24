@@ -212,7 +212,8 @@ fn check_install(policy: &Policy, a: &InstallArgs) -> Result<(String, String)> {
         }
         // Adding a remote needs the network, which proc_run doesn't have.
         bail!(
-            "there is no remote {remote}. The owner can add it in a terminal: flatpak remote-add --if-not-exists {remote} <its .flatpakrepo URL>{}",
+            "there is no remote {remote}. The owner can add it in a terminal: flatpak remote-add {} --if-not-exists {remote} <its .flatpakrepo URL>{}",
+            a.scope.flag(),
             if remote == "flathub" { " (https://dl.flathub.org/repo/flathub.flatpakrepo)" } else { "" }
         );
     }
