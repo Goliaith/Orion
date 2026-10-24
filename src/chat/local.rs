@@ -196,7 +196,7 @@ impl Backend for LocalBackend {
     fn respond(&mut self, on: &mut dyn FnMut(Event)) -> Result<Reply> {
         let reader = self
             .http
-            .post_stream("/chat/completions", &self.request_body(), &[], &mut |n| on(Event::Notice(n)))
+            .post_stream("/chat/completions", &self.request_body(), &[], on)
             .with_context(|| format!("calling the local model {}", self.config.model))?;
         let done = parse_stream(reader, on)?;
         self.usage.add(&done.usage);

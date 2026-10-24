@@ -80,6 +80,10 @@ In `auto`, each message goes to one model, and Orion shows which and why:
 
 Claude's tool calls that touch a private path are refused, whatever the policy allows.
 
+**Simple requests skip the models altogether.** "Volume up", "set volume to 40", "mute", "brightness 60%", "dim the screen", "status" and "open firefox" (or a link or a path) are answered by calling the tool directly, in any mode, which saves a model round trip or two. The call goes through the same policy, approvals and audit log as a model's would, and both models are told about it the next time they answer. Anything phrased differently, or an app that isn't installed, goes to a model as before; `@claude` or `@local` in front always does. `/route <text>` shows which way a message goes, and `fast_path = false` under `[chat]` turns it off.
+
+**When a model makes Orion wait**, the chat says so and counts it down: `waiting on Gemini's rate limit (17s, retry 1 of 3) · 15 requests in the last minute`. Where the API reports its allowance (Claude, OpenAI and other OpenAI-style servers do; Gemini doesn't), the notice says how many requests are left instead, and Orion warns once a minute when they are nearly used up.
+
 ## Approvals
 
 When a call needs approval, Orion shows the tool and its full arguments:
@@ -660,7 +664,7 @@ unknown field `update`, expected one of `manager`, `allowed`, `protected`, `upda
 
 **Voice: Orion keeps listening after you stop, or misses quiet speech.** Background noise is crossing the speech threshold, or your voice isn't. Ask Orion "check my voice settings": `voice_check` looks at how your recent requests ended and suggests a change, which `voice_tune` makes once you approve it. Or `orion voice noise` measures both and prints `noise_margin` and `speech_level` values to put under `[voice]`. If it says the room is as loud as your voice, move closer to the microphone, or use a wake-word detector (`contrib/orion-wake`).
 
-**Replies are slow, or `rate limited, retrying in …`.** Ask Orion "is anything slowing you down?": `settings_check` counts the rate limits of the last day and how long speech takes to transcribe, and suggests a lighter model, less thinking or a smaller Whisper model, which `settings_tune` sets once you approve it. Undo it the same way, or delete `~/.config/orion/tuning.toml`.
+**Replies are slow, or `waiting on …'s rate limit`.** Ask Orion "is anything slowing you down?": `settings_check` counts the rate limits of the last day and how long speech takes to transcribe, and suggests a lighter model, less thinking or a smaller Whisper model, which `settings_tune` sets once you approve it. Undo it the same way, or delete `~/.config/orion/tuning.toml`.
 
 **The wake detector stopped.** Run the `wake_command` by hand with `--verbose` (for `orion-wake`) to see its error: usually a missing `pip install --user vosk`, or no microphone.
 

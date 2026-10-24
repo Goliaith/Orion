@@ -31,6 +31,10 @@ pub struct Turn {
     pub reply: String,
     /// One line per tool call: what ran and what came back.
     pub tools: Vec<String>,
+    /// Orion answered it by calling a tool itself, without a model; then
+    /// `provider` means nothing and every model is told about the turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub direct: bool,
 }
 
 /// One model's view of the conversation.
@@ -253,6 +257,7 @@ mod tests {
                 private: false,
                 reply: "hello".into(),
                 tools: vec![],
+                direct: false,
             }],
             backends: BTreeMap::from([(
                 "claude".to_string(),
@@ -295,7 +300,7 @@ mod tests {
 
     #[test]
     fn titles_and_times() {
-        let turn = |user: &str, private| Turn { user: user.into(), provider: Provider::Local, private, reply: String::new(), tools: vec![] };
+        let turn = |user: &str, private| Turn { user: user.into(), provider: Provider::Local, private, reply: String::new(), tools: vec![], direct: false };
         assert_eq!(title_from(&turn("  how full\nis my disk? ", false)), "how full is my disk?");
         assert_eq!(title_from(&turn(&"x".repeat(80), false)).chars().count(), 60);
         assert_eq!(title_from(&turn("my password is hunter2", true)), "(private conversation)");

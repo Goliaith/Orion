@@ -8,7 +8,7 @@
 <style>
 :root {
   --bg: #0d0f14; --panel: #141821; --panel-2: #1a1f2b; --line: #262c3a; --text: #e7e9ef; --muted: #8a93a6; --faint: #5d6577;
-  --accent: #8b7cf6; --accent-soft: rgba(139,124,246,.14); --claude: #d97757; --local: #3fbf7f; --warn: #e6b450; --bad: #ef6b6b; --ok: #3fbf7f;
+  --accent: #8b7cf6; --accent-soft: rgba(139,124,246,.14); --claude: #d97757; --local: #3fbf7f; --orion: #5ec4e6; --warn: #e6b450; --bad: #ef6b6b; --ok: #3fbf7f;
   --code: #10131a; --radius: 12px; --shadow: 0 8px 30px rgba(0,0,0,.35);
   color-scheme: dark;
 }
@@ -77,7 +77,7 @@ header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; bord
 .user .bubble { background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); padding: 10px 14px; border-radius: 16px 16px 4px 16px; max-width: 80%; white-space: pre-wrap; overflow-wrap: anywhere; }
 .who { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 650; letter-spacing: .3px; margin-bottom: 4px; }
 .who::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
-.who.claude { color: var(--claude); } .who.local { color: var(--local); }
+.who.claude { color: var(--claude); } .who.local { color: var(--local); } .who.orion { color: var(--orion); }
 .reply { overflow-wrap: anywhere; }
 .reply p { margin: 0 0 10px; } .reply p:last-child { margin-bottom: 0; }
 .reply h4 { margin: 14px 0 6px; font-size: 15px; }
@@ -86,7 +86,7 @@ header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; bord
 .reply pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; margin: 8px 0 12px; }
 .reply pre code { border: 0; padding: 0; background: none; }
 .route { color: var(--faint); font-size: 13px; margin: 14px 0 6px; display: flex; gap: 6px; align-items: center; }
-.route b { font-weight: 600; } .route .claude { color: var(--claude); } .route .local { color: var(--local); }
+.route b { font-weight: 600; } .route .claude { color: var(--claude); } .route .local { color: var(--local); } .route .orion { color: var(--orion); }
 details.thinking { color: var(--muted); font-size: 13.5px; margin: 6px 0; border-left: 2px solid var(--line); padding-left: 12px; }
 details.thinking summary { cursor: pointer; color: var(--faint); list-style: none; }
 details.thinking summary::-webkit-details-marker { display: none; }
@@ -111,7 +111,7 @@ details.thinking div { white-space: pre-wrap; font-style: italic; margin-top: 4p
 .card .done { color: var(--muted); font-size: 13.5px; }
 .card .from { color: var(--muted); font-size: 13px; margin: -4px 0 8px; }
 .card.resolved { border-color: var(--line); background: var(--panel); }
-.notice { color: var(--warn); font-size: 13.5px; margin: 8px 0; }
+.notice { color: var(--warn); font-size: 13.5px; margin: 8px 0; } .notice .countdown { color: var(--faint); }
 .error { color: var(--bad); font-size: 13.5px; margin: 8px 0; }
 .output { margin: 10px 0; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; white-space: pre-wrap; color: var(--muted); }
 .divider { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 12px; margin: 22px 0; text-transform: uppercase; letter-spacing: .8px; }
@@ -285,9 +285,10 @@ function welcome() {
 function clearWelcome() { if (state.empty) { col.innerHTML = ""; state.empty = false; } }
 
 function userMsg(text) { endBlocks(); const m = el("div", "msg user"); const b = el("div", "bubble"); b.textContent = text; m.appendChild(b); add(m); }
+const WHO = { claude: "Claude", local: "Local model", orion: "Orion" };
 function replyBlock(who) {
   const m = el("div", "msg");
-  m.innerHTML = `<div class="who ${who}">${who === "claude" ? "Claude" : "Local model"}</div><div class="reply"></div>`;
+  m.innerHTML = `<div class="who ${who}">${WHO[who] || "Local model"}</div><div class="reply"></div>`;
   m._text = ""; return add(m);
 }
 function appendText(t) {
@@ -310,7 +311,7 @@ function appendThinking(t) {
 function route(ev) {
   endBlocks(); state.who = ev.who;
   const r = el("div", "route");
-  r.innerHTML = `→ <b class="${ev.who}">${ev.who === "claude" ? "Claude" : "Local model"}</b> <span>${esc(ev.model)}</span>${ev.reason ? " · " + esc(ev.reason) : ""}`;
+  r.innerHTML = `→ <b class="${ev.who}">${WHO[ev.who] || "Local model"}</b> <span>${esc(ev.model)}</span>${ev.reason ? " · " + esc(ev.reason) : ""}`;
   add(r);
 }
 function toolStart(ev) {
@@ -352,6 +353,23 @@ function answered(ev) {
   if (acts) acts.outerHTML = `<div class="done">${ev.answer === "yes" ? "✓ Approved" : ev.answer === "always" ? "✓ Approved for the rest of this session" : ev.answer === "expired" ? "No answer in time · declined" : "Declined"}</div>`;
 }
 function system(cls, text) { endBlocks(); const e = el("div", cls); e.textContent = text; add(e); }
+// A rate limit being waited out: the notice, with a countdown until the retry.
+function waiting(ev) {
+  endBlocks(); stopWaiting();
+  const e = el("div", "notice"); e.textContent = ev.text;
+  const left = el("span", "countdown"); e.appendChild(left); add(e);
+  const until = Date.now() + ev.secs * 1000;
+  const tick = () => {
+    const s = Math.ceil((until - Date.now()) / 1000);
+    left.textContent = s > 0 ? ` · retrying in ${s}s` : "";
+    if (s <= 0) stopWaiting();
+  };
+  state.waitLeft = left; tick(); state.wait = setInterval(tick, 250);
+}
+function stopWaiting() {
+  if (state.wait) { clearInterval(state.wait); state.wait = null; }
+  if (state.waitLeft) { state.waitLeft.textContent = ""; state.waitLeft = null; }
+}
 function transcript(turns) {
   col.innerHTML = ""; state.empty = false; state.cards = {}; endBlocks();
   if (!turns.length) { welcome(); return; }
@@ -503,6 +521,8 @@ async function talk() {
 }
 
 function handle(ev) {
+  // Anything the AI does next means the wait is over.
+  if (["text", "thinking", "tool_start", "route", "error"].includes(ev.type)) stopWaiting();
   switch (ev.type) {
     case "hello":
       state.mic = ev.mic; state.speech = ev.speech; state.speak = ev.speak_replies;
@@ -524,11 +544,12 @@ function handle(ev) {
     case "confirm": confirmCard(ev); break;
     case "answered": answered(ev); break;
     case "notice": system("notice", ev.text); break;
+    case "wait": waiting(ev); break;
     case "error": system("error", "Error: " + ev.text); break;
     case "output": system("output", ev.text); break;
     case "status": status(ev); break;
     case "machine": machine(ev.machine); break;
-    case "busy": setBusy(ev.on); if (!ev.on) endBlocks(); break;
+    case "busy": setBusy(ev.on); if (!ev.on) { endBlocks(); stopWaiting(); } break;
     case "voice": voiceEv(ev); break;
     case "heard": input.value = (input.value.trim() ? input.value.trim() + " " : "") + ev.text; autosize(); input.focus(); break;
     case "voice_error": toast("Voice: " + ev.text); break;

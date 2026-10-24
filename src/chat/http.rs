@@ -1,12 +1,15 @@
 //! HTTP plumbing shared by the model backends.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader};
+use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
+use super::Event;
 use crate::interrupt::{self, ChannelReader};
 
 const MAX_RETRIES: u32 = 3;
@@ -48,15 +51,15 @@ impl Http {
 
     /// POST a JSON body and return the response body for streaming. Retries
     /// rate limits, overload and dropped connections that happen before the
-    /// response starts, telling `notice` how long each wait is; a server that
-    /// refuses connections fails at once. Ctrl-C interrupts both the waits
-    /// and the reads.
+    /// response starts, telling `on` about each [`Wait`] (and when few
+    /// requests are left); a server that refuses connections fails at once.
+    /// Ctrl-C interrupts both the waits and the reads.
     pub fn post_stream(
         &self,
         path: &str,
         body: &Value,
         extra: &[(&str, String)],
-        notice: &mut dyn FnMut(&str),
+        on: &mut dyn FnMut(Event),
     ) -> Result<impl BufRead> {
         let model = body["model"].as_str().unwrap_or_default().to_string();
         let body = serde_json::to_string(body)?;
@@ -64,11 +67,16 @@ impl Http {
         let mut attempt = 0;
         let reader = loop {
             let (http, path, extra, body) = (self.clone(), path.to_string(), extra.clone(), body.clone());
+            quota::sent(&self.base);
             let sent = interrupt::wait(move || {
                 let req = http.request("POST", &path, &extra).set("content-type", "application/json");
                 match req.send_string(&body) {
-                    Ok(resp) => Ok(Ok(resp.into_reader())),
+                    Ok(resp) => {
+                        quota::heard(&http.base, &resp);
+                        Ok(Ok(resp.into_reader()))
+                    }
                     Err(ureq::Error::Status(code, resp)) if retryable(code) && attempt < MAX_RETRIES => {
+                        quota::heard(&http.base, &resp);
                         let header = resp.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok());
                         let asked = header.or_else(|| retry_delay(&resp.into_string().unwrap_or_default()));
                         Ok(Err((code, asked.map(Duration::from_secs))))
@@ -77,7 +85,12 @@ impl Http {
                 }
             })?;
             let (code, asked) = match sent {
-                Ok(reader) => break reader,
+                Ok(reader) => {
+                    if let Some(low) = quota::running_low(&self.base) {
+                        on(Event::Notice(&low));
+                    }
+                    break reader;
+                }
                 Err(retry) => retry,
             };
             if code == 429 && attempt == 0 {
@@ -85,7 +98,8 @@ impl Http {
             }
             attempt += 1;
             let wait = asked.unwrap_or(Duration::from_secs(1 << attempt)).min(Duration::from_secs(60));
-            notice(&retry_notice(code, wait, attempt));
+            let w = Wait { service: service(&self.base), code, secs: wait.as_secs().max(1), attempt, quota: quota::describe(&self.base) };
+            on(Event::Wait(&w));
             interrupt::wait(move || {
                 thread::sleep(wait);
                 Ok(())
@@ -97,6 +111,8 @@ impl Http {
     /// One quick POST with a JSON reply: no retries, and a timeout of its own.
     pub fn post_json(&self, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
         let body = serde_json::to_string(body)?;
+        // The classifier's requests count against the same limit.
+        quota::sent(&self.base);
         let (http, path) = (self.clone(), path.to_string());
         interrupt::wait(move || {
             let resp = http
@@ -174,15 +190,151 @@ fn retryable(code: u16) -> bool {
     matches!(code, 408 | 409 | 429 | 500..=599)
 }
 
-/// What a retry is waiting for, for the user: a free tier's rate limit
+/// A retry being waited out, for the user to see: a free tier's rate limit
 /// otherwise looks like a hang.
-fn retry_notice(code: u16, wait: Duration, attempt: u32) -> String {
-    let why = match code {
-        429 => "rate limited".to_string(),
-        503 | 529 => "the server is busy".to_string(),
-        _ => format!("the server answered {code}"),
-    };
-    format!("{why}, retrying in {}s ({attempt} of {MAX_RETRIES})", wait.as_secs().max(1))
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wait {
+    /// Who is making us wait: "Gemini", "Claude", "the local model server".
+    pub service: String,
+    pub code: u16,
+    pub secs: u64,
+    /// Which retry this is, of [`MAX_RETRIES`].
+    pub attempt: u32,
+    /// What Orion knows of the allowance: "0 of 50 requests left this
+    /// minute", or how many it sent in the last minute.
+    pub quota: Option<String>,
+}
+
+impl Wait {
+    /// What is being waited on, for a status line: "waiting on Gemini's rate limit".
+    pub fn label(&self) -> String {
+        match self.code {
+            429 => format!("waiting on {}'s rate limit", self.service),
+            503 | 529 => format!("waiting on {} (busy)", self.service),
+            code => format!("waiting on {} (it answered {code})", self.service),
+        }
+    }
+}
+
+impl std::fmt::Display for Wait {
+    /// "waiting on Gemini's rate limit (17s, retry 1 of 3) · 15 requests in the last minute"
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({}s, retry {} of {MAX_RETRIES})", self.label(), self.secs, self.attempt)?;
+        if let Some(q) = &self.quota {
+            write!(f, " · {q}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The name people know a model API by, from its base URL.
+pub fn service(base: &str) -> String {
+    let rest = base.split_once("://").map_or(base, |(_, r)| r);
+    let host = rest.split(['/', ':']).next().unwrap_or_default().to_ascii_lowercase();
+    const KNOWN: [(&str, &str); 8] = [
+        ("generativelanguage.googleapis.com", "Gemini"),
+        ("anthropic.com", "Claude"),
+        ("openai.com", "OpenAI"),
+        ("openrouter.ai", "OpenRouter"),
+        ("groq.com", "Groq"),
+        ("mistral.ai", "Mistral"),
+        ("deepseek.com", "DeepSeek"),
+        ("together.xyz", "Together"),
+    ];
+    if let Some((_, name)) = KNOWN.iter().find(|(h, _)| host == *h || host.ends_with(&format!(".{h}"))) {
+        return name.to_string();
+    }
+    if super::local::is_on_machine(base) {
+        return "the local model server".into();
+    }
+    host
+}
+
+/// What each API has said about its allowance, and how often Orion has
+/// called it lately. Shared by every client of the same base URL (a
+/// backend and the classifier count against one limit).
+mod quota {
+    use super::*;
+
+    #[derive(Default)]
+    struct Quota {
+        sent: VecDeque<Instant>,
+        /// Requests left and the limit, from the last response's headers.
+        left: Option<(u64, u64)>,
+        /// Whether that limit is known to be per minute.
+        per_minute: bool,
+        warned: Option<Instant>,
+    }
+
+    static QUOTAS: Mutex<BTreeMap<String, Quota>> = Mutex::new(BTreeMap::new());
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    fn with<T>(base: &str, f: impl FnOnce(&mut Quota) -> T) -> T {
+        let mut all = QUOTAS.lock().unwrap_or_else(|e| e.into_inner());
+        let q = all.entry(base.to_string()).or_default();
+        while q.sent.front().is_some_and(|t| t.elapsed() > MINUTE) {
+            q.sent.pop_front();
+        }
+        f(q)
+    }
+
+    pub fn sent(base: &str) {
+        with(base, |q| q.sent.push_back(Instant::now()));
+    }
+
+    /// Read the allowance headers: Anthropic's `anthropic-ratelimit-requests-*`
+    /// and the OpenAI-style `x-ratelimit-*-requests` (both per minute there;
+    /// other providers that send the latter may count per day).
+    pub fn heard(base: &str, resp: &ureq::Response) {
+        let num = |h: &str| resp.header(h).and_then(|v| v.trim().parse::<u64>().ok());
+        let found = num("anthropic-ratelimit-requests-remaining")
+            .zip(num("anthropic-ratelimit-requests-limit"))
+            .map(|l| (l, true))
+            .or_else(|| {
+                let per_minute = matches!(service(base).as_str(), "OpenAI");
+                num("x-ratelimit-remaining-requests").zip(num("x-ratelimit-limit-requests")).map(|l| (l, per_minute))
+            });
+        if let Some((left, per_minute)) = found {
+            with(base, |q| {
+                q.left = Some(left);
+                q.per_minute = per_minute;
+            });
+        }
+    }
+
+    fn text(q: &Quota) -> Option<String> {
+        if let Some((left, limit)) = q.left {
+            let window = if q.per_minute { " this minute" } else { "" };
+            return Some(format!("{left} of {limit} requests left{window}"));
+        }
+        match q.sent.len() {
+            0 => None,
+            1 => Some("1 request in the last minute".into()),
+            n => Some(format!("{n} requests in the last minute")),
+        }
+    }
+
+    pub fn describe(base: &str) -> Option<String> {
+        with(base, |q| text(q))
+    }
+
+    /// A note when the allowance is nearly used up, at most once a minute.
+    pub fn running_low(base: &str) -> Option<String> {
+        with(base, |q| {
+            let (left, limit) = q.left?;
+            let low = left <= (limit / 10).max(1);
+            if !low || q.warned.is_some_and(|t| t.elapsed() < MINUTE) {
+                return None;
+            }
+            q.warned = Some(Instant::now());
+            Some(format!("{}: {}; replies may wait soon", service(base), text(q)?))
+        })
+    }
+
+    #[cfg(test)]
+    pub fn reset(base: &str) {
+        QUOTAS.lock().unwrap().remove(base);
+    }
 }
 
 /// The wait a 429 body asks for, when there's no `retry-after` header:
@@ -307,8 +459,15 @@ mod tests {
             {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"16.4s"}]}}]"#;
         assert_eq!(retry_delay(gemini), Some(17));
         assert_eq!(retry_delay(r#"{"error":{"message":"slow down"}}"#), None);
-        assert_eq!(retry_notice(429, Duration::from_secs(17), 1), "rate limited, retrying in 17s (1 of 3)");
-        assert_eq!(retry_notice(503, Duration::from_secs(2), 2), "the server is busy, retrying in 2s (2 of 3)");
+        let w = |code, secs, attempt, quota: Option<&str>| {
+            Wait { service: "Gemini".into(), code, secs, attempt, quota: quota.map(str::to_string) }.to_string()
+        };
+        assert_eq!(w(429, 17, 1, Some("15 requests in the last minute")), "waiting on Gemini's rate limit (17s, retry 1 of 3) · 15 requests in the last minute");
+        assert_eq!(w(503, 2, 2, None), "waiting on Gemini (busy) (2s, retry 2 of 3)");
+        assert_eq!(service("https://generativelanguage.googleapis.com/v1beta/openai"), "Gemini");
+        assert_eq!(service("https://api.anthropic.com"), "Claude");
+        assert_eq!(service("http://127.0.0.1:11434/v1"), "the local model server");
+        assert_eq!(service("https://llm.example.net/v1"), "llm.example.net");
     }
 
     #[test]
@@ -322,18 +481,31 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 let _ = std::io::Read::read(&mut conn, &mut buf);
                 let reply = if i == 0 {
-                    "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                    "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\nx-ratelimit-remaining-requests: 0\r\nx-ratelimit-limit-requests: 15\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
                 } else {
-                    "HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: close\r\n\r\ndata: ok\n"
+                    "HTTP/1.1 200 OK\r\nx-ratelimit-remaining-requests: 1\r\nx-ratelimit-limit-requests: 15\r\ncontent-length: 8\r\nconnection: close\r\n\r\ndata: ok\n"
                 };
                 std::io::Write::write_all(&mut conn, reply.as_bytes()).unwrap();
             }
         });
-        let mut notices = Vec::new();
-        let reader = Http::new(&url, Vec::new()).post_stream("/x", &json!({}), &[], &mut |n| notices.push(n.to_string()));
+        quota::reset(&url);
+        let mut seen = Vec::new();
+        let reader = Http::new(&url, Vec::new()).post_stream("/x", &json!({}), &[], &mut |e| {
+            seen.push(match e {
+                Event::Wait(w) => format!("wait: {w}"),
+                Event::Notice(n) => format!("notice: {n}"),
+                _ => "other".into(),
+            })
+        });
         let data: Vec<String> = sse_data(reader.unwrap()).map(Result::unwrap).collect();
         assert_eq!(data, ["ok"]);
-        assert_eq!(notices, ["rate limited, retrying in 1s (1 of 3)"]);
+        assert_eq!(
+            seen,
+            [
+                "wait: waiting on the local model server's rate limit (1s, retry 1 of 3) · 0 of 15 requests left",
+                "notice: the local model server: 1 of 15 requests left; replies may wait soon",
+            ]
+        );
     }
 
     #[test]

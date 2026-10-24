@@ -17,6 +17,7 @@ pub mod claude;
 pub(crate) mod http;
 mod machine;
 pub mod local;
+mod quick;
 pub mod router;
 mod session;
 pub mod shell;
@@ -44,6 +45,9 @@ pub struct ChatConfig {
     pub mode: Mode,
     /// Model calls per user message before the turn is stopped.
     pub max_tool_rounds: usize,
+    /// Answer simple requests (volume, brightness, status, "open firefox")
+    /// by calling the tool directly, without a model.
+    pub fast_path: bool,
     /// Show reasoning and progress notes (Ctrl-O toggles it in the chat).
     pub show_reasoning: bool,
     /// Save conversations after every message so they can be resumed.
@@ -65,6 +69,7 @@ impl Default for ChatConfig {
         Self {
             mode: Mode::Auto,
             max_tool_rounds: 50,
+            fast_path: true,
             show_reasoning: true,
             save_conversations: true,
             memory: true,
@@ -108,9 +113,10 @@ pub enum Event<'a> {
     Text(&'a str),
     /// Reasoning or progress notes, shown apart from the answer.
     Thinking(&'a str),
-    /// Something the user should know while they wait, such as a rate
-    /// limit being waited out.
+    /// Something the user should know, such as few requests being left.
     Notice(&'a str),
+    /// A rate limit or busy server being waited out before a retry.
+    Wait(&'a http::Wait),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -208,6 +214,11 @@ pub trait Ui {
     fn tool_start(&mut self, name: &str, input: &Value);
     fn tool_end(&mut self, name: &str, result: &Result<Value, String>, took: Duration);
     fn notice(&mut self, text: &str);
+    /// A rate limit or busy server is being waited out; shown as a notice
+    /// unless the UI can count it down.
+    fn wait(&mut self, wait: &http::Wait) {
+        self.notice(&wait.to_string());
+    }
     /// Answer an `ask` decision.
     fn approve(&mut self, tool: &dyn Tool, args: &Value) -> bool;
     /// Which model is taking the message, and why.

@@ -1,6 +1,6 @@
 //! Built-in tools. Each module groups one area of the machine.
 
-mod apps;
+pub(crate) mod apps;
 mod audio;
 mod bluetooth;
 mod changes;

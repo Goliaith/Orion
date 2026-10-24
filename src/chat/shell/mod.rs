@@ -26,7 +26,7 @@ use self::http::Request;
 use super::agent::{self, capitalize, Answer, FromAgent, Status, ToAgent};
 use super::machine::{watch_machine, Machine};
 use super::store::{self, Store};
-use super::terminal::{provider_label, Saver};
+use super::terminal::{turn_label, Saver};
 use super::Session;
 use crate::voice::{is_stop_request, spoken_answer, Person, Recording, VoiceIo, WakeEvent, WakeState};
 use crate::{interrupt, Orion};
@@ -206,7 +206,11 @@ fn relay(hub: &Hub, from_agent: Receiver<FromAgent>) {
             }
             FromAgent::Thinking(t) => hub.broadcast(json!({ "type": "thinking", "text": t }), true),
             FromAgent::Route { to, model, reason } => {
-                let who = if to == "Claude" { "claude" } else { "local" };
+                let who = match to.as_str() {
+                    "Claude" => "claude",
+                    "Orion" => "orion",
+                    _ => "local",
+                };
                 hub.broadcast(json!({ "type": "route", "to": to, "who": who, "model": model, "reason": reason }), true)
             }
             FromAgent::ToolStart { name, args } => {
@@ -217,6 +221,9 @@ fn relay(hub: &Hub, from_agent: Receiver<FromAgent>) {
                 true,
             ),
             FromAgent::Notice(t) => hub.broadcast(json!({ "type": "notice", "text": t }), true),
+            FromAgent::Wait { text, label, secs } => {
+                hub.broadcast(json!({ "type": "wait", "text": text, "label": label, "secs": secs }), true)
+            }
             FromAgent::Error(t) => hub.broadcast(json!({ "type": "error", "text": t }), true),
             FromAgent::Output(t) => hub.broadcast(json!({ "type": "output", "text": t }), true),
             FromAgent::Approve { tool, preview, reply } => {
@@ -232,7 +239,7 @@ fn relay(hub: &Hub, from_agent: Receiver<FromAgent>) {
             FromAgent::Transcript(turns) => {
                 let turns: Vec<Value> = turns
                     .iter()
-                    .map(|t| json!({ "user": t.user, "who": provider_label(t.provider), "reply": t.reply, "tools": t.tools }))
+                    .map(|t| json!({ "user": t.user, "who": turn_label(t), "reply": t.reply, "tools": t.tools }))
                     .collect();
                 hub.broadcast(json!({ "type": "transcript", "turns": turns }), true);
             }

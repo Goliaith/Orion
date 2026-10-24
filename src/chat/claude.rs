@@ -96,7 +96,7 @@ impl Client {
         }
         let reader = self
             .http
-            .post_stream("/v1/messages", body, &headers, &mut |n| on(Event::Notice(n)))
+            .post_stream("/v1/messages", body, &headers, &mut *on)
             .context("calling the Claude API")?;
         parse_sse(reader, on)
     }
@@ -413,6 +413,7 @@ mod tests {
                 Event::Text(t) => format!("text:{t}"),
                 Event::Thinking(t) => format!("thinking:{t}"),
                 Event::Notice(t) => format!("notice:{t}"),
+                Event::Wait(w) => format!("wait:{w}"),
             })
         })
         .unwrap();

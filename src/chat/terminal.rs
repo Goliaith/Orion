@@ -500,6 +500,11 @@ impl Saver {
     }
 }
 
+/// Who answered a turn: a model, or Orion itself on the fast path.
+pub(super) fn turn_label(t: &Turn) -> &'static str {
+    if t.direct { "orion" } else { provider_label(t.provider) }
+}
+
 pub(super) fn provider_label(p: Provider) -> &'static str {
     match p {
         Provider::Claude => "claude",
@@ -535,7 +540,7 @@ pub(super) fn print_turn(s: &Style, t: &Turn, max: usize, out: &mut String) {
         say!(out, "    {} {}", s.cyan("⚙"), s.dim(&clip(tool, max)));
     }
     let reply = if t.reply.trim().is_empty() { "(no reply)" } else { &t.reply };
-    say!(out, "  {} {}", s.dim(&format!("{}:", provider_label(t.provider))), clip(reply, max * 2));
+    say!(out, "  {} {}", s.dim(&format!("{}:", turn_label(t))), clip(reply, max * 2));
 }
 
 /// `orion conversations`: list, show or delete saved conversations.
