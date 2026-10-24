@@ -215,12 +215,12 @@ provider = "local"
 
 [chat.local]
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
-model = "gemini-3.8-flash-lite"       # list yours: curl -H "Authorization: Bearer $GEMINI_API_KEY" …/openai/models
+model = "gemini-3.8-flash"            # or a flash-lite from the list below
 api_key_env = "GEMINI_API_KEY"
 reasoning_effort = "low"              # less thinking, faster answers; "minimal", "low", "medium" or "high"
 ```
 
-- **Pick a chat model:** the plain `flash` or `flash-lite` ones. The `tts` and `image` variants make speech and pictures, and can't chat or use tools.
+- **Pick a chat model:** list what your key offers with `curl -s -H "Authorization: Bearer $GEMINI_API_KEY" https://generativelanguage.googleapis.com/v1beta/openai/models`, and take a plain `flash` or `flash-lite` one. The `tts` and `image` variants make speech and pictures, and can't chat or use tools.
 - **Free-tier limits are tight,** a few requests a minute, and each tool Orion runs is one more. When Google says to slow down, Orion waits and says so (`rate limited, retrying in 17s (1 of 3)`). Flash-Lite has the most generous limits.
 - **A pasted key** with a stray space, line break or invisible character still works: Orion drops them.
 
