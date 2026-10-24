@@ -26,6 +26,10 @@ impl Decision {
     }
 }
 
+/// Tools that ask even where the policy allows them: `settings_tune` can
+/// pre-approve other tools.
+const ALWAYS_ASK: &[&str] = &["settings_tune"];
+
 /// Decision for each risk level, used when a tool has no explicit entry.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -356,15 +360,22 @@ impl Policy {
                 let text = std::fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
                 let mut policy = Self::from_toml(&text).with_context(|| format!("parsing {}", path.display()))?;
-                crate::voice::tuning::Tuning::load().apply(&mut policy.voice);
+                policy.apply_tuning();
                 Ok((policy, Some(path)))
             }
             None => {
                 let mut policy = Self::from_toml("")?;
-                crate::voice::tuning::Tuning::load().apply(&mut policy.voice);
+                policy.apply_tuning();
                 Ok((policy, None))
             }
         }
+    }
+
+    /// What Orion tuned with the person's approval: `voice-tuning.toml` and
+    /// `tuning.toml`, beside orion.toml.
+    fn apply_tuning(&mut self) {
+        crate::voice::tuning::Tuning::load().apply(&mut self.voice);
+        crate::tuning::Overlay::load().apply(self);
     }
 
     fn resolve(&mut self) {
@@ -376,14 +387,19 @@ impl Policy {
     }
 
     pub fn decide(&self, tool: &str, risk: Risk) -> Decision {
-        if let Some(d) = self.tools.get(tool) {
-            return *d;
+        let d = match self.tools.get(tool) {
+            Some(d) => *d,
+            None => match risk {
+                Risk::Read => self.defaults.read,
+                Risk::Write => self.defaults.write,
+                Risk::Execute => self.defaults.execute,
+            },
+        };
+        // A person agrees to every change to what Orion may do.
+        if ALWAYS_ASK.contains(&tool) && d == Decision::Allow {
+            return Decision::Ask;
         }
-        match risk {
-            Risk::Read => self.defaults.read,
-            Risk::Write => self.defaults.write,
-            Risk::Execute => self.defaults.execute,
-        }
+        d
     }
 
     /// `$XDG_CONFIG_HOME/orion/orion.toml`, whether or not it exists.

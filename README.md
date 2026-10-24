@@ -31,9 +31,11 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | Tool           | Risk    | Default | What it does |
 |----------------|---------|---------|--------------|
 | `system_info`  | read    | allow   | Hostname, OS, kernel, CPU, memory, load, uptime |
-| `system_health` | read   | allow   | What needs attention: failed services, full or failing disks, security updates, a due reboot, low memory, heat, battery wear, journal errors, failed logins, voice trouble |
+| `system_health` | read   | allow   | What needs attention: failed services, full or failing disks, security updates, a due reboot, low memory, heat, battery wear, journal errors, failed logins, voice trouble, settings that keep getting in the way |
 | `voice_check`  | read    | allow   | How listening is going: the voice settings, how recent spoken requests ended, what was heard in place of the wake word, and suggested changes with their reasons |
 | `voice_tune`   | write   | ask     | Change how Orion listens (noise margin, speech level, pause, time limit, wake-word spellings), and nothing else in the policy |
+| `settings_check` | read  | allow   | Settings that keep getting in the way (the chat model's rate limits, slow speech to text, tools approved every time), with the change that fixes each and why |
+| `settings_tune` | write  | always asks | Make a change `settings_check` suggests, by its key, or undo one; only the chat model and its thinking, the transcription model, and pre-approving write tools you always approve |
 | `disk_health`  | read    | allow   | Each drive's SMART health: good, warning or failing and why, wear, temperature, hours of use |
 | `sensor_status` | read   | allow   | Temperatures (CPU, GPU, drives, board) with their limits, and fan speeds |
 | `gpu_info`     | read    | allow   | Every GPU (NVIDIA, AMD, Intel) by name: memory, load, temperature, power, compute stacks, and what runs on each, down to the model |
@@ -605,12 +607,29 @@ Orion notices problems before anyone asks. The daemon checks every 15 minutes:
 | Errors | one program or unit logs 50 errors in an interval (`journal_errors`) |
 | Hardware errors | the kernel reports any CPU or memory hardware error, filesystem error, disk I/O error, GPU crash or reset, thermal throttling, or ran out of memory and ended a program |
 | Logins | 10 failed logins in the last hour, by SSH, sudo, su or the login screen, with the address most came from (`failed_logins`) |
+| Settings | the chat model was rate limited 3 times in a day, speech took at least half as long to transcribe as to say (and 2 s or more) 3 times running, or you approved a tool 5 times in 30 days and never said no (see [Orion tunes its settings](#orion-tunes-its-settings)) |
+
+#### Orion tunes its settings
+
+When a setting keeps getting in the way, Orion says what it saw and which change would fix it, as a finding like the others, or when you ask "is anything slowing you down?". With your approval, `settings_tune` makes that change. It takes the suggestion's key, so the values come from what Orion measured, not from the AI.
+
+| It notices | It suggests |
+|---|---|
+| Gemini keeps rate limiting requests | a lighter model (Pro to Flash, Flash to Flash-Lite), and `reasoning_effort = "low"` |
+| Speech is slow to turn into text | the next smaller Whisper model (`medium` to `small`), and the GPU when the machine has one |
+| You approve a tool every time it asks | pre-approving it (`allow`) |
+
+- **Changes go to `~/.config/orion/tuning.toml`,** applied over orion.toml. It can hold only `[chat.local] model` and `reasoning_effort`, `[voice] transcribe_model`, and `[tools]` entries set to `allow`.
+- **The rest of the policy stays out of reach.** Only `write` tools can be pre-approved there, not ones with a list of their own (`proc_run`'s commands, `pkg_install`'s packages, `svc_control`'s units), and not over an entry in orion.toml's `[tools]` or a `[defaults] write` other than `ask`. A file that breaks these rules is ignored. `settings_tune` itself always asks, even under `allow`.
+- **To go back,** ask Orion to undo a setting, or delete the file. The daemon picks up changes within seconds.
+- **What it keeps:** when requests were rate limited and how long transcriptions took, in `~/.local/state/orion/tuning.json`, and the approvals in the audit log. Never what was said.
+- Listening itself (noise, the wake word) is `voice_check` and `voice_tune`'s: see [Voice](#voice).
 
 - **A desktop notification** comes the first time each problem appears, not again while it lasts, and again if it comes back after clearing.
 - **`orion status`** lists what needs attention, with what to do about each. Without the daemon it runs the quick checks itself (all but updates).
 - **The AI knows:** each conversation starts with the findings, and the AI mentions them once when it fits ("by the way, /home is 93% full") and offers to help, without acting unasked. `system_health` checks afresh.
 - **The interfaces show them:** the line-by-line chat under its header, the full-screen chat's panel and the shell's machine panel.
-- **Settings** are under `[watch]`: the interval, the thresholds, notifications, and `ignore` for findings you don't care about, by key (`"service:backup.service"`, `"disk:/mnt/archive"`, `"reboot"`, `"temp:*"`, `"errors:noisy.service"`).
+- **Settings** are under `[watch]`: the interval, the thresholds, notifications, and `ignore` for findings you don't care about, by key (`"service:backup.service"`, `"disk:/mnt/archive"`, `"reboot"`, `"temp:*"`, `"errors:noisy.service"`, `"tune:approve:*"`).
 - **The system journal** is readable only to members of `systemd-journal` (or `adm` or `wheel`, by distribution). Without that, the error and login checks see only your own programs: `sudo usermod -aG systemd-journal "$USER"`.
 - **`disk_health`** and **`sensor_status`** show the details behind the disk-health and temperature findings: each drive's state, wear, temperature and hours of use; every temperature with its limits, and fan speeds.
 

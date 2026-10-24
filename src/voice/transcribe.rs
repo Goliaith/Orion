@@ -1,7 +1,7 @@
 //! Speech to text: an OpenAI-compatible transcription server, or a command.
 
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -58,6 +58,7 @@ impl Transcriber {
 
     /// The words in a WAV recording.
     pub fn transcribe(&self, wav: &[u8]) -> Result<String> {
+        let start = Instant::now();
         let raw = match self {
             Self::Http { http, model, language, timeout } => {
                 let mut fields = vec![("model", model.as_str()), ("response_format", "json")];
@@ -86,12 +87,24 @@ impl Transcriber {
                 String::from_utf8_lossy(&out.stdout).into_owned()
             }
         };
+        // How long it took, so Orion can tell when it is too slow.
+        crate::tuning::Signals::transcribed(&self.describe(), wav_secs(wav), start.elapsed());
         let text = clean(&raw);
         if text.is_empty() {
             bail!("heard nothing that could be transcribed");
         }
         Ok(text)
     }
+}
+
+/// How long a WAV recording lasts, from its header.
+fn wav_secs(wav: &[u8]) -> f32 {
+    let (Some(fmt), true) = (wav.get(20..36), wav.starts_with(b"RIFF") && wav.len() > 44) else { return 0.0 };
+    let channels = u16::from_le_bytes([fmt[2], fmt[3]]) as f32;
+    let rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]) as f32;
+    let bits = u16::from_le_bytes([fmt[14], fmt[15]]) as f32;
+    let per_sec = channels * rate * bits / 8.0;
+    if per_sec > 0.0 { (wav.len() - 44) as f32 / per_sec } else { 0.0 }
 }
 
 /// One line of plain text, without the markers whisper models emit for
@@ -137,6 +150,12 @@ mod tests {
     fn cleans_transcripts() {
         assert_eq!(clean(" [BLANK_AUDIO]\n how full is\n my disk? (coughs) "), "how full is my disk?");
         assert_eq!(clean("[BLANK_AUDIO]"), "");
+    }
+
+    #[test]
+    fn measures_recordings() {
+        assert_eq!(wav_secs(&super::super::wav(&vec![0; 32_000], 16_000)), 2.0);
+        assert_eq!(wav_secs(b"RIFFfake"), 0.0);
     }
 
     #[test]

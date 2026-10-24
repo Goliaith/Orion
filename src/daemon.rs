@@ -329,18 +329,22 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Reload the policy when its file changes. A file that fails to parse is
-/// reported and the running policy kept.
+/// Reload the policy when its file changes, or what Orion tuned over it. A
+/// file that fails to parse is reported and the running policy kept.
 fn watch_policy(path: &Path, shared: &Shared, stats: &Stats) {
-    let mut last = mtime(path);
+    let stamps = || {
+        let tuned = [crate::tuning::Overlay::path(), crate::voice::tuning::Tuning::path()];
+        (mtime(path), tuned.map(|p| p.as_deref().and_then(mtime)))
+    };
+    let mut last = stamps();
     loop {
         thread::sleep(Duration::from_secs(2));
-        let now = mtime(path);
+        let now = stamps();
         if now == last {
             continue;
         }
         last = now;
-        if now.is_none() {
+        if now.0.is_none() {
             continue;
         }
         match Policy::load(Some(path)) {
