@@ -221,18 +221,19 @@ fn check_install(policy: &Policy, a: &InstallArgs) -> Result<(String, String)> {
         bail!("{app} is already installed ({}{}); app_open starts it", a.scope.name(), if v.is_empty() { String::new() } else { format!(", {v}") });
     }
     // Unknown apps fail here, not after the approval.
-    exec::output("flatpak", &["remote-info", a.scope.flag(), "--", &remote, &app])
+    exec::output("flatpak", &["remote-info", a.scope.flag(), "--app", "--", &remote, &app])
         .with_context(|| format!("couldn't find {app} on {remote} (flatpak_search finds app ids)"))?;
     Ok((app, remote))
 }
 
 /// The command lines the helper runs as root; `helper_check` accepts only these.
+/// `--app`: never a runtime.
 fn install_argv(remote: &str, app: &str) -> Vec<String> {
-    ["install", "--system", "--noninteractive", "-y", "--", remote, app].map(String::from).to_vec()
+    ["install", "--system", "--app", "--noninteractive", "-y", "--", remote, app].map(String::from).to_vec()
 }
 
 fn uninstall_argv(app: &str) -> Vec<String> {
-    ["uninstall", "--system", "--noninteractive", "-y", "--", app].map(String::from).to_vec()
+    ["uninstall", "--system", "--app", "--noninteractive", "-y", "--", app].map(String::from).to_vec()
 }
 
 /// Run a system-wide `flatpak` command as you, and if polkit says no, as
@@ -389,14 +390,14 @@ impl Tool for FlatpakRemove {
 pub(super) fn helper_check(policy: &Policy, args: &[String]) -> Result<()> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     match a.as_slice() {
-        ["install", ..] if a.len() == 7 => {
-            let (remote, app) = (remote_name(a[5])?, app_id(a[6])?);
+        ["install", ..] if a.len() == 8 => {
+            let (remote, app) = (remote_name(a[6])?, app_id(a[7])?);
             ensure!(args == install_argv(remote, app), "that isn't a flatpak command Orion makes");
             ensure!(policy.flatpak.remotes.iter().any(|r| r == remote), "{remote} is not in the helper's [flatpak] remotes");
             Ok(())
         }
-        ["uninstall", ..] if a.len() == 6 => {
-            let app = app_id(a[5])?;
+        ["uninstall", ..] if a.len() == 7 => {
+            let app = app_id(a[6])?;
             ensure!(args == uninstall_argv(app), "that isn't a flatpak command Orion makes");
             Ok(())
         }
@@ -478,12 +479,14 @@ mod tests {
         assert!(helper_check(&p, &install_argv("flathub", "com.discordapp.Discord")).is_ok());
         assert!(helper_check(&p, &uninstall_argv("com.discordapp.Discord")).is_ok());
         for bad in [
-            s(&["install", "--system", "--noninteractive", "-y", "--", "evil", "com.discordapp.Discord"]),
-            s(&["install", "--system", "--noninteractive", "-y", "--", "flathub", "/tmp/x.flatpakref"]),
+            s(&["install", "--system", "--app", "--noninteractive", "-y", "--", "evil", "com.discordapp.Discord"]),
+            s(&["install", "--system", "--app", "--noninteractive", "-y", "--", "flathub", "/tmp/x.flatpakref"]),
             s(&["install", "--system", "--noninteractive", "-y", "--from", "flathub", "https://x/y.flatpakref"]),
             s(&["remote-add", "evil", "https://evil.example/repo"]),
             s(&["run", "com.discordapp.Discord"]),
-            s(&["uninstall", "--system", "--noninteractive", "-y", "--all", "x.y.z"]),
+            s(&["uninstall", "--system", "--app", "--noninteractive", "-y", "--all", "x.y.z"]),
+            // Runtimes are not apps.
+            s(&["install", "--system", "--noninteractive", "-y", "--", "flathub", "org.freedesktop.Platform"]),
         ] {
             assert!(helper_check(&p, &bad).is_err(), "{bad:?}");
         }
