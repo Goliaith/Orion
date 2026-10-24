@@ -9,6 +9,7 @@
 pub mod enroll;
 pub mod neural;
 pub mod record;
+pub mod setup;
 pub mod speak;
 pub mod speaker;
 mod torch;

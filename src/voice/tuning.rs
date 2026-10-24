@@ -69,7 +69,7 @@ impl Tuning {
         })
     }
 
-    fn save(&self) -> Result<PathBuf> {
+    pub fn save(&self) -> Result<PathBuf> {
         let path = Self::path().context("no home directory")?;
         if *self == Self::default() {
             let _ = std::fs::remove_file(&path);
