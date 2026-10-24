@@ -43,6 +43,7 @@ die() { echo "bootstrap.sh: $*" >&2; exit 1; }
 # Everything runs from main, so a shell reading this script from a pipe has
 # read all of it before any command can touch stdin.
 main() {
+    PATH_BEFORE=$PATH
     [ "$(id -u)" != 0 ] || die "run this as yourself, not root; it uses sudo where it must"
     [ "$(uname -s)" = Linux ] || die "Orion runs on Linux only"
 
@@ -176,6 +177,11 @@ next_steps() {
     if [ "${relogin:-}" = yes ]; then
         echo "Log out and back in once, so you're in the orion group the helper answers."
     fi
+    # Rust from the distribution, not rustup, leaves ~/.cargo/bin off PATH.
+    case :${PATH_BEFORE}: in
+        *:"$HOME/.cargo/bin":*) ;;
+        *) [ -f "$HOME/.cargo/env" ] || echo "Add ~/.cargo/bin to your PATH so the orion command is found: echo 'export PATH=\"\$HOME/.cargo/bin:\$PATH\"' >> ~/.bashrc" ;;
+    esac
     if [ ! -f "$HOME/.config/orion/orion.toml" ]; then
         echo "Orion has no policy yet; it runs on the defaults. To start one:"
         echo "  mkdir -p ~/.config/orion && cp $dir/orion.example.toml ~/.config/orion/orion.toml"
