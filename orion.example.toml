@@ -3,8 +3,8 @@
 # unless noted otherwise.
 
 # `orion setup --trust ask|everyday|hands-off` sets [defaults] and the
-# allow-lists below for one of three trust levels (see "Trust levels" in the
-# README); `orion doctor` says which one this file is on.
+# allow-lists below for one of three trust levels (see "Trust levels" in
+# docs/safety.md); `orion doctor` says which one this file is on.
 
 # What happens to tools that have no entry under [tools], by risk level:
 #   allow  run without asking
@@ -194,7 +194,7 @@ complex_words = ["code", "script", "program", "debug", "refactor", "implement", 
 long_request_words = 60         # longer messages go to Claude
 
 # The AI's journal: entries and decisions by topic, in HelixCore's format,
-# recalled when a message is about them (see "The journal" in the README).
+# recalled when a message is about them (see docs/memory.md).
 [chat.journal]
 enabled = true
 auto_recall = true              # add matching entries to each message

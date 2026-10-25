@@ -1,6 +1,8 @@
 # Installing Orion
 
-This guide takes a Linux machine from nothing to a working Orion: installing it, giving it a model to talk to, the optional parts (sandbox, voice, the graphical shell, network and disk tools), root access for the machine tools, and running it as a service. [Operating Orion](operating.md) covers using it day to day.
+This guide takes a Linux machine from nothing to a working Orion: installing it, giving it a model to talk to, the optional parts (sandbox, voice, the graphical shell, network and disk tools), root access for the machine tools, and running it as a service. [Operating Orion](operating.md) covers using it day to day, and the [README](../README.md) lists the other guides.
+
+**On Fedora KDE with Gemini?** The [README's Get started](../README.md#get-started) has the short version: three commands and `orion setup`.
 
 - [What you need](#what-you-need)
 - [1. Install](#1-install)
@@ -297,7 +299,7 @@ With whisper.cpp and no server, for example:
 transcribe_command = "whisper-cli -m ~/models/ggml-base.en.bin -nt -np -f {wav}"
 ```
 
-Then set up the rest in one go, with the speech-to-text server running:
+Then set up the rest in one go, with the speech-to-text server running ([Voice](voice.md) has the details):
 
 ```sh
 orion voice setup
@@ -323,7 +325,7 @@ orion voice test
 
 On a machine without internet, download the Resemblyzer 0.1.4 wheel elsewhere and use `orion voice model install --from <file>`.
 
-To set up the wake-word detector by hand instead, or to use openWakeWord (see the README):
+To set up the wake-word detector by hand instead, or to use openWakeWord (see [Voice](voice.md#the-wake-word-detector)):
 
 ```sh
 install -Dm 755 contrib/orion-wake ~/.local/bin/orion-wake
@@ -419,7 +421,7 @@ To give the helper its own protected lists or another group, copy the sections y
 
 #### Letting Orion work as root beyond its tools
 
-`root_run` and `sys_edit` let Orion change anything on the machine, each step approved by you and snapshotted so `pkg_rollback` undoes it ([Root work](../README.md#root-work)). They are off until root lists your login in the helper's policy:
+`root_run` and `sys_edit` let Orion change anything on the machine, each step approved by you and snapshotted so `pkg_rollback` undoes it ([Root work](safety.md#root-work)). They are off until root lists your login in the helper's policy:
 
 ```sh
 sudo mkdir -p /etc/orion

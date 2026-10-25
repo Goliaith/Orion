@@ -35,7 +35,7 @@ mkdir -p "$t/systemd/user" "$t/systemd/system" "$t/docs"
 install -m 755 "$binary" "$t/orion"
 install -m 755 "$top/contrib/orion-kiosk" "$here/install.sh" "$t/"
 install -m 644 "$top/orion.example.toml" "$here/sysusers.conf" "$top/LICENSE" "$t/"
-install -m 644 "$top/README.md" "$top/docs/install.md" "$top/docs/operating.md" "$t/docs/"
+install -m 644 "$top/README.md" "$top"/docs/*.md "$t/docs/"
 for unit in "$top"/contrib/*.service "$top"/contrib/*.socket; do
     case $(basename "$unit") in orion-helper.*) kind=system ;; *) kind=user ;; esac
     sed -e 's|%h/\.cargo/bin/orion|@BINDIR@/orion|g' -e 's|/usr/local/bin/orion|@BINDIR@/orion|g' "$unit" > "$t/systemd/$kind/$(basename "$unit")"
