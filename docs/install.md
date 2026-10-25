@@ -423,7 +423,7 @@ To give the helper its own protected lists or another group, copy the sections y
 
 ```sh
 sudo mkdir -p /etc/orion
-printf '[helper]\nroot_users = ["%s"]\n' "$USER" | sudo tee -a /etc/orion/helper.toml
+sudoedit /etc/orion/helper.toml            # under [helper]: root_users = ["your login"]
 sudo systemctl restart orion-helper.service
 sudo snapper -c root create-config /       # once, on btrfs: the snapshots that make each step undoable
 rpm -q bubblewrap || sudo dnf install bubblewrap   # proc_run must be in bubblewrap

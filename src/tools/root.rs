@@ -252,6 +252,11 @@ impl Tool for RootRun {
     fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
         let a: RunArgs = parse_args(args.clone())?;
         ensure!(!a.command.is_empty(), "no program to run");
+        ensure!(
+            route(policy)?.is_some(),
+            "Orion runs as root itself, so root_run would run outside the helper's limits (home folders read-only, \
+             out of the snapshot's reach); run Orion as yourself, with the helper"
+        );
         ensure!(a.stdin.as_ref().is_none_or(|s| s.len() <= MAX_EDIT), "the input is too long (64 KiB at most)");
         precheck(policy)
     }
@@ -260,14 +265,10 @@ impl Tool for RootRun {
         let a: RunArgs = parse_args(args)?;
         let cap = policy.root.timeout_secs.max(1);
         let timeout = Duration::from_secs(a.timeout_secs.unwrap_or(cap).clamp(1, cap));
+        let socket = route(policy)?.context("root_run runs only through the helper")?;
         let tracker = changes::begin_root(policy, "root_run")?;
-        let done = match route(policy)? {
-            Some(socket) => {
-                let argv: Vec<String> = std::iter::once(a.command.clone()).chain(a.args).collect();
-                crate::helper::run(&socket, RUN, &argv, a.stdin, timeout)
-            }
-            None => exec::run(exec::command_as(None, &root_program(&a.command)?.to_string_lossy(), &a.args), a.stdin, timeout, 4 << 20),
-        };
+        let argv: Vec<String> = std::iter::once(a.command.clone()).chain(a.args).collect();
+        let done = crate::helper::run(&socket, RUN, &argv, a.stdin, timeout);
         let mut out = match &done {
             Ok(d) => json!({
                 "ok": d.success(),
