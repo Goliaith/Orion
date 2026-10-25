@@ -862,6 +862,16 @@ mod tests {
     }
 
     #[test]
+    fn the_daemons_unit_leaves_bubblewrap_working() {
+        // These lay a read-only /proc/sys over /proc in a user namespace,
+        // and bubblewrap can't mount a /proc of its own under them.
+        let unit = include_str!("../contrib/orion.service");
+        for setting in ["ProtectKernelTunables=", "ProtectKernelModules=", "ProtectControlGroups=", "PrivateUsers="] {
+            assert!(!unit.lines().any(|l| l.starts_with(setting)), "orion.service sets {setting}");
+        }
+    }
+
+    #[test]
     fn landlock_scopes_signals() {
         if landlock_abi() < 6 {
             return;

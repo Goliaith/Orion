@@ -98,7 +98,10 @@ pub(crate) fn helper_check_run(policy: &Policy, peer: &Peer, args: &[String], st
 /// Where `sys_edit` would write `raw`, and whether the file is there
 /// already. The folder must exist and be root's alone, and the file, if
 /// there, a plain file: not a link (name what it points to instead).
-pub(crate) fn edit_target(raw: &str) -> Result<(PathBuf, bool)> {
+///
+/// Only the helper (`as_root`) checks who owns the folder: Orion's daemon
+/// runs in a user namespace of its own, where root's files show as nobody's.
+pub(crate) fn edit_target(raw: &str, as_root: bool) -> Result<(PathBuf, bool)> {
     let path = Path::new(raw);
     ensure!(path.is_absolute(), "the path must be absolute: {raw}");
     let plain = raw.split('/').all(|c| c != "." && c != "..") && path.components().all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
@@ -113,7 +116,7 @@ pub(crate) fn edit_target(raw: &str) -> Result<(PathBuf, bool)> {
     let meta = std::fs::metadata(&dir)?;
     ensure!(meta.is_dir(), "{} isn't a folder", dir.display());
     ensure!(
-        meta.uid() == 0 && meta.permissions().mode() & 0o022 == 0,
+        (meta.uid() == 0 || !as_root) && meta.permissions().mode() & 0o022 == 0,
         "{} isn't root's alone; sys_edit writes only where only root can",
         dir.display()
     );
@@ -151,7 +154,7 @@ pub(crate) fn helper_edit(policy: &Policy, peer: &Peer, args: &[String], content
         [path, mode] => (path, Some(parse_mode(mode)?)),
         _ => bail!("sys_edit takes a path, and a mode for a new file"),
     };
-    let (path, exists) = edit_target(raw)?;
+    let (path, exists) = edit_target(raw, true)?;
     ensure!(!(exists && mode.is_some()), "{} exists; a mode is only for a new file", path.display());
     let mut file = if exists {
         OpenOptions::new().write(true).truncate(true).custom_flags(libc::O_NOFOLLOW).open(&path)
@@ -302,7 +305,7 @@ struct EditArgs {
 impl SysEdit {
     /// What the file holds now, if Orion can read it.
     fn current(path: &str) -> Option<String> {
-        let (target, exists) = edit_target(path).ok()?;
+        let (target, exists) = edit_target(path, false).ok()?;
         if !exists {
             return Some(String::new());
         }
@@ -366,7 +369,7 @@ impl Tool for SysEdit {
     fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
         let a: EditArgs = parse_args(args.clone())?;
         ensure!(a.content.len() <= MAX_EDIT, "sys_edit writes files up to {} KiB", MAX_EDIT >> 10);
-        let (path, exists) = edit_target(&a.path)?;
+        let (path, exists) = edit_target(&a.path, false)?;
         if let Some(mode) = &a.mode {
             parse_mode(mode)?;
             ensure!(!exists, "{} exists; mode is only for a new file", path.display());
@@ -499,19 +502,19 @@ mod tests {
     #[test]
     fn edits_only_where_a_snapshot_reaches() {
         for bad in ["etc/hosts", "/etc/../root/x", "/etc/./hosts", "/proc/sys/kernel/x", "/home/me/.bashrc", "/boot/grub2/grub.cfg", "/tmp/x"] {
-            assert!(edit_target(bad).is_err(), "{bad}");
+            assert!(edit_target(bad, true).is_err(), "{bad}");
         }
-        assert!(format!("{:#}", edit_target("/no-such-dir/x").unwrap_err()).contains("doesn't exist"));
+        assert!(format!("{:#}", edit_target("/no-such-dir/x", true).unwrap_err()).contains("doesn't exist"));
         // /etc is root's alone wherever these tests run.
-        let (p, exists) = edit_target("/etc/orion-no-such-file.conf").unwrap();
+        let (p, exists) = edit_target("/etc/orion-no-such-file.conf", true).unwrap();
         assert_eq!((p, exists), (PathBuf::from("/etc/orion-no-such-file.conf"), false));
-        assert!(edit_target("/etc").is_err() || !Path::new("/etc").is_file());
-        assert!(edit_target("/etc/hostname").is_ok_and(|(_, e)| e) || !Path::new("/etc/hostname").is_file());
+        assert!(edit_target("/etc", true).is_err() || !Path::new("/etc").is_file());
+        assert!(edit_target("/etc/hostname", true).is_ok_and(|(_, e)| e) || !Path::new("/etc/hostname").is_file());
         let dir = tempfile::tempdir().unwrap();
         let mine = dir.path().join("x.conf");
         // A folder someone other than root may write is refused (when not running as root).
         if unsafe { libc::geteuid() } != 0 {
-            assert!(edit_target(mine.to_str().unwrap()).is_err());
+            assert!(edit_target(mine.to_str().unwrap(), true).is_err());
         }
     }
 
