@@ -27,8 +27,9 @@ impl Decision {
 }
 
 /// Tools that ask even where the policy allows them: `settings_tune` can
-/// pre-approve other tools.
-const ALWAYS_ASK: &[&str] = &["settings_tune"];
+/// pre-approve other tools, and `root_run` and `sys_edit` work as root
+/// beyond what the machine tools check.
+pub(crate) const ALWAYS_ASK: &[&str] = &["settings_tune", "root_run", "sys_edit"];
 
 /// Decision for each risk level, used when a tool has no explicit entry.
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +81,9 @@ pub struct ProcPolicy {
     /// Processes `proc_signal` never stops, by name (`*` wildcards): the
     /// ones the session, the network or the machine stand on.
     pub protected: Vec<String>,
+    /// Let `proc_run` run a program outside the sandbox when asked to
+    /// (`"sandbox": false`), which a person approves every time.
+    pub unsandboxed: bool,
 }
 
 impl Default for ProcPolicy {
@@ -94,7 +98,27 @@ impl Default for ProcPolicy {
             timeout_secs: 30,
             max_output_bytes: 64 << 10,
             protected: protected.map(String::from).to_vec(),
+            unsandboxed: true,
         }
+    }
+}
+
+/// `[root]`: `root_run` and `sys_edit`, root work beyond the machine
+/// tools. They go through the privileged helper, which runs them only for
+/// the logins in its own `[helper] root_users`, and a person approves each.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RootPolicy {
+    /// Snapper snapshots around each one: `required` (none runs without a
+    /// pair, so each can be put back) or `auto` (when snapper can).
+    pub snapshots: String,
+    /// The longest a `root_run` program may run.
+    pub timeout_secs: u64,
+}
+
+impl Default for RootPolicy {
+    fn default() -> Self {
+        Self { snapshots: "required".into(), timeout_secs: 600 }
     }
 }
 
@@ -317,6 +341,7 @@ pub struct Policy {
     pub fs: FsPolicy,
     pub proc: ProcPolicy,
     pub admin: AdminPolicy,
+    pub root: RootPolicy,
     pub services: ServicesPolicy,
     pub packages: PackagesPolicy,
     pub flatpak: FlatpakPolicy,

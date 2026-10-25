@@ -281,14 +281,10 @@ mod tests {
     #[test]
     fn levels_decide_as_described() {
         use crate::tools::builtin;
-        use crate::Preapproval;
         let tool = |n: &str| builtin().into_iter().find(|t| t.name() == n).unwrap();
         let runs_unasked = |p: &Policy, n: &str, args: serde_json::Value| {
             let t = tool(n);
-            matches!(
-                (p.decide(n, t.risk()), t.preapproval(p, &args)),
-                (Decision::Allow, Preapproval::Granted | Preapproval::NotApplicable) | (Decision::Ask, Preapproval::Granted)
-            )
+            t.preapproval(p, &args).unasked(p.decide(n, t.risk()))
         };
         let flatpak = serde_json::json!({ "app": "org.kde.krita" });
         let volume = serde_json::json!({ "volume": "+5%" });

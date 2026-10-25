@@ -1,5 +1,6 @@
-//! The safety net under package changes. Around each `pkg_install`,
-//! `pkg_remove`, `update_apply` and `pkg_rollback`, Orion
+//! The safety net under package changes and root work. Around each
+//! `pkg_install`, `pkg_remove`, `update_apply`, `pkg_rollback`, `root_run`
+//! and `sys_edit`, Orion
 //!
 //! - takes a snapper snapshot before and after, where the root filesystem
 //!   has a snapper configuration (`[packages] snapshots`);
@@ -11,6 +12,9 @@
 //! manager for the old versions again (from the repositories, or pacman's
 //! cache) and removing what the change added. It refuses when a later
 //! change touched the same packages, so changes are put back newest first.
+//! `root_run` and `sys_edit` changes can only go back by their snapshots,
+//! and only while no later change is in place, since which files they
+//! touched isn't written down.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -118,7 +122,10 @@ pub(super) struct Change {
 }
 
 /// The tools whose changes are tracked, which name the snapshots.
-const TRACKED: [&str; 4] = ["update_apply", "pkg_install", "pkg_remove", "pkg_rollback"];
+const TRACKED: [&str; 6] = ["update_apply", "pkg_install", "pkg_remove", "pkg_rollback", "root_run", "sys_edit"];
+
+/// The tracked tools that work as root beyond the package manager.
+const ROOT_WORK: [&str; 2] = ["root_run", "sys_edit"];
 
 fn history_path() -> Option<PathBuf> {
     Policy::state_dir().map(|d| d.join("packages.jsonl"))
@@ -165,15 +172,20 @@ fn valid_config(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
 }
 
-/// The snapper configuration to snapshot with, or why there is none.
+/// The snapper configuration to snapshot package changes with, or why
+/// there is none.
 pub(super) fn snapper(policy: &Policy) -> Result<String, String> {
-    let p = &policy.packages;
-    let config = p.snapper_config.as_str();
-    match p.snapshots.as_str() {
+    match policy.packages.snapshots.as_str() {
         "never" => return Err("packages.snapshots is \"never\"".into()),
         "auto" | "required" => {}
         other => return Err(format!("packages.snapshots must be auto, required or never, not {other:?}")),
     }
+    snapper_config(policy)
+}
+
+/// `[packages] snapper_config`, if snapper can use it here.
+pub(super) fn snapper_config(policy: &Policy) -> Result<String, String> {
+    let config = policy.packages.snapper_config.as_str();
     if !valid_config(config) {
         return Err(format!("packages.snapper_config {config:?} isn't a snapper configuration name"));
     }
@@ -247,9 +259,22 @@ pub(super) fn precheck(policy: &Policy) -> Result<()> {
     Ok(())
 }
 
+/// The same for root work, under `[root] snapshots`.
+pub(super) fn precheck_root(policy: &Policy) -> Result<()> {
+    match policy.root.snapshots.as_str() {
+        "required" => {
+            snapper_config(policy).map_err(|why| anyhow::anyhow!("root.snapshots is \"required\" so it can be put back, but {why}"))?;
+        }
+        "auto" => {}
+        other => bail!("root.snapshots must be required or auto, not {other:?}"),
+    }
+    Ok(())
+}
+
 /// A change under way: the versions and snapshot from before it.
 pub(super) struct Tracker {
-    m: Manager,
+    /// The package manager, whose versions are noted before and after.
+    m: Option<Manager>,
     tool: &'static str,
     before: Option<Versions>,
     snapshot: Option<Snapshot>,
@@ -260,17 +285,36 @@ pub(super) struct Tracker {
 
 /// Get ready for a change: note every version and take the "pre" snapshot.
 pub(super) fn begin(policy: &Policy, m: Manager, tool: &'static str, undoes: Option<u64>) -> Result<Tracker> {
-    let required = policy.packages.snapshots == "required";
-    let (snapshot, skipped) = match snapper(policy) {
-        Ok(config) => match take(policy, &config, Snap::Pre(tool)) {
+    let required = (policy.packages.snapshots == "required").then_some("packages.snapshots");
+    start(policy, Some(m), tool, undoes, snapper(policy), required)
+}
+
+/// [`begin`] for root work (`root_run`, `sys_edit`), under `[root] snapshots`.
+/// Package versions are noted too, where there is a package manager, in
+/// case the work installs or removes some.
+pub(super) fn begin_root(policy: &Policy, tool: &'static str) -> Result<Tracker> {
+    let required = (policy.root.snapshots == "required").then_some("root.snapshots");
+    start(policy, manager(policy).ok(), tool, None, snapper_config(policy), required)
+}
+
+fn start(
+    policy: &Policy,
+    m: Option<Manager>,
+    tool: &'static str,
+    undoes: Option<u64>,
+    config: Result<String, String>,
+    required: Option<&str>,
+) -> Result<Tracker> {
+    let (snapshot, skipped) = match (config, required) {
+        (Ok(config), _) => match take(policy, &config, Snap::Pre(tool)) {
             Ok(pre) => (Some(Snapshot { config, pre, post: None }), None),
-            Err(e) if required => bail!("packages.snapshots is \"required\", and the snapshot failed: {e:#}"),
+            Err(e) if let Some(key) = required => bail!("{key} is \"required\", and the snapshot failed: {e:#}"),
             Err(e) => (None, Some(format!("{e:#}"))),
         },
-        Err(why) if required => bail!("packages.snapshots is \"required\", but {why}"),
-        Err(why) => (None, Some(why)),
+        (Err(why), Some(key)) => bail!("{key} is \"required\", but {why}"),
+        (Err(why), None) => (None, Some(why)),
     };
-    let before = versions(m).map_err(|e| tracing::warn!("package history: {e:#}")).ok();
+    let before = m.and_then(|m| versions(m).map_err(|e| tracing::warn!("package history: {e:#}")).ok());
     Ok(Tracker { m, tool, before, snapshot, skipped, undoes })
 }
 
@@ -288,7 +332,7 @@ impl Tracker {
             Some(s) => out["snapshot"] = json!(s),
             None => out["snapshot"] = json!({ "skipped": self.skipped }),
         }
-        let after = versions(self.m).map_err(|e| tracing::warn!("package history: {e:#}")).ok();
+        let after = self.m.and_then(|m| versions(m).map_err(|e| tracing::warn!("package history: {e:#}")).ok());
         let packages = match (&self.before, &after) {
             (Some(b), Some(a)) => diff(b, a),
             _ => Vec::new(),
@@ -300,7 +344,7 @@ impl Tracker {
             id: 0,
             at: now(),
             tool: self.tool.into(),
-            manager: self.m.name().into(),
+            manager: self.m.map_or("none", Manager::name).into(),
             ok,
             packages,
             snapshot: self.snapshot,
@@ -335,7 +379,13 @@ fn rollback_target(changes: &[Change], id: u64) -> Result<Change> {
     let names: BTreeSet<&str> = target.packages.iter().map(|p| p.name.as_str()).collect();
     let undone: BTreeSet<u64> = changes.iter().filter(|c| c.ok).filter_map(|c| c.undoes).collect();
     let later = changes.iter().filter(|c| c.id > id && !undone.contains(&c.id) && c.undoes.is_none_or(|u| u <= id));
+    let root_work = |c: &Change| ROOT_WORK.contains(&c.tool.as_str());
     for c in later {
+        // Which files root work touched isn't known, so nothing goes back
+        // across it, nor it across anything later.
+        if root_work(target) || root_work(c) {
+            bail!("change {} ({}, from {}) came after it and is still in place; put that back first (pkg_rollback with id {})", c.id, c.tool, c.at, c.id);
+        }
         if let Some(p) = c.packages.iter().find(|p| names.contains(p.name.as_str())) {
             bail!("change {} (from {}) changed {} since; put that back first (pkg_rollback with id {})", c.id, c.at, p.name, c.id);
         }
@@ -551,9 +601,9 @@ impl Tool for PkgHistory {
     }
 
     fn description(&self) -> &'static str {
-        "The package changes Orion made (installs, removals, updates, rollbacks), newest first: each package's \
-         version before and after, the snapper snapshots taken around it, and whether it was put back since. \
-         Use the id with pkg_rollback."
+        "The package changes Orion made (installs, removals, updates, rollbacks) and its root work (root_run, \
+         sys_edit), newest first: each package's version before and after, the snapper snapshots taken around it, \
+         and whether it was put back since. Use the id with pkg_rollback."
     }
 
     fn risk(&self) -> Risk {
@@ -625,17 +675,20 @@ fn plan(policy: &Policy, args: &Value) -> Result<(Manager, Change, Plan)> {
     let a: RollbackArgs = parse_args(args.clone())?;
     let m = manager(policy)?;
     let change = rollback_target(&history()?, a.id)?;
-    ensure!(change.manager == m.name(), "change {} was made with {}, and this machine uses {}", a.id, change.manager, m.name());
+    let same_manager = change.manager == m.name() || change.packages.is_empty();
+    ensure!(same_manager, "change {} was made with {}, and this machine uses {}", a.id, change.manager, m.name());
     let pair = change.snapshot.clone().filter(|s| s.post.is_some());
+    // Root work is snapshotted under [root] snapshots, whatever packages.snapshots says.
+    let usable = || if ROOT_WORK.contains(&change.tool.as_str()) { snapper_config(policy) } else { snapper(policy) };
     let by_snapshot = |s: Snapshot| -> Result<Plan> {
-        let config = snapper(policy).map_err(|why| anyhow::anyhow!("can't use the snapshots: {why}"))?;
+        let config = usable().map_err(|why| anyhow::anyhow!("can't use the snapshots: {why}"))?;
         ensure!(config == s.config, "change {} was snapshotted with snapper config {:?}; packages.snapper_config is {config:?}", a.id, s.config);
         Ok(Plan::Snapshot(s))
     };
     let p = match (a.method.as_str(), pair) {
         ("snapshot", Some(s)) => by_snapshot(s)?,
         ("snapshot", None) => bail!("change {} has no snapshot pair to go back to; use method \"packages\"", a.id),
-        ("auto", Some(s)) if snapper(policy).is_ok() => by_snapshot(s)?,
+        ("auto", Some(s)) if usable().is_ok() => by_snapshot(s)?,
         ("auto" | "packages", _) => {
             let r = restore_plan(policy, m, &change, Path::new(PACMAN_CACHE))?;
             let install_first = check_restore(policy, m, &r)?;
@@ -652,11 +705,12 @@ impl Tool for PkgRollback {
     }
 
     fn description(&self) -> &'static str {
-        "Put back a package change Orion made (an id from pkg_history), as root. With a snapper snapshot pair \
-         around the change, undoes every file it changed (method snapshot, the default when there is one); \
-         otherwise installs the old versions again, from the repositories or pacman's cache, and removes what \
-         the change added (method packages). Changes are put back newest first. Protected packages stay. \
-         A reboot is wise afterwards when the kernel or core libraries were involved."
+        "Put back a package change or root work (root_run, sys_edit) Orion did (an id from pkg_history), as \
+         root. With a snapper snapshot pair around the change, undoes every file it changed (method snapshot, the \
+         default when there is one); otherwise installs the old versions again, from the repositories or pacman's \
+         cache, and removes what the change added (method packages). Changes are put back newest first, and root \
+         work only by its snapshots. Protected packages stay. A reboot is wise afterwards when the kernel or core \
+         libraries were involved."
     }
 
     fn risk(&self) -> Risk {
@@ -800,6 +854,36 @@ mod tests {
         assert_eq!(rollback_target(&h, 1).unwrap().id, 1);
         assert!(err(&h, 3).contains("already put back, by change 4"));
         assert!(err(&h, 4).contains("itself a rollback"));
+    }
+
+    #[test]
+    fn root_work_goes_back_only_newest_first() {
+        let mut root = change(2, &[], None);
+        root.tool = "sys_edit".into();
+        let h = vec![change(1, &[("curl", Some("1"), Some("2"))], None), root, change(3, &[("vim", None, Some("9"))], None)];
+        let err = |h: &[Change], id| format!("{:#}", rollback_target(h, id).unwrap_err());
+        // Nothing goes back across root work, nor it across anything later.
+        assert!(err(&h, 1).contains("change 2 (sys_edit"), "{}", err(&h, 1));
+        assert!(err(&h, 2).contains("change 3 (update_apply"), "{}", err(&h, 2));
+        assert_eq!(rollback_target(&h, 3).unwrap().id, 3);
+        let mut h = h;
+        h.push(change(4, &[("vim", Some("9"), None)], Some(3)));
+        assert_eq!(rollback_target(&h, 2).unwrap().id, 2);
+    }
+
+    #[test]
+    fn root_work_snapshots() {
+        let p = Policy::from_toml("[packages]\nsnapshots = \"never\"\nsnapper_config = \"orion-no-such\"\n").unwrap();
+        // Required by default, whatever packages.snapshots says.
+        let why = format!("{:#}", precheck_root(&p).unwrap_err());
+        assert!(why.contains("root.snapshots is \"required\""), "{why}");
+        assert!(why.contains("orion-no-such") || why.contains("snapper isn't installed"), "{why}");
+        let p = Policy::from_toml("[root]\nsnapshots = \"auto\"\n[packages]\nsnapper_config = \"orion-no-such\"\n").unwrap();
+        assert!(precheck_root(&p).is_ok());
+        let p = Policy::from_toml("[root]\nsnapshots = \"never\"\n").unwrap();
+        assert!(precheck_root(&p).is_err());
+        // The helper takes the snapshots root work asks for.
+        assert!(snapper_args("root", Snap::Pre("root_run")).join(" ").ends_with("--description orion root_run"));
     }
 
     #[test]

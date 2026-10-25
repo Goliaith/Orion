@@ -24,7 +24,10 @@
 //! - keeping checkpoints of each user's audit log (`ANCHOR`), which runs
 //!   no program: it only appends a line to that user's file;
 //! - the time zone, network time, locale and keyboard layout, with values
-//!   the machine has.
+//!   the machine has;
+//! - and, only for the logins in its own `[helper] root_users` (none by
+//!   default), any program as root (`root_run`) and writing a system file
+//!   (`sys_edit`): see `tools::root`.
 //!
 //! Each command runs with a clean environment and a fixed `PATH`, is
 //! logged with who asked, and is stopped if the asker hangs up.
@@ -55,6 +58,10 @@ pub struct HelperConfig {
     pub group: String,
     /// And these login names.
     pub users: Vec<String>,
+    /// Logins (of those who may use the helper) it also runs `root_run`
+    /// and `sys_edit` for: any program as root, any system file. None by
+    /// default; only root, in the helper's own file, can add one.
+    pub root_users: Vec<String>,
     /// Where the helper keeps each user's audit-log checkpoints
     /// (`UID.jsonl`, root's, readable by all).
     pub anchors: String,
@@ -66,6 +73,7 @@ impl Default for HelperConfig {
             socket: "/run/orion/helper.sock".into(),
             group: "orion".into(),
             users: Vec::new(),
+            root_users: Vec::new(),
             anchors: "/var/lib/orion/audit-anchors".into(),
         }
     }
@@ -139,6 +147,9 @@ pub struct Peer {
 /// A command a check let through: its arguments (a check may rewrite them,
 /// as for a password file), its input, and what must live while it runs.
 pub struct Checked {
+    /// The program to run, when it isn't the one asked for by name
+    /// (`root_run` names its program in the arguments).
+    pub program: Option<PathBuf>,
     pub args: Vec<String>,
     pub stdin: Option<String>,
     pub keep: Vec<Box<dyn std::any::Any + Send>>,
@@ -146,7 +157,7 @@ pub struct Checked {
 
 impl Checked {
     pub fn as_is(args: &[String], stdin: Option<&str>) -> Self {
-        Self { args: args.to_vec(), stdin: stdin.map(String::from), keep: Vec::new() }
+        Self { program: None, args: args.to_vec(), stdin: stdin.map(String::from), keep: Vec::new() }
     }
 }
 
@@ -309,6 +320,19 @@ fn handle(policy: &Policy, stream: UnixStream) -> Result<()> {
             Err(e) => answer(&Response { refused: Some(format!("{e:#}")), ..Default::default() }),
         };
     }
+    if req.program == crate::tools::root::EDIT {
+        let done = check_sizes(&req).and_then(|()| crate::tools::root::helper_edit(policy, &peer, &req.args, req.stdin.as_deref()));
+        return match done {
+            Ok(what) => {
+                tracing::info!("{who}: sys_edit: {what}");
+                answer(&Response { stdout: format!("{what}\n"), ..Default::default() })
+            }
+            Err(e) => {
+                tracing::warn!("{who}: refused sys_edit {:?}: {e:#}", req.args);
+                answer(&Response { refused: Some(format!("{e:#}")), ..Default::default() })
+            }
+        };
+    }
     let checked = match check(policy, &peer, &req) {
         Ok(c) => c,
         Err(e) => {
@@ -316,8 +340,16 @@ fn handle(policy: &Policy, stream: UnixStream) -> Result<()> {
             return answer(&Response { refused: Some(format!("{e:#}")), ..Default::default() });
         }
     };
-    tracing::info!("{who}: {} {}", req.program, checked.args.join(" "));
-    let mut cmd = Command::new(program_path(&req.program)?);
+    let program = match &checked.program {
+        Some(p) => p.clone(),
+        None => program_path(&req.program)?,
+    };
+    if req.program == crate::tools::root::RUN {
+        tracing::info!("{who}: root_run: {} {}", program.display(), checked.args.join(" "));
+    } else {
+        tracing::info!("{who}: {} {}", req.program, checked.args.join(" "));
+    }
+    let mut cmd = Command::new(&program);
     cmd.args(&checked.args)
         .env_clear()
         .env("PATH", SAFE_PATH)
@@ -356,15 +388,20 @@ fn handle(policy: &Policy, stream: UnixStream) -> Result<()> {
 
 /// The checks every request passes, then the owning tool's own check.
 fn check(policy: &Policy, peer: &Peer, req: &Request) -> Result<Checked> {
+    check_sizes(req)?;
+    crate::tools::helper_check(policy, peer, &req.program, &req.args, req.stdin.as_deref())
+}
+
+fn check_sizes(req: &Request) -> Result<()> {
     ensure!(req.args.len() <= 400, "too many arguments");
     let sizes_ok = req.args.iter().all(|a| a.len() <= 4096 && !a.contains('\0'));
     ensure!(sizes_ok, "an argument is too long or holds a NUL byte");
     ensure!(req.stdin.as_ref().is_none_or(|s| s.len() <= 64 << 10), "the input is too long");
-    crate::tools::helper_check(policy, peer, &req.program, &req.args, req.stdin.as_deref())
+    Ok(())
 }
 
 /// The full path of a program, from the safe directories only.
-fn program_path(name: &str) -> Result<PathBuf> {
+pub(crate) fn program_path(name: &str) -> Result<PathBuf> {
     ensure!(!name.contains('/'), "a program name, not a path");
     SAFE_PATH
         .split(':')
@@ -404,7 +441,7 @@ fn allowed(cfg: &HelperConfig, peer: &Peer) -> bool {
     peer.gid == gid || user_groups(&name, peer.gid).contains(&gid)
 }
 
-fn user_name(uid: u32) -> Option<String> {
+pub(crate) fn user_name(uid: u32) -> Option<String> {
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 16 << 10];
     let mut out: *mut libc::passwd = std::ptr::null_mut();

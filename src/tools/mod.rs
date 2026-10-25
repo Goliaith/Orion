@@ -19,6 +19,7 @@ mod network;
 mod packages;
 mod power;
 mod process;
+pub(crate) mod root;
 mod sensors;
 mod services;
 pub(crate) mod session;
@@ -117,6 +118,9 @@ fn stale_helper_note(installed: &Path) -> String {
 /// The privileged helper's check of one command: the module that builds
 /// that command vets it, against the helper's own policy.
 pub fn helper_check(policy: &Policy, peer: &Peer, program: &str, args: &[String], stdin: Option<&str>) -> Result<Checked> {
+    if program == root::RUN {
+        return root::helper_check_run(policy, peer, args, stdin);
+    }
     ensure!(stdin.is_none() || program == "tee", "{program} takes no input here");
     let plain = |r: Result<()>| r.map(|()| Checked::as_is(args, stdin));
     let drop_in = args.last().is_some_and(|p| p.starts_with("/etc/systemd/system/"));
@@ -166,6 +170,8 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(process::ProcList),
         Box::new(process::ProcRun),
         Box::new(process::ProcSignal),
+        Box::new(root::RootRun),
+        Box::new(root::SysEdit),
         Box::new(services::SvcList),
         Box::new(services::SvcStatus),
         Box::new(services::SvcControl),

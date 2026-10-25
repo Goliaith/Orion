@@ -125,8 +125,9 @@ fn unattended(policy: &Policy, tool: &dyn Tool, args: &Value) -> Result<()> {
     match (policy.decide(name, tool.risk()), tool.preapproval(policy, args)) {
         (Decision::Deny, _) => bail!("{name} is denied by the policy"),
         (Decision::Allow, Preapproval::Refused(why)) => bail!("{name} would be refused when it runs: {why}"),
-        (Decision::Allow, _) | (Decision::Ask, Preapproval::Granted) => Ok(()),
-        (Decision::Ask, _) => bail!(
+        (d, p) if p.unasked(d) => Ok(()),
+        (_, Preapproval::Person(why)) => bail!("{name} always needs a person's approval ({why}), so it can't run on a timer"),
+        _ => bail!(
             "{name} needs approval, and nobody is there to give it when a timer fires. Pre-approve the call in the \
              policy first (for proc_run, [proc] allowed_commands; for update_apply, [packages] updates; or [tools] \
              {name} = \"allow\")"

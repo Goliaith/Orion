@@ -234,6 +234,12 @@ impl<L: Log> Headless<L> {
             }
             FromAgent::Approve { tool, preview, reply } => {
                 let args: Value = serde_json::from_str(&preview).unwrap_or(Value::Null);
+                if beyond_sandbox(&tool, &args) {
+                    // Too much to approve by ear: the person should read it.
+                    let _ = reply.send(Answer::No);
+                    self.say("That needs approving on a screen, where you can read exactly what it does.");
+                    return;
+                }
                 let question = format!("May I {}?", spoken_action(&tool, &args));
                 self.put_question(Asking::Approve(reply), &question);
             }
@@ -282,6 +288,11 @@ impl<L: Log> Headless<L> {
 }
 
 /// A tool call as a short phrase: "run df -h", "install htop".
+/// Root work and programs outside the sandbox: never approved by voice.
+fn beyond_sandbox(tool: &str, args: &Value) -> bool {
+    matches!(tool, "root_run" | "sys_edit") || (tool == "proc_run" && args["sandbox"] == Value::Bool(false))
+}
+
 fn spoken_action(tool: &str, args: &Value) -> String {
     let s = |k: &str| args[k].as_str().unwrap_or_default().to_string();
     let list = |k: &str| {
@@ -451,6 +462,14 @@ mod tests {
         h.on_agent(FromAgent::Approve { tool: "pkg_install".into(), preview: r#"{"packages":["htop"]}"#.into(), reply });
         h.on_wake(WakeEvent::Request { text: "no".into(), speaker: None });
         assert_eq!(answer.try_recv().unwrap(), Answer::No);
+
+        // Root work and runs outside the sandbox are for reading on a screen.
+        for (tool, preview) in [("root_run", r#"{"command":"sysctl"}"#), ("sys_edit", r#"{"path":"/etc/x"}"#), ("proc_run", r#"{"command":"make","sandbox":false}"#)] {
+            let (reply, answer) = mpsc::channel();
+            h.on_agent(FromAgent::Approve { tool: tool.into(), preview: preview.into(), reply });
+            assert_eq!(answer.try_recv().unwrap(), Answer::No, "{tool}");
+        }
+        assert!(spoken(&said, "on a screen").contains("approving on a screen"));
     }
 
     #[test]

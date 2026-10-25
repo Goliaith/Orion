@@ -53,6 +53,12 @@ pub trait Tool: Send + Sync {
         args.clone()
     }
 
+    /// Whether this call needs a person's yes every time, so that "always
+    /// for this session" doesn't cover it: the tools that always ask.
+    fn every_time(&self, _args: &Value) -> bool {
+        crate::policy::ALWAYS_ASK.contains(&self.name())
+    }
+
     /// Hard checks that no approval can override (such as path scopes). They
     /// run before the user is asked, so nobody approves a call that would fail.
     fn precheck(&self, _policy: &Policy, _args: &Value) -> Result<()> {
@@ -67,6 +73,20 @@ pub enum Preapproval {
     Granted,
     /// Refused under `allow`; under `ask` a human can still approve it.
     Refused(String),
+    /// A person approves this call under `allow` too (it reaches past
+    /// the sandbox, say); the reason says why.
+    Person(String),
+}
+
+impl Preapproval {
+    /// Whether a call with this decision runs without asking anyone.
+    pub fn unasked(&self, decision: crate::policy::Decision) -> bool {
+        use crate::policy::Decision;
+        matches!(
+            (decision, self),
+            (Decision::Allow, Preapproval::NotApplicable | Preapproval::Granted) | (Decision::Ask, Preapproval::Granted)
+        )
+    }
 }
 
 /// Deserialize tool arguments; a missing/null argument object counts as `{}`.

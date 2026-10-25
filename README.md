@@ -60,7 +60,9 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `fs_move`      | write   | ask     | Move or rename a file or folder, within the writable roots |
 | `fs_delete`    | write   | ask     | Delete to the Trash (or for good), within the writable roots |
 | `proc_list`    | read    | allow   | Processes, with filtering and sorting by memory |
-| `proc_run`     | execute | ask     | Run one program (no shell) in the [sandbox](#sandbox), with a timeout and an output cap |
+| `proc_run`     | execute | ask     | Run one program (no shell) in the [sandbox](#sandbox), with a timeout and an output cap; or, with `"sandbox": false`, as you outside it (always asks) |
+| `root_run`     | execute | always asks | Run one program as root through the helper, for work no other tool covers; snapshotted, so `pkg_rollback` undoes it ([root work](#root-work)) |
+| `sys_edit`     | write   | always asks | Write a system file (in `/etc`, say) as root, approved as a diff; snapshotted, so `pkg_rollback` undoes it |
 | `proc_signal`  | write   | ask     | Stop, interrupt, pause or resume a process; never the ones the system stands on |
 | `svc_list`     | read    | allow   | systemd units: running, failed or stopped, and enabled at boot |
 | `svc_status`   | read    | allow   | One unit's state, last result, memory, CPU, restarts and recent log |
@@ -79,7 +81,7 @@ It speaks the [Model Context Protocol](https://modelcontextprotocol.io), so the 
 | `flatpak_remove` | execute | ask   | Uninstall a Flatpak app |
 | `update_check` | read    | allow   | Pending updates (security fixes and kernels marked), services to restart, reboot needed |
 | `update_apply` | execute | ask     | Install updates: all, security fixes only, or named packages |
-| `pkg_history`  | read    | allow   | Every package change Orion made: versions before and after, snapshots, rollbacks |
+| `pkg_history`  | read    | allow   | Every package change and root work Orion did: versions before and after, snapshots, rollbacks |
 | `pkg_rollback` | execute | ask     | Put a change back, through its snapper snapshots or by reinstalling the old versions |
 | `audio_status` | read    | allow   | Sound outputs and inputs (speakers, headphones, HDMI, Bluetooth, microphones): volume, mute, the default, and what plays |
 | `audio_set`    | write   | allow\* | Set or nudge a volume, mute, or pick the default output or microphone |
@@ -112,7 +114,7 @@ Out of the box the AI can look at the machine freely. Changing it (writing files
 | Everyday | Flatpak installs, volume and brightness, locking the screen, opening apps and files, and starting, stopping and restarting the services in `[services] allowed` | `[desktop] approved = ["volume", "brightness", "lock", "open"]`, `apps = ["*"]`, `[flatpak] allowed = ["*"]`; your own `[services] allowed`, or `ollama.service` and `llama-server.service` when it names none. Package installs, updates and your `allowed_commands` are left as they are |
 | Hands-off | everything: files, programs, packages, services, rebooting | `[defaults] write` and `execute` = `allow`, every allow-list `["*"]`, `[packages] updates = "all"` |
 
-The hard limits are the same at every level: the writable roots, protected services, packages and mounts, the Flatpak remotes, the sandbox, and `settings_tune`, which always asks. Under Hands-off, updates that would remove packages are refused rather than run. A `[tools]` entry set to `allow` stays as it is; setup and doctor name any that let a tool run unasked beyond the level. The old file is kept as `orion.toml.bak`.
+The hard limits are the same at every level: the writable roots, protected services, packages and mounts, the Flatpak remotes, the sandbox, and the tools that always ask: `settings_tune`, `root_run`, `sys_edit` and `proc_run` outside the sandbox. Under Hands-off, updates that would remove packages are refused rather than run. A `[tools]` entry set to `allow` stays as it is; setup and doctor name any that let a tool run unasked beyond the level. The old file is kept as `orion.toml.bak`.
 
 ## Install
 
@@ -761,6 +763,22 @@ Every package change Orion makes (`pkg_install`, `pkg_remove`, `update_apply`) c
 - **Newest first.** A change can't be put back while a later one that touched the same packages is still in place; the refusal names it. Protected packages stay installed, and a change is put back only once.
 - `pkg_rollback` is `execute` and asks, like the changes themselves. Through the privileged helper, `snapper` runs only as Orion builds it, on the helper's own snapper configuration.
 
+### Root work
+
+For work no machine tool covers (a setting in `/etc`, `sysctl`, a repository's setup, `restorecon`), Orion can work as root beyond its sandbox, with you approving each step and every step undoable:
+
+- **`sys_edit`** writes a system file as root: the file's whole new content, which you approve as a diff against what it holds now. An existing file keeps its owner, mode and SELinux label; a new one is root's, with the mode asked for (`0644` by default, never set-id). Not under `/home`, `/root`, `/boot`, `/efi`, `/tmp`, `/proc`, `/sys`, `/dev`, `/run`, `/mnt` or `/media`, which snapper doesn't snapshot with `/`, nor through a link, nor in a folder anyone but root can write. Up to 64 KiB.
+- **`root_run`** runs one program as root, with no shell: a program from `/usr/sbin`, `/usr/bin`, `/sbin` or `/bin`, or an absolute path that only root could have put there. Its environment is clean, home folders are read-only to it (`ProtectHome` in the helper's unit), and it stops after `[root] timeout_secs` (600).
+- **`proc_run` with `"sandbox": false`** runs a program as you, outside the sandbox: with the network, the GPU and every file you can reach, for a build that downloads, say. No root. `[proc] unsandboxed = false` turns it off.
+
+All three **always ask**, whatever the policy or trust level says, so none can be pre-approved, scheduled with `timer_create` or run by `orion serve` with nobody there. "Always for this session" approves only the one call, and `orion listen` never takes a spoken yes for them: they are for reading on a screen. `root_run` and `sys_edit` also:
+
+- **go only through the [helper](#the-privileged-helper)**, which runs them only for the logins root lists in its own policy, `/etc/orion/helper.toml`: `[helper] root_users = ["you"]`. None are listed by default, so this stays off until root turns it on, and code running as you can't turn it on. The helper's log (`journalctl -u orion-helper`) records each, with who asked;
+- **are snapshotted**: a snapper pair around each, described "orion root_run" or "orion sys_edit", written in the change history with any packages it moved. `pkg_rollback` with its id puts the files back (`snapper undochange`). Root work goes back only newest first, and nothing goes back across it, since which files it touched isn't written down. `[root] snapshots = "required"` (the default) refuses root work where no snapshot can be taken; on Fedora with btrfs, `sudo snapper -c root create-config /` sets one up. Home folders are a separate subvolume there, outside the snapshot, which is why neither tool writes in them;
+- **refuse to run unless `proc_run`'s sandbox is bubblewrap** (or `proc_run` is denied). Bubblewrap hides the daemon's and the helper's sockets from the programs it runs; Landlock can't stop a program connecting to a socket file, and through the daemon a program could approve its own call.
+
+Anything you approve to run as you, `proc_run` outside the sandbox or an app `app_open` starts, can reach the helper as you can. With your login in `root_users`, that is as good as root, so approve those as you would `root_run`.
+
 ### Unattended updates
 
 `[packages] automatic = "security"` (or `"all"`) has the daemon install updates once a day, at or after `automatic_at` (default `04:00`, local time). It catches up after the machine was off, and waits while on battery unless `automatic_on_battery` is set. Each run refreshes the lists and calls `update_apply` under the policy like any other caller: so `[packages] updates` must allow it (`"security"` for security fixes, `"all"` for everything), and it never removes packages. Every run is snapshotted and in the history, so `pkg_rollback` undoes it. The daemon notifies the desktop when it installed something; a failed run shows under what needs attention and tries again the next day. `orion status` shows the setting and the last run. Orion never reboots: the reboot check says when one is due.
@@ -907,7 +925,8 @@ The service reads `ANTHROPIC_API_KEY` and other variables from `~/.config/orion/
 - `systemctl` actions on units that aren't protected, including those that give a console root shell;
 - GPU drop-ins holding only GPU variables;
 - `nosuid,nodev` mounts under the mount roots, of disks the system doesn't run from;
-- NetworkManager's Wi-Fi and connection commands, and firewall rules that keep SSH open.
+- NetworkManager's Wi-Fi and connection commands, and firewall rules that keep SSH open;
+- and only for the logins in its own `[helper] root_users` (none by default), [root work](#root-work): any program as root (`root_run`) and writing a system file (`sys_edit`).
 
 Anything else is refused. Commands run with a clean environment and a fixed `PATH`, are logged with who asked (`journalctl -u orion-helper`), and stop if the asker hangs up. With `[admin] elevate = "auto"`, Orion uses the helper whenever its socket exists, and `orion tools` and `orion status` say how Orion gets root. [Installing Orion](docs/install.md#the-privileged-helper-recommended) sets it up; `tests/helper/run.sh` checks it end to end.
 
@@ -932,6 +951,8 @@ Every program the AI starts with `proc_run` runs in a sandbox, whatever the poli
 - **Limits** are per program: `memory_mb` (default 8192), `cpu_secs` (300) and `max_file_mb` (4096); `0` turns one off. Programs also can't gain privileges through setuid binaries.
 - **A cgroup per program:** where the systemd user manager runs, each program gets a scope of its own (`systemd-run --user --scope`), so `memory_mb` holds for all of its processes together, page cache included, and `max_processes` (512) stops a fork bomb. Without a user manager the per-process limits above still apply. `cgroup = false` turns scopes off.
 - **A seccomp filter** refuses, with "operation not permitted", the system calls a program has no business making here: debugging other processes (ptrace), loading kernels, modules or eBPF, perf events, userfaultfd, io_uring, mounting, `setns` and new user namespaces, the kernel keyring, swap, reboot, setting the clock, raw I/O ports and `open_by_handle_at`. A system call from another architecture (a 32-bit call in a 64-bit program) ends the program. Built into Orion (no libseccomp), for x86_64 and aarch64. `seccomp = false` turns it off, for a program that needs `strace` or `gdb`.
+- **Orion's own sockets** are out of reach under bubblewrap: the daemon's, where a program could otherwise answer approvals, and the helper's. Landlock can't hide a socket, which is why [root work](#root-work) needs bubblewrap.
+- **`"sandbox": false`** runs one program as you, outside the sandbox, when you approve that call; it is never pre-approved (`[proc] unsandboxed = false` turns it off).
 - Each result says which sandbox ran it (`"sandbox": "bubblewrap"`), and `orion tools` prints the current one.
 - Under Landlock, a directory that contains a hidden path is opened up entry by entry, so files created there later aren't readable. Bubblewrap has no such gap.
 
@@ -975,7 +996,8 @@ src/
                 (recognition, per-process use, placement, gpu_assign), netconf
                 (Wi-Fi, connections, firewall), disks (disks, usage, mounts), updates
                 (pending updates, upgrading, restarts and reboots), changes
-                (snapshots, the package history, pkg_rollback);
+                (snapshots, the package history, pkg_rollback), root (root_run and
+                sys_edit, root work through the helper);
                 exec.rs runs programs for them
   chat/
     mod.rs      config, the Backend and Ui traits
