@@ -1,6 +1,6 @@
 # Operating Orion
 
-How to use Orion day to day, keep it in check, and fix it when something goes wrong. [Installing Orion](install.md) gets it running first. The [README](../README.md) describes each feature in depth.
+How to use Orion day to day, keep it in check, and fix it when something goes wrong. [Installing Orion](install.md) gets it running first. Each feature has its own guide: [chat](chat.md), [voice](voice.md), [memory](memory.md), [safety](safety.md), [the machine](machine.md), [setup and doctor](setup.md) and [all tools](tools.md).
 
 - [How Orion works](#how-orion-works)
 - [Ways to use it](#ways-to-use-it)
@@ -50,11 +50,15 @@ Type what you want in plain words: "what's using my disk?", "are there security 
 | `/model [claude\|local] [id]`, `/models` | show or switch models; list the local server's |
 | `/effort <level>` | Claude's effort: low, medium, high, xhigh, max |
 | `/tools` | what the AI can do, and what needs your approval |
+| `/status` | the daemon, the sandbox, and what needs attention |
 | `/usage` | tokens used this session |
 | `/new`, `/history`, `/resume <n\|id>`, `/title <text>` | conversations |
 | `/memory [forget <id>\|clear]` | what the AI remembers about this person |
+| `/journal [<topic>\|search <words>]` | the AI's journal |
 | `/voice [speak on\|off\|test]`, `/voice wake on\|off` | voice |
-| `/keys`, `/exit` | the hotkeys; leave |
+| `/keys`, `/help`, `/exit` | the hotkeys; every command; leave |
+
+Typing `orion status`, `orion tools`, `orion memory` or `orion conversations` in the chat runs the matching slash command. Commands that need a terminal (`orion doctor`, `orion setup`, …) get a note on where to run them ([details](chat.md#typing-orion-commands-in-the-chat)).
 
 | Key | |
 |---|---|
