@@ -196,7 +196,7 @@ approve = false
 - The system's mounts (`/`, `/boot`, `/home`, …) can't be unmounted.
 - Firewall changes that would cut off an SSH session into the machine are refused, and so is taking down the connection one runs over.
 - Programs started by `proc_run` can't see your keys, Orion's state or its policy, and under bubblewrap can't reach the daemon's or the helper's socket.
-- `root_run`, `sys_edit` and `proc_run` outside the sandbox ask you every time, whatever the policy or trust level says. `root_run` and `sys_edit` run only for the logins root lists in the helper's own `[helper] root_users`.
+- `root_run`, `sys_edit` and `proc_run` outside the sandbox ask you every time, whatever the policy or trust level says. So does opening a shell in unsandboxed [developer mode](safety.md#developer-mode), which only you can turn on. `root_run` and `sys_edit` run only for the logins root lists in the helper's own `[helper] root_users`.
 
 You can extend the protected lists in the policy. Shortening them is possible, so do it with care.
 

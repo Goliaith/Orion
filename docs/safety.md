@@ -9,6 +9,7 @@ How Orion decides what the AI may do, and how to undo what it did.
 - [The policy file](#the-policy-file)
 - [The sandbox](#the-sandbox)
 - [Root work](#root-work)
+- [Developer mode](#developer-mode)
 - [Snapshots and rollback](#snapshots-and-rollback)
 - [Private things](#private-things)
 - [The audit log](#the-audit-log)
@@ -61,7 +62,8 @@ These ask you every time, at every trust level, whatever the policy says:
 - `root_run`: run a program as root,
 - `sys_edit`: write a system file as root,
 - `proc_run` with `"sandbox": false`: run a program as you, outside the sandbox,
-- `settings_tune`: change a setting Orion [tuned](setup.md#self-tuning).
+- `settings_tune`: change a setting Orion [tuned](setup.md#self-tuning),
+- `dev_shell` opening a shell in [unsandboxed developer mode](#developer-mode).
 
 For the first three, "always for this session" approves only that one call, they can't be put on a timer, `orion serve` won't run them with nobody there, and a spoken "yes" doesn't count. They are meant to be read on a screen.
 
@@ -197,6 +199,75 @@ rpm -q bubblewrap || sudo dnf install bubblewrap
 - **The helper logs each one** with who asked: `journalctl -u orion-helper`.
 
 **Know what it grants.** With your login in `root_users`, any program running as you can ask the helper for root, so this is like a passwordless sudo rule, with a log and snapshots. Orion still asks you before each step. That's also why `proc_run` outside the sandbox, and apps `app_open` starts, deserve the same care as `root_run`: they run as you, and can reach the helper too.
+
+## Developer mode
+
+Safe Assistant mode, everything above, is the default and what Orion goes back to. Developer mode is for building and testing software: the AI gets a **persistent shell** in a folder of its own, `~/orion-dev`, with the network on, so it can fetch dependencies, build, run the tests, fix and go again without asking you at every step.
+
+### Turn it on and off
+
+Only you can switch, from a terminal. No tool switches modes, so the AI can't.
+
+```sh
+orion mode dev                      # sandboxed, for 8 hours
+orion mode dev --for 2h             # or 30m, 2d, never
+orion mode dev --unsandboxed        # the shell runs as you, for 1 hour
+orion mode safe                     # back to Safe Assistant mode; open shells close
+orion mode                          # which mode is on, and for how long
+```
+
+It turns itself off when the time is up (`[dev] expires`, `unsandboxed_expires`). `orion status`, `orion doctor`, `orion tools` and the chat's status show which mode is on.
+
+### The two kinds of shell
+
+| | Safe Assistant mode | `orion mode dev` | `orion mode dev --unsandboxed` |
+|---|---|---|---|
+| Programs | one at a time (`proc_run`) | a persistent bash (`dev_shell`): `cd`, variables, virtual environments and background jobs carry over | the same |
+| Runs as | you, in the sandbox | you, in the sandbox | you, in namespaces of its own |
+| Writes | `~/orion-workspace` | `~/orion-dev` and the toolchain caches in `[dev] caches` (`~/.cargo`, `~/.npm`, pip, Go, Maven, Gradle) | everything you can write, except below |
+| Network | off | on | on |
+| GPU | off | off (`[dev] gpu = true` turns it on) | on |
+| Your keys (`~/.ssh`, `~/.gnupg`, cloud credentials) | hidden | hidden | readable, not writable: `git push` works |
+| Orion's own files (settings, audit log, checkpoints, conversations) | hidden | hidden | hidden |
+| Orion's and the root helper's sockets | unreachable | unreachable | unreachable |
+| The user bus and systemd user manager | reachable | unreachable | unreachable |
+| Login scripts (`~/.bashrc`, `~/.profile`, `~/.config/systemd`, autostart, …) | read-only | read-only | read-only (`[dev] protect`) |
+| The machine's other processes | invisible | invisible | invisible |
+| Debuggers (`gdb`, `strace`) | refused | work, inside the shell | work, inside the shell |
+| Time per command | 30 s | as long as it takes: a call waits up to 30 minutes, then `dev_shell_read` follows it | the same |
+| Memory | 8 GB per program | 16 GB for the whole shell (`[dev] memory_mb`) | the same |
+
+Both need bubblewrap: Landlock can't hide sockets.
+
+### What it asks
+
+- **Opening a shell asks you.** The prompt says which kind. A sandboxed one may be approved "always for this session". An unsandboxed one asks every time it opens, like `root_run`.
+- **Commands in an open shell don't ask**, at any trust level. The shell's boundary is the sandbox, not a prompt per command.
+- **Everything else is unchanged.** Your trust level keeps deciding the machine tools, `root_run`, `sys_edit` and `proc_run` outside the sandbox still ask every time, `sudo` doesn't work in either shell, and the [hard limits](#hard-limits) hold. `[tools] dev_shell = "deny"` turns the shell off altogether.
+
+### The audit log
+
+Every command is its own entry (tool `dev_shell`), with the shell's id, the command line and how it ended, so `orion audit` reads like a shell history. Turning the mode on or off is logged too (tool `dev_mode`). The entries are in the same hash chain as everything else.
+
+### Undo
+
+Before each command Orion checkpoints `~/orion-dev`: every file's content, kept once, in Orion's state folder where the shells can't reach. Just ask ("undo what the last command did"), or:
+
+```sh
+orion call dev_history                  # newest first: when, and before which command
+orion call dev_rollback '{"id": 12}'    # put ~/orion-dev back as it was then
+```
+
+- A rollback takes a checkpoint first, so it can be undone too.
+- Folders named in `[dev] skip` (`target`, `node_modules`, `.venv`, …) and files over 64 MB are left out and left alone: a build makes them again.
+- The newest 50 are kept (`[dev] checkpoints`).
+- **Only `~/orion-dev` comes back.** Not the caches, not what an unsandboxed shell did elsewhere, not what went out over the network.
+
+### What it doesn't protect against
+
+- **Code you didn't write runs.** `npm install`, `pip install` and `cargo build` run their packages' scripts. With the network on, they can send out what the shell can read: in the sandboxed shell that's your projects and whatever else is under your readable roots, though not your keys; in the unsandboxed one, nearly everything you can read.
+- **There's no list of allowed hosts.** The network is on or off.
+- **The unsandboxed shell is best effort, not a wall.** It shuts the easy ways to root and out of the session (the helper, the daemon, the user bus, login scripts, other processes), but it runs as you. It can write to folders on your `PATH` such as `~/.local/bin` and `~/.cargo/bin`, so something it leaves there can run later, outside it. If you're in the `docker` group, it can use Docker, which is as good as root. Use it for a job, then `orion mode safe`.
 
 ## Snapshots and rollback
 

@@ -11,6 +11,7 @@ pub mod approvals;
 pub mod audit;
 pub mod chat;
 pub mod daemon;
+pub mod dev;
 pub mod doctor;
 pub mod envfile;
 pub mod helper;

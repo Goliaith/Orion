@@ -61,6 +61,19 @@ pub struct SandboxConfig {
     pub cgroup: bool,
     /// Processes and threads per program, in its scope (0: no limit).
     pub max_processes: u64,
+    /// Set for developer mode's shells (see `dev`); never from orion.toml.
+    #[serde(skip)]
+    pub dev: Option<DevProfile>,
+}
+
+/// How a developer-mode shell's bubblewrap differs from the usual one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevProfile {
+    /// The whole filesystem as the person has it, rather than read-only
+    /// outside the writable roots; only Orion's own files stay hidden.
+    pub unsandboxed: bool,
+    /// Under `unsandboxed`: readable, but not writable.
+    pub protect: Vec<PathBuf>,
 }
 
 impl Default for SandboxConfig {
@@ -87,6 +100,7 @@ impl Default for SandboxConfig {
             seccomp: true,
             cgroup: true,
             max_processes: 512,
+            dev: None,
         }
     }
 }
@@ -262,8 +276,9 @@ pub fn command(
         _ruleset: None,
         _seccomp: None,
     };
+    let debuggers = config.dev.is_some();
     let filter = if config.seccomp && b != Backend::Off {
-        crate::seccomp::program()
+        crate::seccomp::program_for(debuggers)
     } else {
         Vec::new()
     };
@@ -292,7 +307,7 @@ pub fn command(
             let mut a = bwrap_args(policy, cwd);
             if !filter.is_empty() {
                 // bwrap installs it just before running the program.
-                let fd = seccomp_fd(&crate::seccomp::bytes())?;
+                let fd = seccomp_fd(&crate::seccomp::bytes_for(debuggers))?;
                 a.extend(["--seccomp".into(), fd.as_raw_fd().to_string()]);
                 guard._seccomp = Some(fd);
             }
@@ -338,6 +353,77 @@ pub fn command(
     }
     cmd.process_group(0);
     Ok((cmd, b, guard))
+}
+
+/// Developer mode's unsandboxed shell: the person's own filesystem,
+/// devices and network, in namespaces of its own so that what it hides
+/// stays hidden. It can't see Orion's state and settings, nor reach the
+/// daemon's or the helper's socket, nor the user bus and systemd user
+/// manager (through which it could start a program outside this
+/// namespace), nor the machine's other processes (whose /proc/PID/root
+/// would lead back out). What runs at the next login is read-only.
+fn bwrap_unsandboxed(policy: &Policy, dev: &DevProfile, cwd: Option<&Path>) -> Vec<String> {
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let mut a: Vec<String> = [
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--unshare-cgroup-try",
+        "--cap-drop",
+        "ALL",
+        "--bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for p in &dev.protect {
+        a.extend(["--ro-bind".into(), s(p), s(p)]);
+    }
+    for h in orion_paths(policy) {
+        if h.is_dir() {
+            a.extend(["--tmpfs".into(), s(&h)]);
+        } else if h.exists() {
+            a.extend(["--ro-bind".into(), "/dev/null".into(), s(&h)]);
+        }
+    }
+    for sock in orion_sockets(policy).into_iter().chain(user_manager_sockets()) {
+        a.extend(["--ro-bind".into(), "/dev/null".into(), s(&sock)]);
+    }
+    if let Some(dir) = cwd {
+        a.extend(["--chdir".into(), s(dir)]);
+    }
+    a
+}
+
+/// Orion's own files: its state (the audit log, the mode, checkpoints,
+/// conversations), its settings and the AI's journal.
+fn orion_paths(policy: &Policy) -> Vec<PathBuf> {
+    let config = Policy::default_config_path().and_then(|p| p.parent().map(Path::to_path_buf));
+    let mut out = Vec::new();
+    for p in Policy::state_dir().iter().chain(config.as_ref()).chain(policy.chat.journal.home.as_ref()) {
+        let p = expand_home(p);
+        let p = p.canonicalize().unwrap_or(p);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The session bus and the systemd user manager's private socket.
+fn user_manager_sockets() -> Vec<PathBuf> {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else { return Vec::new() };
+    [runtime.join("bus"), runtime.join("systemd/private")]
+        .into_iter()
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type())))
+        .collect()
 }
 
 /// Holds sandbox resources (the Landlock ruleset, bwrap's seccomp
@@ -424,6 +510,9 @@ impl Limits {
 
 fn bwrap_args(policy: &Policy, cwd: Option<&Path>) -> Vec<String> {
     let c = &policy.sandbox;
+    if let Some(dev) = c.dev.as_ref().filter(|d| d.unsandboxed) {
+        return bwrap_unsandboxed(policy, dev, cwd);
+    }
     let s = |p: &Path| p.to_string_lossy().into_owned();
     let mut a: Vec<String> = [
         "--die-with-parent",
@@ -472,6 +561,13 @@ fn bwrap_args(policy: &Policy, cwd: Option<&Path>) -> Vec<String> {
     // own approvals, and through the helper do Orion's root work.
     for sock in orion_sockets(policy) {
         a.extend(["--ro-bind".into(), "/dev/null".into(), s(&sock)]);
+    }
+    // A dev shell's commands run unasked, so they mustn't be able to ask
+    // the user manager to start something outside the sandbox either.
+    if c.dev.is_some() {
+        for sock in user_manager_sockets() {
+            a.extend(["--ro-bind".into(), "/dev/null".into(), s(&sock)]);
+        }
     }
     if let Some(dir) = cwd {
         a.extend(["--chdir".into(), s(dir)]);

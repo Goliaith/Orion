@@ -54,7 +54,8 @@ src/
   approvals.rs  approvals through the daemon, and `orion approvals`
   remote.rs     the chat calling tools through the daemon
   helper.rs     the privileged helper: the root service, its client, who may use it
-  sandbox.rs    sandboxing for proc_run: bubblewrap, Landlock, limits, cgroups
+  sandbox.rs    sandboxing for proc_run: bubblewrap, Landlock, limits, cgroups; the dev shells' profiles
+  dev/          developer mode: [dev], `orion mode`, the shells' policy (mod.rs), checkpoints of the dev root
   seccomp.rs    the seccomp filter for sandboxed programs
   watch.rs      what needs attention: the checks, the daemon's watch, unattended updates
   interrupt.rs  Ctrl-C: the SIGINT flag, interruptible waits and reads
