@@ -129,4 +129,4 @@ See [Connect other AI agents](docs/install.md#8-connect-other-ai-agents-mcp).
 
 ## License
 
-Copyright (c) 2026 Goliaith. All rights reserved: Orion is proprietary, and no license is granted to use, copy, modify or distribute it without written permission. See [LICENSE](LICENSE). The third-party libraries it uses keep their own licenses.
+Copyright (c) 2026 MrSilhouette. All rights reserved: Orion is proprietary, and no license is granted to use, copy, modify or distribute it without written permission. See [LICENSE](LICENSE). The third-party libraries it uses keep their own licenses.
