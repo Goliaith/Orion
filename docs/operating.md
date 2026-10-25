@@ -86,7 +86,7 @@ Claude's tool calls that touch a private path are refused, whatever the policy a
 
 **Simple requests skip the models altogether.** "Volume up", "set volume to 40", "mute", "brightness 60%", "dim the screen", "status" and "open firefox" (or a link or a path) are answered by calling the tool directly, in any mode, which saves a model round trip or two. The call goes through the same policy, approvals and audit log as a model's would, and both models are told about it the next time they answer. Anything phrased differently, or an app that isn't installed, goes to a model as before; `@claude` or `@local` in front always does. `/route <text>` shows which way a message goes, and `fast_path = false` under `[chat]` turns it off.
 
-**When a model makes Orion wait**, the chat says so and counts it down: `waiting on Gemini's rate limit (17s, retry 1 of 3) · 15 requests in the last minute`. Where the API reports its allowance (Claude, OpenAI and other OpenAI-style servers do; Gemini doesn't), the notice says how many requests are left instead, and Orion warns once a minute when they are nearly used up.
+**When a model makes Orion wait**, the chat says so and counts it down: `waiting on Gemini's rate limit (17s, retry 1 of 3) · 15 requests in the last minute`. Where the API reports its allowance (Claude, OpenAI and other OpenAI-style servers do; Gemini doesn't), the notice says how many requests are left instead, and Orion warns once a minute when they are nearly used up. A hosted model in `[chat.local]` rarely waits: Orion [switches to another cloud model](chat.md#switching-cloud-models-when-one-is-rate-limited) you have a key for until the limit passes.
 
 ## Approvals
 

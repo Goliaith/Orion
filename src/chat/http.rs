@@ -19,6 +19,9 @@ pub struct Http {
     agent: ureq::Agent,
     base: String,
     headers: Vec<(String, String)>,
+    /// Give a rate limit back to the caller as [`RateLimited`] instead of
+    /// waiting it out, so the cloud router can switch models.
+    hand_off: bool,
 }
 
 impl Http {
@@ -31,7 +34,13 @@ impl Http {
             // stream quiet for a while; this only trips on a dead connection.
             .timeout_read(Duration::from_secs(600))
             .build();
-        Self { agent, base: base_url.trim_end_matches('/').to_string(), headers }
+        Self { agent, base: base_url.trim_end_matches('/').to_string(), headers, hand_off: false }
+    }
+
+    /// Rate limits fail at once with [`RateLimited`] rather than being waited out.
+    pub fn handing_off(mut self, yes: bool) -> Self {
+        self.hand_off = yes;
+        self
     }
 
     pub fn base(&self) -> &str {
@@ -93,6 +102,9 @@ impl Http {
                 }
                 Err(retry) => retry,
             };
+            if code == 429 && self.hand_off {
+                return Err(RateLimited { service: service(&self.base), model, retry_after: asked }.into());
+            }
             if code == 429 && attempt == 0 {
                 crate::tuning::Signals::rate_limited(&self.base, &model);
             }
@@ -185,6 +197,23 @@ impl std::fmt::Display for StatusError {
 }
 
 impl std::error::Error for StatusError {}
+
+/// A rate limit handed back instead of waited out (see [`Http::handing_off`]).
+#[derive(Debug)]
+pub struct RateLimited {
+    pub service: String,
+    pub model: String,
+    /// How long the server asked for, if it said.
+    pub retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} rate limited {}", self.service, self.model)
+    }
+}
+
+impl std::error::Error for RateLimited {}
 
 fn retryable(code: u16) -> bool {
     matches!(code, 408 | 409 | 429 | 500..=599)

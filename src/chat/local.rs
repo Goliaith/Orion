@@ -8,7 +8,8 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::http::{secret_env, sse_data, Http};
+use super::cloud::{self, CloudConfig, CloudRouter, Pick, Target};
+use super::http::{secret_env, sse_data, Http, RateLimited, StatusError};
 use super::{Backend, Event, Reply, Stop, ToolCall, ToolResult, ToolSpec, Usage};
 
 /// `[chat.local]` in orion.toml.
@@ -103,6 +104,12 @@ pub struct LocalBackend {
     messages: Vec<Value>,
     usage: Usage,
     next_call_id: u64,
+    /// Other cloud models to switch to when this one is rate limited; only
+    /// for a hosted API.
+    cloud: Option<CloudRouter>,
+    /// Which model wrote each assistant message, by index, once the router
+    /// has switched; the rest are `config.model`'s.
+    made_by: Vec<(usize, String)>,
 }
 
 impl LocalBackend {
@@ -123,6 +130,8 @@ impl LocalBackend {
             usage: Usage::default(),
             next_call_id: 0,
             config: LocalConfig::default(),
+            cloud: None,
+            made_by: Vec::new(),
         };
         if config.model.is_empty() {
             let models = backend.list_models().with_context(|| format!("asking {} for its models", config.base_url))?;
@@ -133,6 +142,36 @@ impl LocalBackend {
         }
         backend.config = config;
         Ok(backend)
+    }
+
+    /// Switch to the other cloud models in `cloud` when this one is rate
+    /// limited. Nothing changes for a server on this machine, or when there
+    /// is no other model with a key.
+    pub fn with_cloud(mut self, cloud: &CloudConfig) -> Self {
+        if self.config.on_machine() {
+            return self;
+        }
+        let lineup = cloud::lineup(&self.config, cloud, &cloud::key_is_set);
+        let targets = lineup
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, entry)| {
+                let http = if i == 0 {
+                    self.http.clone()
+                } else {
+                    let key = secret_env(&entry.api_key_env).ok().flatten()?;
+                    Http::new(&entry.base_url, vec![("authorization".into(), format!("Bearer {key}"))])
+                };
+                Some(Target::new(entry, http))
+            })
+            .collect();
+        self.cloud = CloudRouter::new(targets, std::time::Duration::from_secs(cloud.cooldown_secs));
+        self
+    }
+
+    /// The cloud router, when there is one.
+    pub fn cloud(&self) -> Option<&CloudRouter> {
+        self.cloud.as_ref()
     }
 
     fn list_models_with(http: &Http) -> Result<Vec<String>> {
@@ -146,9 +185,13 @@ impl LocalBackend {
     }
 
     fn request_body(&self) -> Value {
+        self.request_body_for(&self.config.model, self.config.reasoning_effort.as_deref(), Value::from(self.messages.clone()))
+    }
+
+    fn request_body_for(&self, model: &str, effort: Option<&str>, messages: Value) -> Value {
         let mut body = json!({
-            "model": self.config.model,
-            "messages": self.messages,
+            "model": model,
+            "messages": messages,
             "stream": true,
             "stream_options": { "include_usage": true },
         });
@@ -161,16 +204,87 @@ impl LocalBackend {
         if let Some(t) = self.config.temperature {
             body["temperature"] = json!(t);
         }
-        if let Some(effort) = self.config.reasoning_effort.as_deref().filter(|e| !e.is_empty()) {
+        if let Some(effort) = effort.filter(|e| !e.is_empty()) {
             body["reasoning_effort"] = json!(effort);
         }
         body
+    }
+
+    /// Send the conversation to the configured model or, through the cloud
+    /// router, to the best one that isn't rate limited. Returns the stream
+    /// and the model answering.
+    fn send(&mut self, on: &mut dyn FnMut(Event)) -> Result<(Box<dyn BufRead>, String)> {
+        let Some(mut router) = self.cloud.take() else {
+            let reader = self
+                .http
+                .post_stream("/chat/completions", &self.request_body(), &[], on)
+                .with_context(|| format!("calling the local model {}", self.config.model))?;
+            return Ok((Box::new(reader), self.config.model.clone()));
+        };
+        let result = self.send_routed(&mut router, on);
+        self.cloud = Some(router);
+        result
+    }
+
+    fn send_routed(&mut self, router: &mut CloudRouter, on: &mut dyn FnMut(Event)) -> Result<(Box<dyn BufRead>, String)> {
+        let last = self.made_by.last().map_or(self.config.model.as_str(), |(_, m)| m.as_str()).to_string();
+        let mut tried = Vec::new();
+        loop {
+            let (i, wait) = match router.pick(&tried) {
+                Pick::Try(i) => (i, false),
+                Pick::Wait(i) => (i, true),
+                Pick::None => bail!("no cloud model can take the request (see `orion doctor`)"),
+            };
+            let target = &router.targets[i];
+            let model = target.entry.model.clone();
+            if wait {
+                on(Event::Notice(&format!("Every cloud model is rate limited; waiting for {}.", target.label())));
+            } else if model != last && tried.is_empty() && i == 0 {
+                on(Event::Notice(&format!("{} is free again; back to it.", target.label())));
+            }
+            let messages = cloud::messages_for(&self.messages, &self.made_by, &self.config.model, &model, target.is_gemini());
+            let body = self.request_body_for(&model, target.entry.reasoning_effort.as_deref(), Value::from(messages));
+            let http = target.http.clone().handing_off(!wait);
+            let err = match http.post_stream("/chat/completions", &body, &[], on) {
+                Ok(reader) => return Ok((Box::new(reader), model)),
+                Err(e) => e,
+            };
+            tried.push(i);
+            let label = router.targets[i].label();
+            let next = match router.pick(&tried) {
+                Pick::Try(n) => Some(router.targets[n].label()),
+                _ => None,
+            };
+            if let Some(limit) = err.downcast_ref::<RateLimited>() {
+                let secs = router.limited(i, limit.retry_after).as_secs();
+                if let Some(next) = next {
+                    on(Event::Notice(&format!("{label} is rate limited for {secs}s; switching to {next}.")));
+                }
+                continue;
+            }
+            // A key turned down or a model that isn't there won't get
+            // better this session; anything else is the server's trouble.
+            let lasting = err.downcast_ref::<StatusError>().is_some_and(|s| matches!(s.code, 401 | 403 | 404));
+            if !lasting || router.targets.iter().enumerate().all(|(n, t)| n == i || t.dead.is_some()) {
+                return Err(err.context(format!("calling {label}")));
+            }
+            let why = format!("{err:#}");
+            let then = next.map(|n| format!("; switching to {n}")).unwrap_or_default();
+            on(Event::Notice(&format!("{label} can't be used this session ({why}){then}.")));
+            router.failed(i, why);
+        }
     }
 }
 
 impl Backend for LocalBackend {
     fn describe(&self) -> String {
-        format!("{} · local at {}", self.config.model, self.http.base())
+        let here = format!("{} · local at {}", self.config.model, self.http.base());
+        let Some(router) = &self.cloud else { return here };
+        let others = router.targets.len() - 1;
+        match router.next().filter(|t| t.entry.model != self.config.model) {
+            Some(t) => format!("{} · standing in for {} (rate limited) · cloud router, {others} more", t.label(), self.config.model),
+            None => format!("{here} · cloud router, {others} more"),
+        }
     }
 
     fn model(&self) -> String {
@@ -179,6 +293,9 @@ impl Backend for LocalBackend {
 
     fn set_model(&mut self, model: &str) {
         self.config.model = model.to_string();
+        if let Some(home) = self.cloud.as_mut().and_then(|r| r.targets.first_mut()) {
+            home.entry.model = model.to_string();
+        }
     }
 
     fn list_models(&self) -> Result<Vec<String>> {
@@ -194,10 +311,7 @@ impl Backend for LocalBackend {
     }
 
     fn respond(&mut self, on: &mut dyn FnMut(Event)) -> Result<Reply> {
-        let reader = self
-            .http
-            .post_stream("/chat/completions", &self.request_body(), &[], on)
-            .with_context(|| format!("calling the local model {}", self.config.model))?;
+        let (reader, model) = self.send(on)?;
         let done = parse_stream(reader, on)?;
         self.usage.add(&done.usage);
         if done.finish.as_deref() == Some("content_filter") {
@@ -235,6 +349,9 @@ impl Backend for LocalBackend {
         if !wire_calls.is_empty() {
             message["tool_calls"] = json!(wire_calls);
         }
+        if self.cloud.is_some() && (model != self.config.model || !self.made_by.is_empty()) {
+            self.made_by.push((self.messages.len(), model));
+        }
         self.messages.push(message);
 
         let stop = match done.finish.as_deref() {
@@ -255,6 +372,7 @@ impl Backend for LocalBackend {
 
     fn clear(&mut self) {
         self.messages.truncate(1);
+        self.made_by.clear();
     }
 
     fn set_system(&mut self, system: &str) {
@@ -269,6 +387,7 @@ impl Backend for LocalBackend {
     fn import_history(&mut self, history: Value) -> Result<()> {
         let Value::Array(messages) = history else { bail!("saved local history is not a list") };
         self.messages.truncate(1);
+        self.made_by.clear();
         self.next_call_id = messages.len() as u64;
         self.messages.extend(messages);
         Ok(())
@@ -493,6 +612,90 @@ mod tests {
         let done = parse_stream(stream.as_bytes(), &mut |_| {}).unwrap();
         assert_eq!(done.calls.len(), 1);
         assert_eq!(serde_json::from_str::<Value>(&done.calls[0].arguments).unwrap(), json!({"sort":"memory"}));
+    }
+
+    /// A local backend at `home` whose cloud router can switch to `other`.
+    fn routed(home: &str, other: &str) -> LocalBackend {
+        let orion = orion();
+        let config = LocalConfig { base_url: format!("{home}/v1"), model: "home-model".into(), on_machine: Some(false), ..Default::default() };
+        let mut backend = LocalBackend::connect(config, "system".into(), &offered_tools(&orion)).unwrap();
+        let entry = |model: &str, url: String| cloud::Entry {
+            provider: "test".into(),
+            model: model.into(),
+            base_url: url,
+            api_key_env: String::new(),
+            reasoning_effort: None,
+            speed: 3,
+            quality: 3,
+        };
+        let targets = vec![
+            Target::new(entry("home-model", format!("{home}/v1")), backend.http.clone()),
+            Target::new(entry("other-model", format!("{other}/v1")), Http::new(&format!("{other}/v1"), Vec::new())),
+        ];
+        backend.cloud = CloudRouter::new(targets, std::time::Duration::from_secs(60));
+        backend
+    }
+
+    fn limited(secs: u32) -> String {
+        format!(r#"STATUS 429 {{"error":{{"code":429,"details":[{{"retryDelay":"{secs}s"}}]}}}}"#)
+    }
+
+    #[test]
+    fn rate_limited_requests_switch_models_instead_of_waiting() {
+        let call = chunks(&[
+            delta(json!({"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"system_info","arguments":"{}"}}]})),
+            finish("tool_calls"),
+        ]);
+        let answer = chunks(&[delta(json!({"content":"Fine."})), finish("stop")]);
+        let (home, home_reqs) = fake_server(vec![limited(30)]);
+        let (other, other_reqs) = fake_server(vec![call, answer]);
+        let orion = orion();
+        let backend = routed(&home, &other);
+        let mut session = Session::with_backends(&orion, Mode::Local, None, Some(Box::new(backend)));
+        let mut ui = Recorder::default();
+        session.turn("how is it?", &mut ui).unwrap();
+
+        assert!(ui.out.contains("!home-model (the local model server) is rate limited for 30s; switching to other-model"), "{}", ui.out);
+        assert!(!ui.out.contains("waiting"), "no wait: {}", ui.out);
+        assert!(ui.out.ends_with("Fine."), "{}", ui.out);
+        assert_eq!(home_reqs.recv().unwrap().1["model"], "home-model");
+        // The whole turn stays on the other model while home cools down,
+        // tool call and result included.
+        let (_, first) = other_reqs.recv().unwrap();
+        let (_, second) = other_reqs.recv().unwrap();
+        assert_eq!(first["model"], "other-model");
+        assert_eq!(second["messages"][2]["tool_calls"][0]["id"], "c1");
+        assert_eq!(second["messages"][3]["role"], "tool");
+        assert!(home_reqs.try_recv().is_err());
+    }
+
+    #[test]
+    fn waits_as_before_when_every_model_is_limited() {
+        let answer = chunks(&[delta(json!({"content":"Fine."})), finish("stop")]);
+        let (home, home_reqs) = fake_server(vec![limited(0), answer]);
+        let (other, _other_reqs) = fake_server(vec![limited(0)]);
+        let orion = orion();
+        let mut session = Session::with_backends(&orion, Mode::Local, None, Some(Box::new(routed(&home, &other))));
+        let mut ui = Recorder::default();
+        session.turn("hi", &mut ui).unwrap();
+        assert!(ui.out.contains("switching to other-model"), "{}", ui.out);
+        assert!(ui.out.contains("!Every cloud model is rate limited; waiting for home-model"), "{}", ui.out);
+        assert!(ui.out.ends_with("Fine."), "{}", ui.out);
+        assert_eq!(home_reqs.iter().take(2).count(), 2);
+    }
+
+    #[test]
+    fn a_fallback_that_is_turned_down_is_left_out() {
+        let answer = chunks(&[delta(json!({"content":"Fine."})), finish("stop")]);
+        let (home, _home_reqs) = fake_server(vec![limited(0), answer]);
+        let (other, _other_reqs) = fake_server(vec![r#"STATUS 401 {"error":{"message":"bad key"}}"#.to_string()]);
+        let orion = orion();
+        let mut session = Session::with_backends(&orion, Mode::Local, None, Some(Box::new(routed(&home, &other))));
+        let mut ui = Recorder::default();
+        session.turn("hi", &mut ui).unwrap();
+        assert!(ui.out.contains("!Every cloud model is rate limited; waiting for home-model"), "{}", ui.out);
+        let backend = session.backend(super::super::Provider::Local).unwrap();
+        assert!(backend.describe().contains("cloud router, 1 more"), "{}", backend.describe());
     }
 
     #[test]

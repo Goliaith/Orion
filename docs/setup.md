@@ -34,7 +34,8 @@ Pick Gemini when setup asks, and paste a key from [aistudio.google.com/apikey](h
 Good to know:
 
 - **The free tier allows only a few requests a minute,** and each tool Orion runs is one more request. When Google says to slow down, Orion waits and counts it down: `waiting on Gemini's rate limit (17s, retry 1 of 3)`.
-- **If it keeps happening,** Orion suggests a lighter model and less thinking ([self-tuning](#self-tuning)).
+- **Orion switches instead of waiting.** While your model is limited, the request goes to another Gemini model (each has its own allowance), or to Claude or OpenAI if you have a key. See [switching cloud models](chat.md#switching-cloud-models-when-one-is-rate-limited).
+- **If waits keep happening,** Orion suggests a lighter model and less thinking ([self-tuning](#self-tuning)).
 - **The [fast path](chat.md#the-fast-path) helps:** "volume up" or "open firefox" needs no request at all.
 - **Private things stay on your machine.** Gemini isn't on your machine, so Orion never sends it private notes, private journal entries or private files, and asks before sending a message that looks private.
 

@@ -73,6 +73,7 @@ src/
     classifier.rs  the local model as routing judge
     claude.rs   the Claude backend (streaming Messages API)
     local.rs    the OpenAI-compatible backend (Ollama, llama.cpp, vLLM, LM Studio, Gemini)
+    cloud.rs    the cloud router: other cloud models to switch to while one is rate limited
     http.rs     shared HTTP: retries, rate-limit waits, proxies, SSE
     memory.rs   notes about each person
     journal.rs  the HelixCore journal: entries, decisions, recall

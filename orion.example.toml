@@ -193,6 +193,25 @@ complex_words = ["code", "script", "program", "debug", "refactor", "implement", 
                  "algorithm", "step by step"]
 long_request_words = 60         # longer messages go to Claude
 
+# The cloud router. When the hosted model in [chat.local] (Gemini, say) is
+# rate limited, the request goes to the next-best cloud model Orion has a key
+# for instead of waiting, and comes back once the limit has passed. Only
+# providers with a key take part: GEMINI_API_KEY (Gemini Flash, Flash-Lite and
+# Pro, each with its own free allowance), ANTHROPIC_API_KEY (Claude Haiku and
+# Sonnet), OPENAI_API_KEY. Not used for a model on this machine. `orion
+# doctor` shows the order.
+[chat.cloud]
+enabled = true
+prefer = "balanced"             # rank by speed and quality together; or "speed", "quality"
+providers = []                  # who may take over, e.g. ["gemini"]; empty: everyone with a key
+cooldown_secs = 60              # how long a limited model is left alone when it doesn't say
+# More models, or the built-in ones rescored (speed and quality from 1 to 5):
+# models = [
+#   { provider = "groq", model = "llama-3.3-70b-versatile", speed = 5, quality = 3 },
+#   { provider = "mine", model = "m", base_url = "https://llm.example.net/v1",
+#     api_key_env = "MINE_KEY", speed = 3, quality = 4 },
+# ]
+
 # The AI's journal: entries and decisions by topic, in HelixCore's format,
 # recalled when a message is about them (see docs/memory.md).
 [chat.journal]
