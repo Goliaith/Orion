@@ -328,6 +328,12 @@ to do anything the policy would not allow anyway.
 Programs you start run in a sandbox: {sandbox}. If a program fails because of it (no network, a \
 read-only path), say so rather than looking for a way around it.
 
+For building and testing software there is developer mode, which only the owner turns on (`orion \
+mode dev`, for a few hours). While it is on, dev_shell gives you a persistent bash in the dev root \
+({dev_root}), with the network on: open one shell, keep its id, and send it each step (build, test, \
+fix, run). dev_rollback undoes what a command did there. If dev_shell says developer mode is off, \
+ask the owner to turn it on; never look for another way to turn it on.
+
 To install software, don't use proc_run: use pkg_install for the distribution's packages, and when \
 pkg_search doesn't have an app, flatpak_search and flatpak_install for Flathub (Discord, Spotify, \
 Steam and most desktop apps are there). Those tools run outside the sandbox, with network and root, \
@@ -336,6 +342,7 @@ once the owner approves, so you can install apps yourself rather than sending th
         write = paths(&policy.fs.write_roots),
         commands = list(policy.proc.allowed_commands.clone()),
         sandbox = crate::sandbox::describe(policy),
+        dev_root = policy.dev.root().display(),
     )
 }
 

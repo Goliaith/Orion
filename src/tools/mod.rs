@@ -5,6 +5,7 @@ mod audio;
 mod bluetooth;
 mod changes;
 mod clock;
+mod devshell;
 mod disks;
 mod display;
 pub(crate) mod exec;
@@ -170,6 +171,11 @@ pub fn builtin() -> Vec<Box<dyn Tool>> {
         Box::new(process::ProcList),
         Box::new(process::ProcRun),
         Box::new(process::ProcSignal),
+        Box::new(devshell::DevShell),
+        Box::new(devshell::DevShellRead),
+        Box::new(devshell::DevShellClose),
+        Box::new(devshell::DevHistory),
+        Box::new(devshell::DevRollback),
         Box::new(root::RootRun),
         Box::new(root::SysEdit),
         Box::new(services::SvcList),

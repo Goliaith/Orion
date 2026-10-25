@@ -25,6 +25,7 @@ orion: Discord is installed. Open it?
 - **Remember.** Facts about each person, and a journal of what was done and why.
 - **Tune itself.** When a setting keeps getting in the way (rate limits, slow speech to text, an approval you always give), it suggests the fix and makes it once you say yes.
 - **Undo.** Package changes and root work are snapshotted, so they can be rolled back.
+- **Build software, when you say so.** `orion mode dev` gives the AI a persistent shell with compilers and the network in `~/orion-dev`, for a few hours, with every command logged and undoable. See [Developer mode](docs/safety.md#developer-mode).
 
 ## Get started
 

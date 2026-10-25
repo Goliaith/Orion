@@ -60,6 +60,11 @@ With nobody there to answer (`orion serve` without the daemon, or a timer), "ask
 | `proc_list` | read | allow | Processes, with filtering and sorting by memory |
 | `proc_run` | execute | ask | Run one program (no shell) in the [sandbox](safety.md#the-sandbox). With `"sandbox": false`, run it as you outside the sandbox (always asks) |
 | `proc_signal` | write | ask | Stop, interrupt, pause or resume a process; never the ones the system needs |
+| `dev_shell` | execute | asks to open a shell | [Developer mode](safety.md#developer-mode) only: run a command line in a persistent bash in `~/orion-dev`. Opening a shell asks you (an unsandboxed one, every time); its commands then run without asking |
+| `dev_shell_read` | read | allow | Follow a dev shell's command that is still running: what it printed since, and how it ended |
+| `dev_shell_close` | write | allow | Close a dev shell and stop everything it runs |
+| `dev_history` | read | allow | The checkpoints of `~/orion-dev`, one before each dev shell command |
+| `dev_rollback` | write | ask | Put `~/orion-dev` back as a checkpoint found it; undoable |
 | `root_run` | execute | always asks | Run one program as root through the helper, for work no other tool covers; snapshotted ([root work](safety.md#root-work)) |
 | `sys_edit` | write | always asks | Write a system file (in `/etc`, say) as root, approved as a diff; snapshotted ([root work](safety.md#root-work)) |
 

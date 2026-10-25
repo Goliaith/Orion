@@ -986,6 +986,7 @@ fn status(orion: &Orion, s: &Style, out: &mut String) {
         }
     };
     say!(out, "  sandbox      {}", crate::sandbox::describe(policy));
+    say!(out, "  mode         {}", crate::dev::state().describe());
     say!(out, "  root access  {}", crate::tools::root_access(policy));
     if findings.is_empty() {
         say!(out, "  attention    {}", s.green("nothing"));

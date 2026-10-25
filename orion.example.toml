@@ -279,6 +279,32 @@ cgroup = true                   # a systemd scope per program: memory_mb covers 
 max_processes = 512             # processes and threads per program, in its scope
 hide = ["~/.ssh", "~/.gnupg", "~/.password-store", "~/.aws", "~/.netrc", "~/.config/orion"]
 
+# Developer mode: a persistent shell (dev_shell) for building and testing
+# software, which only you turn on, with `orion mode dev` (sandboxed) or
+# `orion mode dev --unsandboxed` (as you), for a while. Safe Assistant mode
+# is the default. See "Developer mode" in docs/safety.md.
+[dev]
+root = "~/orion-dev"            # where projects live; the sandboxed shell writes only here
+                                # and in the caches below
+caches = ["~/.cargo", "~/.rustup", "~/.npm", "~/.cache/pip", "~/.cache/pypoetry", "~/.cache/go-build",
+          "~/go", "~/.m2", "~/.gradle"]
+network = true                  # the network in the sandboxed shell
+gpu = false                     # GPUs in the sandboxed shell (the unsandboxed one has them)
+memory_mb = 16384               # for a whole shell and what it runs; 0 for no limit
+max_processes = 4096            # in a shell
+wait_secs = 1800                # the longest one dev_shell call waits; the command runs on after
+expires = "8h"                  # how long `orion mode dev` lasts: "30m", "2d", "never"
+unsandboxed_expires = "1h"      # how long `orion mode dev --unsandboxed` lasts
+unsandboxed = true              # false: `--unsandboxed` is refused
+# Under --unsandboxed, readable but not writable: what runs at your next login.
+protect = ["~/.bashrc", "~/.bash_profile", "~/.bash_login", "~/.profile", "~/.zshrc", "~/.zprofile",
+           "~/.config/fish", "~/.config/systemd", "~/.config/autostart", "~/.config/environment.d",
+           "~/.local/share/systemd", "~/.ssh", "~/.gnupg", "~/.pam_environment", "~/.xprofile", "~/.xinitrc"]
+checkpoints = 50                # of the dev root, one before each command, for dev_rollback; 0: none
+skip = ["target", "node_modules", ".venv", "venv", "__pycache__", ".gradle", ".zig-cache", ".mypy_cache",
+        ".pytest_cache"]        # folders checkpoints leave out, by name: build output, dependencies
+max_file_mb = 64                # larger files are left out of checkpoints
+
 # `orion daemon`: one policy, audit log and sandbox for every agent. `orion
 # serve` connects to it when it is running.
 [daemon]

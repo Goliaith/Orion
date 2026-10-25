@@ -915,6 +915,17 @@ fn sandbox(d: &mut Doctor, policy: &Policy) -> Result<()> {
         Err(e) => check(Level::Fail, format!("{e:#}")),
     };
     d.report(c)?;
+    let state = crate::dev::state();
+    let c = match state.mode() {
+        crate::dev::Mode::Safe => check(Level::Ok, state.describe()),
+        crate::dev::Mode::Sandboxed if !crate::sandbox::bubblewrap_works() => {
+            check(Level::Fail, format!("{}, but bubblewrap can't make a sandbox, so no dev shell opens", state.describe()))
+        }
+        crate::dev::Mode::Sandboxed => check(Level::Ok, state.describe()).hint("`orion mode safe` ends it"),
+        crate::dev::Mode::Unsandboxed => check(Level::Warn, state.describe())
+            .hint("dev shells run as you, with your files and keys; `orion mode safe` ends it"),
+    };
+    d.report(c)?;
     Ok(())
 }
 

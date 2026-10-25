@@ -90,6 +90,23 @@ enum ModelCmd {
 }
 
 #[derive(Subcommand)]
+enum ModeCmd {
+    /// Which mode is on, and for how long.
+    Status,
+    /// Safe Assistant mode: the everyday sandbox, and the dev shells closed.
+    Safe,
+    /// Developer mode: a persistent shell for building software in ~/orion-dev.
+    Dev {
+        /// Run the shell as you, outside the sandbox (Orion's files and sockets stay hidden).
+        #[arg(long)]
+        unsandboxed: bool,
+        /// How long it lasts: 8h, 30m, 2d or never (default: [dev] expires).
+        #[arg(long = "for", value_name = "DURATION")]
+        lasts: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Talk to an AI in the terminal; it works on the machine through Orion's tools.
     Chat {
@@ -208,6 +225,11 @@ enum Cmd {
         /// Show what waits for an answer, and exit.
         #[arg(long)]
         list: bool,
+    },
+    /// Switch between Safe Assistant mode and developer mode, or show which is on.
+    Mode {
+        #[command(subcommand)]
+        action: Option<ModeCmd>,
     },
     /// Show whether the daemon is running, and what it is doing.
     Status,
@@ -376,6 +398,15 @@ fn main() -> Result<()> {
             };
             orion::approvals::watch(&policy.daemon, mode)
         }
+        Cmd::Mode { action } => {
+            let (mode, lasts) = match action {
+                None | Some(ModeCmd::Status) => (None, None),
+                Some(ModeCmd::Safe) => (Some(orion::dev::Mode::Safe), None),
+                Some(ModeCmd::Dev { unsandboxed: false, lasts }) => (Some(orion::dev::Mode::Sandboxed), lasts),
+                Some(ModeCmd::Dev { unsandboxed: true, lasts }) => (Some(orion::dev::Mode::Unsandboxed), lasts),
+            };
+            orion::dev::command(&policy, mode, lasts.as_deref())
+        }
         Cmd::Status => {
             let path = daemon::socket_path(&policy.daemon);
             let st = match daemon::status(&policy.daemon) {
@@ -383,6 +414,7 @@ fn main() -> Result<()> {
                 Err(_) => {
                     println!("Orion daemon: not running ({})", path.display());
                     println!("sandbox:      {}", orion::sandbox::describe(&policy));
+                    println!("mode:         {}", orion::dev::state().describe());
                     println!("root access:  {}", orion::tools::root_access(&policy));
                     print_attention(&orion::watch::check(&policy, false), " (quick checks, no updates: the daemon checks those)");
                     let auto = orion::watch::describe_automatic(&policy, orion::watch::last_unattended().as_ref());
@@ -404,6 +436,7 @@ fn main() -> Result<()> {
             println!("policy:       {}{reload}", st["policy"].as_str().unwrap_or_default());
             println!("tools:        {} allowed, {} ask, {} denied", st["tools"]["allow"], st["tools"]["ask"], st["tools"]["deny"]);
             println!("sandbox:      {}", st["sandbox"].as_str().unwrap_or_default());
+            println!("mode:         {}", orion::dev::state().describe());
             // Not counting this status query's own connection.
             let active = st["connections"]["active"].as_u64().unwrap_or(1).saturating_sub(1);
             let total = st["connections"]["total"].as_u64().unwrap_or(1).saturating_sub(1);
@@ -456,6 +489,7 @@ fn main() -> Result<()> {
                 println!("{:<12} {:<8} {:<6} {summary}", tool.name(), tool.risk().as_str(), decision.as_str());
             }
             println!("\nprograms run sandboxed: {}", orion::sandbox::describe(orion.policy()));
+            println!("mode: {}", orion::dev::state().describe());
             println!("root access for the machine tools: {}", orion::tools::root_access(orion.policy()));
             Ok(())
         }

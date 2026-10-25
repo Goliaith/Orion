@@ -357,6 +357,8 @@ pub struct Policy {
     pub shell: crate::chat::shell::ShellConfig,
     /// Confinement for programs the AI runs.
     pub sandbox: crate::sandbox::SandboxConfig,
+    /// Developer mode: the dev shell, its sandbox and checkpoints.
+    pub dev: crate::dev::DevConfig,
     /// The background service (`orion daemon`).
     pub daemon: crate::daemon::DaemonConfig,
     /// The privileged helper (`orion helper`) that does root work for Orion.

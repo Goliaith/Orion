@@ -42,18 +42,21 @@ const AUDIT_ARCH: u32 = 0xC000_003E;
 #[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH: u32 = 0xC000_00B7;
 
-/// The calls refused outright.
+/// The calls refused outright. `debuggers`: let ptrace and
+/// process_vm_readv/writev through, for developer mode's shells, whose
+/// own PID namespace holds nothing else to debug.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn denied() -> Vec<libc::c_long> {
+fn denied(debuggers: bool) -> Vec<libc::c_long> {
     use libc::*;
-    let mut v = vec![
-        SYS_ptrace, SYS_process_vm_readv, SYS_process_vm_writev, SYS_kexec_load, SYS_kexec_file_load, SYS_init_module,
+    let mut v = if debuggers { Vec::new() } else { vec![SYS_ptrace, SYS_process_vm_readv, SYS_process_vm_writev] };
+    v.extend([
+        SYS_kexec_load, SYS_kexec_file_load, SYS_init_module,
         SYS_finit_module, SYS_delete_module, SYS_bpf, SYS_perf_event_open, SYS_userfaultfd, SYS_io_uring_setup,
         SYS_io_uring_enter, SYS_io_uring_register, SYS_keyctl, SYS_add_key, SYS_request_key, SYS_mount, SYS_umount2,
         SYS_pivot_root, SYS_setns, SYS_fsopen, SYS_fsconfig, SYS_fsmount, SYS_fspick, SYS_move_mount, SYS_open_tree,
         SYS_mount_setattr, SYS_swapon, SYS_swapoff, SYS_reboot, SYS_settimeofday, SYS_clock_settime, SYS_clock_adjtime,
         SYS_adjtimex, SYS_acct, SYS_quotactl, SYS_open_by_handle_at, SYS_name_to_handle_at, SYS_lookup_dcookie,
-    ];
+    ]);
     #[cfg(target_arch = "x86_64")]
     v.extend([SYS_iopl, SYS_ioperm, SYS_uselib]);
     v
@@ -65,8 +68,13 @@ fn op(code: u16, jt: u8, jf: u8, k: u32) -> sock_filter {
 }
 
 /// The filter program.
+pub fn program() -> Vec<libc::sock_filter> {
+    program_for(false)
+}
+
+/// The filter program, with debuggers let through or not.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-pub fn program() -> Vec<sock_filter> {
+pub fn program_for(debuggers: bool) -> Vec<sock_filter> {
     let errno = |e: i32| RET_ERRNO | (e as u32 & 0xffff);
     let mut p = vec![
         op(LD_W_ABS, 0, 0, OFF_ARCH),
@@ -77,7 +85,7 @@ pub fn program() -> Vec<sock_filter> {
     // x32 system calls on x86_64 carry this bit.
     #[cfg(target_arch = "x86_64")]
     p.extend([op(JGE_K, 0, 1, 0x4000_0000), op(RET_K, 0, 0, errno(libc::EPERM))]);
-    for nr in denied() {
+    for nr in denied(debuggers) {
         p.extend([op(JEQ_K, 0, 1, nr as u32), op(RET_K, 0, 0, errno(libc::EPERM))]);
     }
     p.extend([op(JEQ_K, 0, 1, libc::SYS_clone3 as u32), op(RET_K, 0, 0, errno(libc::ENOSYS))]);
@@ -95,13 +103,18 @@ pub fn program() -> Vec<sock_filter> {
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub fn program() -> Vec<libc::sock_filter> {
+pub fn program_for(_debuggers: bool) -> Vec<libc::sock_filter> {
     Vec::new()
 }
 
 /// The program as bytes, as bwrap's `--seccomp FD` reads it.
 pub fn bytes() -> Vec<u8> {
-    program().iter().flat_map(|f| [f.code.to_ne_bytes().as_slice(), &[f.jt, f.jf], &f.k.to_ne_bytes()].concat()).collect()
+    bytes_for(false)
+}
+
+/// [`bytes`], with debuggers let through or not.
+pub fn bytes_for(debuggers: bool) -> Vec<u8> {
+    program_for(debuggers).iter().flat_map(|f| [f.code.to_ne_bytes().as_slice(), &[f.jt, f.jf], &f.k.to_ne_bytes()].concat()).collect()
 }
 
 /// Install the filter on the calling thread. no_new_privs must be set.
