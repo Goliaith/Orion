@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Orion Voice Companion
+Exec=python3 /home/mrsilhouette/orion-workspace/orion_tts_server.py
+Icon=audio-speakers
+Comment=Neural Text-to-Speech Voice Companion for Orion OS
+Terminal=true
+Categories=Audio;Utility;
+StartupWMClass=OrionVoiceCompanion

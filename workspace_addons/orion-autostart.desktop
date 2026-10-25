@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Orion Shell Launcher
+Exec=/home/mrsilhouette/Desktop/start_orion_shell.sh
+Terminal=true
+Comment=Start Orion Shell automatically on login
+X-GNOME-Autostart-enabled=true
