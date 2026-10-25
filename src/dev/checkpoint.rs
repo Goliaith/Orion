@@ -34,6 +34,9 @@ struct FileEntry {
     size: u64,
     mode: u32,
     mtime_ns: i128,
+    /// Unlike the time, nothing a command runs can set this back.
+    #[serde(default)]
+    ctime_ns: i128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -44,11 +47,15 @@ struct Manifest {
     /// What it was taken before: the command, or a rollback.
     before: String,
     files: BTreeMap<String, FileEntry>,
-    dirs: BTreeSet<String>,
+    /// Each folder's permissions.
+    dirs: BTreeMap<String, u32>,
     links: BTreeMap<String, String>,
     /// Files left out for their size: a rollback leaves them alone.
     #[serde(default)]
     too_big: BTreeSet<String>,
+    /// Folders that couldn't be read (a `chmod 000`): left as they are.
+    #[serde(default)]
+    unreadable: BTreeSet<String>,
 }
 
 /// One checkpoint, as `dev_history` lists it.
@@ -157,10 +164,11 @@ impl Store {
             before: before.chars().take(300).collect(),
             ..Default::default()
         };
-        self.walk(&self.root, "", &mut |rel, path, meta| {
+        let mut unreadable = BTreeSet::new();
+        self.walk(&self.root, "", &mut unreadable, &mut |rel, path, meta| {
             let ft = meta.file_type();
             if ft.is_dir() {
-                m.dirs.insert(rel.to_string());
+                m.dirs.insert(rel.to_string(), meta.mode() & 0o7777);
             } else if ft.is_symlink() {
                 m.links.insert(rel.to_string(), fs::read_link(path)?.to_string_lossy().into_owned());
             } else if ft.is_file() {
@@ -168,15 +176,25 @@ impl Store {
                     m.too_big.insert(rel.to_string());
                     return Ok(());
                 }
-                let entry = FileEntry { hash: String::new(), size: meta.len(), mode: meta.mode() & 0o7777, mtime_ns: mtime_ns(meta) };
+                let entry = FileEntry {
+                    hash: String::new(),
+                    size: meta.len(),
+                    mode: meta.mode() & 0o7777,
+                    mtime_ns: mtime_ns(meta),
+                    ctime_ns: meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128,
+                };
+                let same = |old: &FileEntry| {
+                    (old.size, old.mtime_ns, old.ctime_ns, old.mode) == (entry.size, entry.mtime_ns, entry.ctime_ns, entry.mode)
+                };
                 let hash = match last.files.get(rel) {
-                    Some(old) if old.size == entry.size && old.mtime_ns == entry.mtime_ns && old.mode == entry.mode => old.hash.clone(),
+                    Some(old) if same(old) => old.hash.clone(),
                     _ => self.store(path)?,
                 };
                 m.files.insert(rel.to_string(), FileEntry { hash, ..entry });
             }
             Ok(())
         })?;
+        m.unreadable = unreadable;
         let path = self.dir.join(format!("{}.json", m.id));
         let tmp = path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec(&m)?)?;
@@ -186,11 +204,21 @@ impl Store {
     }
 
     /// Walk `dir` (below the dev root, as `rel`), not following links,
-    /// leaving out the skipped folders.
-    fn walk(&self, dir: &Path, rel: &str, f: &mut dyn FnMut(&str, &Path, &fs::Metadata) -> Result<()>) -> Result<()> {
+    /// leaving out the skipped folders, and noting the ones it can't read.
+    fn walk(
+        &self,
+        dir: &Path,
+        rel: &str,
+        unreadable: &mut BTreeSet<String>,
+        f: &mut dyn FnMut(&str, &Path, &fs::Metadata) -> Result<()>,
+    ) -> Result<()> {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                unreadable.insert(rel.to_string());
+                return Ok(());
+            }
             Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
         };
         let mut entries: Vec<_> = entries.flatten().collect();
@@ -205,7 +233,7 @@ impl Store {
             let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
             f(&child, &path, &meta)?;
             if meta.is_dir() {
-                self.walk(&path, &child, f)?;
+                self.walk(&path, &child, unreadable, f)?;
             }
         }
         Ok(())
@@ -274,6 +302,16 @@ impl Store {
         let undo_with = self.take_locked(&format!("rollback to checkpoint {id}"))?;
         let now = self.load(undo_with)?;
         let mut r = Restored { undo_with, ..Default::default() };
+        // Folders a command locked (chmod 000, read-only) open up for the
+        // work, shallowest first; they get their old permissions back last.
+        for rel in want.dirs.keys() {
+            let path = self.root.join(rel);
+            if let Ok(m) = fs::symlink_metadata(&path) {
+                if m.is_dir() && m.mode() & 0o700 != 0o700 {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(m.mode() & 0o7777 | 0o700))?;
+                }
+            }
+        }
 
         // What is there now and wasn't then goes, deepest first.
         let mut gone: Vec<&String> = now
@@ -282,7 +320,7 @@ impl Store {
             .chain(now.links.keys())
             .filter(|p| !want.files.contains_key(*p) && !want.links.contains_key(*p) && !want.too_big.contains(*p))
             .collect();
-        gone.extend(now.dirs.iter().filter(|d| !want.dirs.contains(*d)));
+        gone.extend(now.dirs.keys().filter(|d| !want.dirs.contains_key(*d)));
         gone.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
         for rel in gone {
             let path = self.root.join(rel);
@@ -296,7 +334,7 @@ impl Store {
             done.with_context(|| format!("removing {}", path.display()))?;
             r.removed += 1;
         }
-        for rel in &want.dirs {
+        for rel in want.dirs.keys() {
             let path = self.root.join(rel);
             if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
                 if fs::symlink_metadata(&path).is_ok() {
@@ -329,6 +367,13 @@ impl Store {
             }
             fs::rename(&tmp, &path).with_context(|| format!("restoring {}", path.display()))?;
             r.restored += 1;
+        }
+        for (rel, &mode) in want.dirs.iter().rev() {
+            let path = self.root.join(rel);
+            if fs::symlink_metadata(&path).is_ok_and(|m| m.mode() & 0o7777 != mode) {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+                r.restored += 1;
+            }
         }
         Ok(r)
     }
@@ -393,6 +438,33 @@ mod tests {
         assert!(root.join("app/junk/deep/x").exists() && !root.join("app/run.sh").exists());
         let list = s.list().unwrap();
         assert_eq!(list.first().unwrap().before, format!("rollback to checkpoint {}", r.undo_with));
+    }
+
+    #[test]
+    fn sees_through_locked_folders_and_reset_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path(), 10);
+        let root = s.root.clone();
+        fs::create_dir_all(root.join("app/src")).unwrap();
+        fs::write(root.join("app/src/main.rs"), "fn main() {}\n").unwrap();
+        // A folder a command locked, and a file rewritten behind the
+        // same size, mode and time.
+        let mode = fs::metadata(root.join("app/src")).unwrap().mode() & 0o7777;
+        let second = s.take("chmod").unwrap().unwrap();
+        let mtime = fs::metadata(root.join("app/src/main.rs")).unwrap().modified().unwrap();
+        fs::write(root.join("app/src/main.rs"), "fn MAIN() {}\n").unwrap();
+        fs::File::options().write(true).open(root.join("app/src/main.rs")).unwrap().set_modified(mtime).unwrap();
+        fs::set_permissions(root.join("app/src"), fs::Permissions::from_mode(0o000)).unwrap();
+        s.take("after chmod").unwrap().unwrap();
+        s.rollback(second).unwrap();
+        assert_eq!(fs::metadata(root.join("app/src")).unwrap().mode() & 0o7777, mode);
+        assert_eq!(fs::read_to_string(root.join("app/src/main.rs")).unwrap(), "fn main() {}\n");
+        let third = s.take("rewrite").unwrap().unwrap();
+        fs::write(root.join("app/src/main.rs"), "fn MAIN() {}\n").unwrap();
+        fs::File::options().write(true).open(root.join("app/src/main.rs")).unwrap().set_modified(mtime).unwrap();
+        s.take("after rewrite").unwrap().unwrap();
+        s.rollback(third).unwrap();
+        assert_eq!(fs::read_to_string(root.join("app/src/main.rs")).unwrap(), "fn main() {}\n");
     }
 
     #[test]

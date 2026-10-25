@@ -47,6 +47,19 @@ impl Output {
     fn since(&self, from: usize) -> &[u8] {
         &self.buf[from.saturating_sub(self.base).min(self.buf.len())..]
     }
+
+    /// What is still kept from `from` up to `to`.
+    fn between(&self, from: usize, to: usize) -> &[u8] {
+        let start = from.max(self.base);
+        &self.since(start)[..to.saturating_sub(start).min(self.end().saturating_sub(start))]
+    }
+
+    /// The end marker of the command that started at `from`: where it
+    /// begins (from the shell's start), the exit code and the folder.
+    fn marker(&self, from: usize, nonce: &str) -> Option<(usize, i32, String)> {
+        // What `since` returns begins at `from`, or at `base` if that has gone.
+        find_marker(self.since(from), nonce).map(|(at, rc, cwd)| (from.max(self.base) + at, rc, cwd))
+    }
 }
 
 type Shared = Arc<(Mutex<Output>, Condvar)>;
@@ -122,7 +135,7 @@ impl Shell {
         let mut out = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut ended_with_mode = false;
         let ended = loop {
-            let done = self.running.as_ref().and_then(|r| find_marker(out.since(r.from), &r.nonce).map(|m| (r.from, m)));
+            let done = self.running.as_ref().and_then(|r| out.marker(r.from, &r.nonce));
             if done.is_some() || out.closed || self.running.is_none() {
                 break done;
             }
@@ -138,8 +151,8 @@ impl Shell {
             out = cv.wait_timeout(out, left.min(Duration::from_secs(2))).unwrap_or_else(|e| e.into_inner()).0;
         };
         let (text, exit, cwd) = match &ended {
-            Some((from, (at, rc, cwd))) => {
-                let mut text = String::from_utf8_lossy(&out.since(self.seen.max(*from))[..(from + at).saturating_sub(self.seen.max(*from))]).into_owned();
+            Some((marker, rc, cwd)) => {
+                let mut text = String::from_utf8_lossy(out.between(self.seen, *marker)).into_owned();
                 // The newline the marker brought along.
                 if text.ends_with('\n') {
                     text.pop();
@@ -621,6 +634,13 @@ mod tests {
         assert_eq!(find_marker(out, "__orion_done_ab"), Some((7, 3, "/home/me/orion-dev/app".into())));
         assert_eq!(find_marker(b"hello\n__orion_done_ab 3", "__orion_done_ab"), None, "not until the line ends");
         assert_eq!(tail("abcdef".into(), 3), ("def".into(), true));
+
+        // After the front of a long output was dropped.
+        let out = Output { buf: b"...error: E0308\n\n__orion_done_ab 101 /x\n".to_vec(), base: 5000, closed: false };
+        let (marker, rc, _) = out.marker(100, "__orion_done_ab").unwrap();
+        assert_eq!((marker, rc), (5000 + 17, 101));
+        assert_eq!(out.between(100, marker), b"...error: E0308\n\n");
+        assert_eq!(out.between(5003, marker), b"error: E0308\n\n");
         assert_eq!(tail("ab".into(), 3), ("ab".into(), false));
     }
 }
