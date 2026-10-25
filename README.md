@@ -88,12 +88,12 @@ To update Orion later, run `sh ~/Orion/packaging/bootstrap.sh` again.
 
 ## How Orion keeps you safe
 
-- **You approve changes.** Out of the box the AI can look at anything, and any change asks you first. Your [trust level](docs/safety.md#trust-levels) decides what may run without asking.
+- **You approve changes.** Out of the box the AI can look at anything, and most changes ask you first. Only harmless ones (volume, brightness, locking the screen) run without asking. Your [trust level](docs/safety.md#trust-levels) decides what else may: Everyday adds Flatpak installs and opening apps.
 - **Some things always ask.** Running a program as root, editing a system file, or running a program outside the sandbox asks every time, at every trust level.
 - **Hard limits come first.** Orion refuses, before you are asked, to write outside its folders, stop protected services, remove core packages, unmount system disks or cut off SSH.
 - **Programs run in a sandbox.** Programs the AI starts can't see your keys, can't reach the network, and can't change files outside its workspace.
 - **Private stays private.** Messages about passwords, money or health, and files such as `~/.ssh`, never go to a hosted model.
-- **Everything is logged.** `orion audit` shows every call, and `orion audit --verify` proves nothing was changed.
+- **Everything is logged.** `orion audit` shows every call, and `orion audit --verify` checks that no log entry was edited or removed.
 
 More in [Safety and control](docs/safety.md).
 

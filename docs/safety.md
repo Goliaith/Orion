@@ -257,7 +257,7 @@ Every tool call, by any model, agent or person, is one line in `~/.local/state/o
 
 ```sh
 orion audit -n 20         # the last 20
-orion audit --verify      # check nothing was changed, removed or added
+orion audit --verify      # check no log entry was changed, removed or added
 ```
 
 Each entry carries a hash of the one before it, and the privileged helper keeps checkpoints where code running as you can't reach them, so tampering shows. [Operating Orion](operating.md#the-audit-log) explains each field.
