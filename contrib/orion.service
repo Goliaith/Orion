@@ -26,9 +26,11 @@ LockPersonality=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
+# Not ProtectKernelTunables, ProtectKernelModules or ProtectControlGroups:
+# in a user service they put Orion in a user namespace of its own, and the
+# read-only /proc/sys they lay over /proc stops bubblewrap mounting a /proc
+# for its sandbox, so programs fell back to Landlock, which can't keep them
+# from the daemon's and the helper's sockets.
 
 [Install]
 WantedBy=default.target
