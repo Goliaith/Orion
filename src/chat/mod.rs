@@ -4,13 +4,16 @@
 //! prompts.
 //!
 //! The model is behind [`Backend`]: [`claude`] for the Claude API, [`local`]
-//! for models served on this machine (Ollama, llama.cpp, vLLM, LM Studio).
+//! for models served on this machine (Ollama, llama.cpp, vLLM, LM Studio)
+//! or a hosted OpenAI-style API such as Gemini, which the [`cloud`] router
+//! swaps for another cloud model while it is rate limited.
 //! In `auto` mode the [`router`] picks one for each message, and the
 //! [`Session`] keeps both in one conversation.
 
 pub(crate) mod agent;
 mod classifier;
 mod cli;
+pub mod cloud;
 pub mod journal;
 pub mod memory;
 pub mod listen;
@@ -62,6 +65,7 @@ pub struct ChatConfig {
     pub claude: claude::ClaudeConfig,
     pub local: local::LocalConfig,
     pub router: router::RouterConfig,
+    pub cloud: cloud::CloudConfig,
     pub journal: journal::JournalConfig,
 }
 
@@ -78,6 +82,7 @@ impl Default for ChatConfig {
             claude: Default::default(),
             local: Default::default(),
             router: Default::default(),
+            cloud: Default::default(),
             journal: Default::default(),
         }
     }
@@ -282,7 +287,7 @@ pub fn connect(orion: &Orion, provider: Provider, model: Option<&str>) -> Result
             if let Some(m) = model {
                 c.model = m.to_string();
             }
-            Box::new(local::LocalBackend::connect(c, system, &tools)?)
+            Box::new(local::LocalBackend::connect(c, system, &tools)?.with_cloud(&config.cloud))
         }
     })
 }

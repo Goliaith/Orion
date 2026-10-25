@@ -7,6 +7,7 @@
 - [Typing `orion` commands in the chat](#typing-orion-commands-in-the-chat)
 - [The fast path](#the-fast-path)
 - [When a model makes Orion wait](#when-a-model-makes-orion-wait)
+- [Switching cloud models when one is rate limited](#switching-cloud-models-when-one-is-rate-limited)
 - [Hotkeys](#hotkeys)
 - [The full-screen view](#the-full-screen-view)
 - [The graphical shell](#the-graphical-shell)
@@ -134,7 +135,35 @@ waiting on Gemini's rate limit (17s, retry 1 of 3) · 15 requests in the last mi
 
 Where the API reports how many requests you have left (Claude and most OpenAI-style servers do; Gemini doesn't), the notice says that instead, and Orion warns once a minute when you are nearly out. The full-screen view counts down in its status line, the shell next to the notice, and `orion listen` says it aloud when the wait is long.
 
-If this keeps happening, Orion suggests a lighter model. See [self-tuning](setup.md#self-tuning).
+With a hosted model such as Gemini, Orion usually doesn't wait at all: it [switches to another cloud model](#switching-cloud-models-when-one-is-rate-limited) and waits only when every one of them is limited. If waits keep happening, Orion suggests a lighter model. See [self-tuning](setup.md#self-tuning).
+
+## Switching cloud models when one is rate limited
+
+When the hosted model you set up (Gemini, say) is rate limited, Orion sends the request to the next-best cloud model it has a key for, without waiting. Once your model's limit has passed, it goes back to it.
+
+```
+gemini-2.5-flash (Gemini) is rate limited for 17s; switching to gemini-flash-latest (Gemini).
+gemini-2.5-flash (Gemini) is free again; back to it.
+```
+
+- **Only providers you have a key for take part.** With just a Gemini key, Orion switches between Gemini models: Flash, Flash-Lite and Pro each have their own free-tier allowance. With `ANTHROPIC_API_KEY` it can also use Claude Haiku and Sonnet, and with `OPENAI_API_KEY` an OpenAI model.
+- **Speed and quality come first.** Your own model is always tried first. The others are ranked by speed and quality together. `prefer = "speed"` or `"quality"` under `[chat.cloud]` ranks by one of them first.
+- **It can switch mid-answer.** Each request goes to the best model that is free, so a long job with many tool calls keeps going. The conversation carries over, tool calls and results included.
+- **The usual rules apply.** Tool calls still go through the policy, approvals and audit log, whichever model makes them. Private messages, notes and files are never sent to any of these models, because none of them is on your machine.
+- **When every model is limited,** Orion waits for the one that is free soonest and counts it down, as before.
+- **A model that can't be used** (a key that's turned down, a model that doesn't exist) is left out for the rest of the session, with a note.
+- **To check the order,** run `orion doctor`. The chat's model line shows which model will answer next.
+- **To narrow it down,** list the providers allowed to take over: `providers = ["gemini"]`. To turn it off, set `enabled = false`.
+- **To add a model,** such as one on Groq or OpenRouter, or to rescore a built-in one, add it under `models`. Speed and quality go from 1 to 5:
+
+```toml
+[chat.cloud]
+models = [
+  { provider = "groq", model = "llama-3.3-70b-versatile", speed = 5, quality = 3 },
+]
+```
+
+Known providers (`gemini`, `claude`, `openai`, `groq`, `openrouter`, `mistral`, `deepseek`) need only the model's name. Any other provider takes a `base_url` and an `api_key_env`. Every one must speak the OpenAI-style chat API. Claude is reached through Anthropic's OpenAI-compatible endpoint here. The Claude you set up under `[chat.claude]` is separate, and still waits out its own limits.
 
 ## Hotkeys
 

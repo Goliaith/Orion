@@ -572,6 +572,7 @@ fn models(d: &mut Doctor, policy: &Policy, explicit: Option<&Path>) -> Result<()
     }
     if want_local {
         working += usize::from(local_check(d, policy, explicit, missing)?);
+        cloud_check(d, policy)?;
     }
     if either && working == 0 {
         d.report(check(Level::Fail, "no model answers, so the chat can't start").hint("`orion setup` connects one and checks it"))?;
@@ -634,6 +635,24 @@ fn claude_check(d: &mut Doctor, policy: &Policy, explicit: Option<&Path>, missin
     let mut c = check(Level::Fail, format!("Claude: the key works, but there's no model {model} (retired, or misspelled)"));
     c.fix = setup::suggest(&models, model).and_then(|s| model_fix(explicit, "chat.claude.model", s));
     d.report(c)
+}
+
+/// Where a hosted model's requests go while it is rate limited.
+fn cloud_check(d: &mut Doctor, policy: &Policy) -> Result<()> {
+    let (local, cloud) = (&policy.chat.local, &policy.chat.cloud);
+    if local.on_machine() || !cloud.enabled {
+        return Ok(());
+    }
+    let lineup = crate::chat::cloud::lineup(local, cloud, &crate::chat::cloud::key_is_set);
+    let c = match lineup.split_first() {
+        Some((_, rest)) if !rest.is_empty() => {
+            let names: Vec<&str> = rest.iter().map(|e| e.model.as_str()).collect();
+            check(Level::Ok, format!("Cloud router: when {} is rate limited, it switches to {}", local.model, names.join(", then ")))
+        }
+        _ => check(Level::Ok, "Cloud router: no other cloud model has a key, so rate limits are waited out")
+            .hint("a Claude or OpenAI key, or models under [chat.cloud], gives it somewhere to switch"),
+    };
+    d.report(c).map(drop)
 }
 
 fn local_check(d: &mut Doctor, policy: &Policy, explicit: Option<&Path>, missing: Level) -> Result<bool> {

@@ -19,7 +19,7 @@ orion: Discord is installed. Open it?
 
 - **Chat with you** in the terminal, in a full-screen view, or in a web page (`orion shell`).
 - **Listen and talk.** Say "Orion, what's using the GPU?" and hear the answer. Only enrolled voices can wake it.
-- **Use the AI you have.** Claude, Google's Gemini (the free tier works), or a model on your own machine (Ollama, llama.cpp, vLLM, LM Studio). Private messages stay on your machine.
+- **Use the AI you have.** Claude, Google's Gemini (the free tier works), or a model on your own machine (Ollama, llama.cpp, vLLM, LM Studio). Private messages stay on your machine. When a cloud model is rate limited, Orion switches to the next-best one you have a key for instead of waiting.
 - **Run the machine.** Files, programs, services, packages, Flatpak apps, updates, Wi-Fi, the firewall, disks, GPUs, sound, screens, Bluetooth, power and the clock. See [all tools](docs/tools.md).
 - **Watch for trouble.** Failed services, full disks, security updates, hot parts and failing drives, with a desktop notification.
 - **Remember.** Facts about each person, and a journal of what was done and why.

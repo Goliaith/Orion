@@ -247,7 +247,7 @@ reasoning_effort = "low"              # less thinking, faster answers; "minimal"
 ```
 
 - **Pick a chat model:** list what your key offers with `curl -s -H "Authorization: Bearer $GEMINI_API_KEY" https://generativelanguage.googleapis.com/v1beta/openai/models`, and take a plain `flash` or `flash-lite` one. The `tts` and `image` variants make speech and pictures, and can't chat or use tools.
-- **Free-tier limits are tight,** a few requests a minute, and each tool Orion runs is one more. When Google says to slow down, Orion waits and says so (`rate limited, retrying in 17s (1 of 3)`). Flash-Lite has the most generous limits.
+- **Free-tier limits are tight,** a few requests a minute, and each tool Orion runs is one more. When Google says to slow down, Orion [switches to another model](chat.md#switching-cloud-models-when-one-is-rate-limited) (Flash, Flash-Lite and Pro each have their own allowance), and waits only when all of them are limited. Flash-Lite has the most generous limits.
 - **Private stays on this machine.** Gemini is not on this machine, so Orion gives it no private notes, journal entries or private files, and asks before sending it a message that looks private. Routing uses the keyword rules rather than asking Gemini to judge each message.
 - **A pasted key** with a stray space, line break or invisible character still works: Orion drops them.
 
