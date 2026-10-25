@@ -141,6 +141,12 @@ struct RunArgs {
     cwd: Option<String>,
     stdin: Option<String>,
     timeout_secs: Option<u64>,
+    #[serde(default = "yes")]
+    sandbox: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Tool for ProcRun {
@@ -153,7 +159,9 @@ impl Tool for ProcRun {
          involved, so pipes, globs and redirects are not interpreted. Programs outside the policy's \
          proc.allowed_commands need the user's approval. Programs run sandboxed: they can write only in \
          the writable roots and temporary directories, private paths are hidden, and the network is off \
-         unless the owner allowed it. When it finishes or times out, its whole process group is killed."
+         unless the owner allowed it. With sandbox false it runs as the user outside the sandbox instead (network, \
+         GPU, every file the user can reach), for work the sandbox stops, such as a build that downloads; the \
+         person approves each such run. When it finishes or times out, its whole process group is killed."
     }
 
     fn risk(&self) -> Risk {
@@ -168,7 +176,9 @@ impl Tool for ProcRun {
                 "args": { "type": "array", "items": { "type": "string" }, "default": [] },
                 "cwd": { "type": "string", "description": "Working directory; must be inside a readable root." },
                 "stdin": { "type": "string", "description": "Text written to the program's standard input." },
-                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Capped by the policy's proc.timeout_secs." }
+                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Capped by the policy's proc.timeout_secs." },
+                "sandbox": { "type": "boolean", "default": true,
+                             "description": "false: run as the user, outside the sandbox. The person approves every such run." }
             },
             "required": ["command"],
             "additionalProperties": false
@@ -177,15 +187,25 @@ impl Tool for ProcRun {
 
     fn preapproval(&self, policy: &Policy, args: &Value) -> Preapproval {
         let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
-        if policy.command_allowed(command) {
+        if self.every_time(args) {
+            Preapproval::Person(format!("{command:?} would run outside the sandbox"))
+        } else if policy.command_allowed(command) {
             Preapproval::Granted
         } else {
             Preapproval::Refused(format!("{command:?} is not in proc.allowed_commands"))
         }
     }
 
-    fn precheck(&self, _policy: &Policy, args: &Value) -> Result<()> {
+    fn every_time(&self, args: &Value) -> bool {
+        args.get("sandbox") == Some(&Value::Bool(false))
+    }
+
+    fn precheck(&self, policy: &Policy, args: &Value) -> Result<()> {
         let a: RunArgs = parse_args(args.clone())?;
+        if !a.sandbox {
+            ensure!(policy.proc.unsandboxed, "running programs outside the sandbox is off ([proc] unsandboxed = false)");
+            return Ok(());
+        }
         if let Some(tool) = super::flatpak::redirect(&a.command, &a.args) {
             anyhow::bail!(
                 "proc_run programs have no network or root, so installs fail in the sandbox; use {tool} instead, \
@@ -205,7 +225,16 @@ impl Tool for ProcRun {
             }
             None => None,
         };
-        let (cmd, sandbox, guard) = crate::sandbox::command(policy, &a.command, &a.args, cwd.as_deref())?;
+        let unconfined;
+        let confine = if a.sandbox {
+            policy
+        } else {
+            let mut p = policy.clone();
+            p.sandbox.mode = crate::sandbox::Mode::Off;
+            unconfined = p;
+            &unconfined
+        };
+        let (cmd, sandbox, guard) = crate::sandbox::command(confine, &a.command, &a.args, cwd.as_deref())?;
         let timeout = Duration::from_secs(
             a.timeout_secs.unwrap_or(policy.proc.timeout_secs).clamp(1, policy.proc.timeout_secs.max(1)),
         );

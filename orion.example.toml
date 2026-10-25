@@ -39,6 +39,8 @@ max_read_bytes = 1048576
 # anything else asks you. With proc_run = "allow", only these run at all.
 allowed_commands = []
 # allowed_commands = ["uname", "df", "free", "nvidia-smi", "git"]
+unsandboxed = true              # proc_run may run a program as you outside the sandbox
+                                # ("sandbox": false); you approve every such run
 timeout_secs = 30
 max_output_bytes = 65536   # per stream
 # Processes proc_signal never stops, by name: the ones the session, the network
@@ -295,6 +297,15 @@ chat = "auto"                   # the chat, shell and orion listen call tools th
 socket = "/run/orion/helper.sock"
 group = "orion"                 # members may use it
 users = []                      # and these login names
+root_users = []                 # logins it also runs root_run and sys_edit for: any program
+                                # as root, any system file. Only in /etc/orion/helper.toml
+
+# root_run and sys_edit: root work beyond the machine tools, through the helper
+# (for the logins in its [helper] root_users), approved every time, and
+# snapshotted so pkg_rollback puts it back. Needs bubblewrap for proc_run.
+[root]
+snapshots = "required"          # no root work without a snapper pair; or "auto"
+timeout_secs = 600              # the longest a root_run program may run
 
 # What Orion watches for unasked, in the daemon: failed services, filesystems
 # filling up, pending security updates, a reboot that is due, memory running

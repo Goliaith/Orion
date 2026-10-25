@@ -16,10 +16,13 @@ user=orion-hlp-user
 outsider=orion-hlp-out
 group=orion-hlp
 helper_pid=
+root_helper_pid=
 snap=
 
 cleanup() {
     [ -n "$helper_pid" ] && kill "$helper_pid" 2>/dev/null
+    [ -n "$root_helper_pid" ] && kill "$root_helper_pid" 2>/dev/null
+    rm -f /etc/orion-hlp.conf /etc/orion-hlp.link /etc/orion-hlp-2.conf
     if [ -n "$snap" ]; then
         snapper --no-dbus -c orion-hlp delete-config >/dev/null 2>&1
         umount "$work/snap" 2>/dev/null
@@ -159,6 +162,40 @@ out=$(as "$user" "$work/orion audit --config $work/audited.toml --verify; echo e
 expect "deleting the whole log is caught too" "$out" "entries were removed"
 expect "and verify fails" "$out" "exit 1"
 expect "the user can't touch the checkpoints" "$(as "$user" "echo x >> $work/anchors/$(id -u "$user").jsonl" 2>&1)" "Permission denied"
+
+echo "== Root work (root_run, sys_edit): only for the helper's root_users"
+expect "root_run is off unless root lists the login" "$(raw "$user" '{"program":"orion-root-run","args":["id","-u"],"stdin":null,"timeout_secs":10}')" "root_users"
+expect "sys_edit is off too" "$(raw "$user" '{"program":"orion-sys-edit","args":["/etc/orion-hlp.conf"],"stdin":"x\n","timeout_secs":10}')" "root_users"
+expect "and wrote nothing" "$(ls /etc/orion-hlp.conf 2>&1)" "No such file"
+# A second helper, whose own policy lists the user.
+sed -e "s|$work/helper.sock|$work/root.sock|" -e "s|^group = .*|&\nroot_users = [\"$user\"]|" "$work/helper.toml" > "$work/root-helper.toml"
+chmod 644 "$work/root-helper.toml"
+"$work/orion" helper --config "$work/root-helper.toml" > "$work/root-helper.log" 2>&1 &
+root_helper_pid=$!
+for _ in $(seq 50); do [ -S "$work/root.sock" ] && break; sleep 0.1; done
+root() { # root USER JSON: a raw request to the second helper
+    as "$1" "python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.argv[2].encode()+b\"\\n\"); print(s.makefile().readline())' $work/root.sock '$2'"
+}
+expect "root_run runs a program as root" "$(root "$user" '{"program":"orion-root-run","args":["id","-u"],"stdin":null,"timeout_secs":10}')" '"stdout":"0\n"'
+expect "only programs root put there" "$(root "$user" '{"program":"orion-root-run","args":["/home/'"$user"'/x"],"stdin":null,"timeout_secs":10}')" "doesn't exist"
+expect "sys_edit creates a file" "$(root "$user" '{"program":"orion-sys-edit","args":["/etc/orion-hlp.conf","0600"],"stdin":"first\n","timeout_secs":10}')" "created /etc/orion-hlp.conf"
+expect "root's, with the mode asked for" "$(stat -c '%U %a' /etc/orion-hlp.conf)" "root 600"
+chmod 640 /etc/orion-hlp.conf
+expect "and rewrites it in place" "$(root "$user" '{"program":"orion-sys-edit","args":["/etc/orion-hlp.conf"],"stdin":"second\n","timeout_secs":10}')" "rewrote /etc/orion-hlp.conf"
+expect "keeping its mode" "$(stat -c '%a' /etc/orion-hlp.conf) $(cat /etc/orion-hlp.conf)" "640 second"
+ln -s /etc/orion-hlp.conf /etc/orion-hlp.link
+expect "not through a link" "$(root "$user" '{"program":"orion-sys-edit","args":["/etc/orion-hlp.link"],"stdin":"x\n","timeout_secs":10}')" "is a link to /etc/orion-hlp.conf"
+expect "not in a home folder" "$(root "$user" '{"program":"orion-sys-edit","args":["/home/'"$user"'/.profile"],"stdin":"x\n","timeout_secs":10}')" "doesn't write under /home"
+expect "not with .." "$(root "$user" '{"program":"orion-sys-edit","args":["/etc/../root/x"],"stdin":"x\n","timeout_secs":10}')" "no . or .."
+expect "nor set-id modes" "$(root "$user" '{"program":"orion-sys-edit","args":["/etc/orion-hlp-2.conf","4755"],"stdin":"x\n","timeout_secs":10}')" "read and write bits only"
+expect "someone outside the group still can't connect" "$(root "$outsider" '{"program":"orion-root-run","args":["id","-u"],"stdin":null,"timeout_secs":10}')" "Permission denied"
+expect "it logs root work, and who asked" "$(cat "$work/root-helper.log")" "root_run: /usr/bin/id -u"
+rm -f /etc/orion-hlp.conf /etc/orion-hlp.link /etc/orion-hlp-2.conf
+printf '[admin]\nelevate = "helper"\n[helper]\nsocket = "%s"\n[root]\nsnapshots = "auto"\n[tools]\nproc_run = "deny"\n[audit]\nenabled = false\n' "$work/root.sock" > "$work/root-user.toml"
+chmod 644 "$work/root-user.toml"
+expect "through Orion, a person must approve it" "$(as "$user" "$work/orion call --config $work/root-user.toml root_run '{\"command\":\"id\"}'")" "needs interactive approval"
+kill "$root_helper_pid" 2>/dev/null
+root_helper_pid=
 
 echo "== Only the helper's group may use it"
 expect "someone outside the group can't connect" "$(as "$outsider" "$work/orion call --config $work/user.toml update_check")" "you may not use the Orion helper"

@@ -161,14 +161,15 @@ impl Ui for ChannelUi<'_> {
     }
 
     fn approve(&mut self, tool: &dyn Tool, args: &Value) -> bool {
-        if self.always.contains(tool.name()) {
+        if self.always.contains(tool.name()) && !tool.every_time(args) {
             return true;
         }
         let (reply, rx) = std::sync::mpsc::channel();
         self.send(FromAgent::Approve { tool: tool.name().to_string(), preview: preview(&tool.redact(args)), reply });
         let answer = Self::wait(rx, Answer::No);
         self.answered_at = Some(Instant::now());
-        if answer == Answer::Always {
+        // Calls that ask every time are approved this once.
+        if answer == Answer::Always && !tool.every_time(args) {
             self.always.insert(tool.name().to_string());
         }
         answer != Answer::No

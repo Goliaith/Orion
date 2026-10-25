@@ -369,7 +369,7 @@ pub(super) fn helper_check(policy: &Policy, uid: u32, program: &str, args: &[Str
                     let own = SecretFile::new(&content)?;
                     let mut args = args.to_vec();
                     args[5] = own.0.display().to_string();
-                    Ok(crate::helper::Checked { args, stdin: None, keep: vec![Box::new(own)] })
+                    Ok(crate::helper::Checked { program: None, args, stdin: None, keep: vec![Box::new(own)] })
                 }
                 ["connection", "add", "type", "wifi", "con-name", n, "ifname", "*", "ssid", s, "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk-flags", "0"]
                     if n == s && ssid(n) => fine(),

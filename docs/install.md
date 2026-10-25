@@ -383,6 +383,7 @@ Installing packages and updates, controlling system services, changing the netwo
 - **Disk health:** only `smartctl --json=c -a --nocheck=standby` on a whole disk listed in /sys/block: reading SMART data, never changing a setting or starting a self-test.
 - **Clock and language:** `timedatectl` and `localectl` setting a time zone that exists in `/usr/share/zoneinfo`, network time on or off, a locale generated on the machine, or an XKB keyboard layout. Never the time itself.
 - **Network:** NetworkManager's Wi-Fi and connection commands as Orion makes them (no VPN imports, which can run scripts), and firewall rules that keep SSH open.
+- **Root work, only if root turns it on:** for the logins in the helper's own `[helper] root_users`, any program as root (`root_run`) and writing a system file (`sys_edit`). See below.
 
 Its protected lists come from `/etc/orion/helper.toml`, which only root may change, so code running as you can't loosen them. Everything else is refused, and every command it ran or refused is logged with who asked. Compared with a sudo rule, code running as you gets Orion's operations, not a root shell.
 
@@ -416,7 +417,21 @@ With `[admin] elevate = "auto"` (the default), Orion uses the helper whenever it
 
 To give the helper its own protected lists or another group, copy the sections you want to change from `orion.example.toml` (`[packages]`, `[services]`, `[disks]`, `[helper]`) into `/etc/orion/helper.toml`. A list there replaces the default list, so copy the whole list and add to it. The file must belong to root and be writable only by root, or the helper won't start.
 
-`tests/helper/run.sh` (as root) checks all of this end to end: a normal user installing, rolling back and removing a package through the helper, with snapshots of a scratch btrfs volume, and the helper refusing a shell, an apt hook, a protected package, a unit that runs a command, a console root shell, a snapper command Orion never makes, a weak mount and an outsider.
+#### Letting Orion work as root beyond its tools
+
+`root_run` and `sys_edit` let Orion change anything on the machine, each step approved by you and snapshotted so `pkg_rollback` undoes it ([Root work](../README.md#root-work)). They are off until root lists your login in the helper's policy:
+
+```sh
+sudo mkdir -p /etc/orion
+sudoedit /etc/orion/helper.toml            # under [helper]: root_users = ["your login"]
+sudo systemctl restart orion-helper.service
+sudo snapper -c root create-config /       # once, on btrfs: the snapshots that make each step undoable
+rpm -q bubblewrap || sudo dnf install bubblewrap   # proc_run must be in bubblewrap
+```
+
+With your login there, code running as you can have the helper do anything as root, so this is a passwordless sudo rule with a log and snapshots, not a narrower one. Orion itself still asks you before each `root_run` and `sys_edit`. Leave `root_users` empty to keep the helper to Orion's own operations.
+
+`tests/helper/run.sh` (as root) checks all of this end to end: a normal user installing, rolling back and removing a package through the helper, with snapshots of a scratch btrfs volume, and the helper refusing a shell, an apt hook, a protected package, a unit that runs a command, a console root shell, a snapper command Orion never makes, a weak mount and an outsider; and root work, refused until root lists the user and then confined as described.
 
 ### Other ways
 

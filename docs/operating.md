@@ -191,7 +191,8 @@ approve = false
 - Protected and essential packages can't be removed, by `pkg_remove` or by an update.
 - The system's mounts (`/`, `/boot`, `/home`, …) can't be unmounted.
 - Firewall changes that would cut off an SSH session into the machine are refused, and so is taking down the connection one runs over.
-- Programs started by `proc_run` can't see your keys, Orion's state or its policy.
+- Programs started by `proc_run` can't see your keys, Orion's state or its policy, and under bubblewrap can't reach the daemon's or the helper's socket.
+- `root_run`, `sys_edit` and `proc_run` outside the sandbox ask you every time, whatever the policy or trust level says. `root_run` and `sys_edit` run only for the logins root lists in the helper's own `[helper] root_users`.
 
 You can extend the protected lists in the policy. Shortening them is possible, so do it with care.
 
@@ -310,6 +311,8 @@ orion call pkg_rollback '{"id": 12, "method": "packages"}'  # by the package man
 - **Without**, it installs the old versions again, from the repositories or pacman's cache, and removes what the change added. An old version that the repositories no longer carry can't come back this way; the refusal says which, before anything runs.
 - **Changes go back newest first**: a rollback is refused while a later change to the same packages is in place, and the refusal names that change.
 - **A reboot is wise** after putting back a kernel or core libraries; the result of the next `update_check` says so.
+
+Root work (`root_run`, `sys_edit`) is in the same history and goes back the same way, by its snapshot pair only, and only while nothing later is in place. `[root] snapshots = "required"`, the default, refuses root work where no snapshot can be taken.
 
 `[packages] snapshots = "required"` makes every package change wait for a snapshot, refusing it where none can be taken; `"never"` turns them off; `snapper_config` names another configuration than `root`.
 
@@ -682,6 +685,7 @@ unknown field `update`, expected one of `manager`, `allowed`, `protected`, `upda
 - **Pre-approve narrowly.** `allowed_commands`, `services.allowed` and `packages.allowed` are better than turning whole tools to `allow`.
 - **Install bubblewrap** and consider `[sandbox] require = true`.
 - **Grant root through the helper.** It does only Orion's operations, checked against a policy only root can change. A passwordless sudo rule lets anything running as you become root, not only Orion.
+- **Add yourself to `[helper] root_users` only if you want root work** (`root_run`, `sys_edit`). It makes the helper as good as sudo for code running as you; Orion still asks before each step, and each is snapshotted.
 - **Leave `wake_approvals` off** unless only trusted people can be heard, and enroll voices so others can't wake Orion.
 - **Keep private things private:** add your own sensitive folders to `chat.router.private_paths` (Claude never sees them) and `[sandbox] hide` (programs never see them).
 - **Read the audit log** now and then, especially after letting an agent run unattended, and run `orion audit --verify`: with the helper, nothing running as you can rewrite it unnoticed.

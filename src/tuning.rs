@@ -61,8 +61,8 @@ const SCOPED: &[&str] = &[
     "app_open", "audio_set", "svc_control", "bt_device", "proc_run", "gpu_assign", "power_set", "power_action",
     "clock_set", "flatpak_install", "display_set", "update_apply", "pkg_install",
 ];
-/// Never pre-approved: the tuning tools themselves.
-const UNTUNABLE: &[&str] = &["settings_tune", "voice_tune"];
+/// Never pre-approved: the tuning tools themselves, and sys_edit, which always asks.
+const UNTUNABLE: &[&str] = &["settings_tune", "voice_tune", "sys_edit"];
 const EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high"];
 
 /// What `settings_tune` may change, over orion.toml.

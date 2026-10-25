@@ -207,6 +207,16 @@ pub fn hidden_paths(policy: &Policy) -> Vec<PathBuf> {
     out
 }
 
+/// The daemon's and the helper's sockets, where they exist. A program
+/// that connects to one of them under bubblewrap finds nobody there.
+/// (Landlock can't stop a program connecting to a socket file.)
+pub fn orion_sockets(policy: &Policy) -> Vec<PathBuf> {
+    [crate::daemon::socket_path(&policy.daemon), PathBuf::from(&policy.helper.socket)]
+        .into_iter()
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type())))
+        .collect()
+}
+
 /// Writable roots and temporary directories that exist.
 fn writable(policy: &Policy) -> Vec<PathBuf> {
     policy
@@ -457,6 +467,11 @@ fn bwrap_args(policy: &Policy, cwd: Option<&Path>) -> Vec<String> {
         } else if h.exists() {
             a.extend(["--ro-bind".into(), "/dev/null".into(), s(&h)]);
         }
+    }
+    // Orion's own sockets: through the daemon a program could answer its
+    // own approvals, and through the helper do Orion's root work.
+    for sock in orion_sockets(policy) {
+        a.extend(["--ro-bind".into(), "/dev/null".into(), s(&sock)]);
     }
     if let Some(dir) = cwd {
         a.extend(["--chdir".into(), s(dir)]);
@@ -823,6 +838,27 @@ mod tests {
             return;
         }
         confines("bubblewrap");
+    }
+
+    #[test]
+    fn bubblewrap_hides_orions_sockets() {
+        if !bubblewrap_works() {
+            eprintln!("skipped: bubblewrap unavailable");
+            return;
+        }
+        let dir = setup();
+        let d = dir.path().display();
+        let (daemon, helper) = (dir.path().join("ro/orion.sock"), dir.path().join("ro/helper.sock"));
+        let _listeners = [&daemon, &helper].map(|p| std::os::unix::net::UnixListener::bind(p).unwrap());
+        let p = policy(dir.path(), "bubblewrap", &format!("[daemon]\nsocket = \"{d}/ro/orion.sock\"\n[helper]\nsocket = \"{d}/ro/helper.sock\""));
+        assert_eq!(orion_sockets(&p), [daemon.clone(), helper.clone()]);
+        let connect = |path: &Path| format!("python3 -c \"import socket; socket.socket(socket.AF_UNIX).connect('{}')\"", path.display());
+        for sock in [&daemon, &helper] {
+            assert_ne!(sh(&p, &connect(sock)).0, 0, "{} is out of reach", sock.display());
+        }
+        // Unsandboxed, the same check connects.
+        let off = policy(dir.path(), "off", "");
+        assert_eq!(sh(&off, &connect(&helper)).0, 0);
     }
 
     #[test]

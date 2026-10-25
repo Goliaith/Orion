@@ -115,7 +115,7 @@ impl Terminal {
     }
 
     fn ask(&mut self, tool: &dyn Tool, args: &Value) -> bool {
-        if self.always.contains(tool.name()) {
+        if self.always.contains(tool.name()) && !tool.every_time(args) {
             return true;
         }
         self.line_break();
@@ -138,7 +138,10 @@ impl Terminal {
                 "y" | "yes" => return true,
                 "n" | "no" | "" => return false,
                 "a" | "always" => {
-                    self.always.insert(tool.name().to_string());
+                    // Calls that ask every time are approved this once.
+                    if !tool.every_time(args) {
+                        self.always.insert(tool.name().to_string());
+                    }
                     return true;
                 }
                 _ => {}

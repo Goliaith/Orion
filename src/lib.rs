@@ -159,8 +159,8 @@ impl Orion {
             // Refused before the checks, which can be slow (a dry run).
             (Decision::Allow, Preapproval::Refused(reason)) => Err(reason),
             (_, _) if let Err(e) = precheck() => Err(e),
-            (Decision::Allow, _) | (Decision::Ask, Preapproval::Granted) => Ok(()),
-            (Decision::Ask, _) => match approver {
+            (d, p) if p.unasked(d) => Ok(()),
+            _ => match approver {
                 Some(approver) => {
                     let yes = approver.approve(tool.as_ref(), &args);
                     approved = Some(yes);
@@ -173,12 +173,13 @@ impl Orion {
                 None => Err(format!("tool {name} needs interactive approval, which is not available here")),
             },
         };
+        // Shown as it was before the call: sys_edit's diff is gone after it.
+        let shown = tool.redact(&args);
         let start = Instant::now();
         let result = match verdict {
             Ok(()) => tool.call(&self.policy, args.clone()).map_err(CallError::Failed),
             Err(reason) => Err(CallError::Denied(reason)),
         };
-        let shown = tool.redact(&args);
         self.audit.record(audit::Entry {
             tool: name,
             caller,
@@ -282,6 +283,23 @@ mod tests {
         let r = o.call("fs_write", json!({ "path": "/tmp/nope.txt", "content": "x" }), Some(&yes));
         assert!(r.unwrap_err().to_string().contains("outside the writable roots"));
         assert_eq!(yes.asked.get(), 0);
+    }
+
+    #[test]
+    fn some_calls_always_ask() {
+        // Even with proc_run allowed and the command pre-approved.
+        let o = orion("[tools]\nproc_run = \"allow\"\n[proc]\nallowed_commands = [\"*\"]\n");
+        let outside = json!({ "command": "true", "sandbox": false });
+        assert!(matches!(o.call("proc_run", outside.clone(), None), Err(CallError::Denied(r)) if r.contains("needs interactive approval")));
+        let yes = Answer { yes: true, asked: Cell::new(0) };
+        let done = o.call("proc_run", outside, Some(&yes)).unwrap();
+        assert_eq!((yes.asked.get(), done["sandbox"].as_str()), (1, Some("off")));
+        assert!(o.call("proc_run", json!({ "command": "true" }), Some(&yes)).is_ok());
+        assert_eq!(yes.asked.get(), 1, "sandboxed, it stays pre-approved");
+
+        let off = orion("[proc]\nunsandboxed = false\n");
+        let r = off.call("proc_run", json!({ "command": "true", "sandbox": false }), Some(&yes));
+        assert!(r.unwrap_err().to_string().contains("unsandboxed = false"));
     }
 
     #[test]
