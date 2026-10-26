@@ -31,7 +31,7 @@ orion: Discord is installed. Open it?
 
 These steps are for Fedora KDE with Gemini's free tier. Other distributions and models work too: see [Installing Orion](docs/install.md).
 
-**1. Install the GitHub CLI and sign in.** The repository is private, so the installer needs it.
+**1. Install the GitHub CLI and sign in.**
 
 ```sh
 sudo dnf install -y gh
