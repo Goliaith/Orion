@@ -292,6 +292,32 @@ impl Backend for LocalBackend {
     }
 
     fn set_model(&mut self, model: &str) {
+        // Another model the cloud router knows, by name or as
+        // "provider:model": it becomes the one asked first, wherever it is.
+        if let Some(router) = self.cloud.as_mut() {
+            let named = |t: &Target| {
+                model == t.entry.model
+                    || model.split_once(':').is_some_and(|(p, m)| p.eq_ignore_ascii_case(&t.entry.provider) && m == t.entry.model)
+            };
+            if let Some(i) = router.targets.iter().skip(1).position(named).map(|i| i + 1) {
+                // Replies so far keep their author once `config.model` changes.
+                let old = self.config.model.clone();
+                for (n, m) in self.messages.iter().enumerate() {
+                    if m["role"] == "assistant" && !self.made_by.iter().any(|(at, _)| *at == n) {
+                        self.made_by.push((n, old.clone()));
+                    }
+                }
+                self.made_by.sort_by_key(|(at, _)| *at);
+                let target = router.targets.remove(i);
+                self.config.model = target.entry.model.clone();
+                self.config.base_url = target.entry.base_url.clone();
+                self.config.api_key_env = target.entry.api_key_env.clone();
+                self.config.reasoning_effort = target.entry.reasoning_effort.clone();
+                self.http = target.http.clone().handing_off(false);
+                router.targets.insert(0, target);
+                return;
+            }
+        }
         self.config.model = model.to_string();
         if let Some(home) = self.cloud.as_mut().and_then(|r| r.targets.first_mut()) {
             home.entry.model = model.to_string();
@@ -299,7 +325,12 @@ impl Backend for LocalBackend {
     }
 
     fn list_models(&self) -> Result<Vec<String>> {
-        Self::list_models_with(&self.http)
+        let mut ids = Self::list_models_with(&self.http)?;
+        // The cloud router's other models, as `/model local` takes them.
+        if let Some(router) = &self.cloud {
+            ids.extend(router.targets.iter().skip(1).map(|t| format!("{}:{}", t.entry.provider, t.entry.model)));
+        }
+        Ok(ids)
     }
 
     fn push_user(&mut self, text: &str) {
@@ -682,6 +713,27 @@ mod tests {
         assert!(ui.out.contains("!Every cloud model is rate limited; waiting for home-model"), "{}", ui.out);
         assert!(ui.out.ends_with("Fine."), "{}", ui.out);
         assert_eq!(home_reqs.iter().take(2).count(), 2);
+    }
+
+    #[test]
+    fn model_switches_to_another_cloud_model_and_back() {
+        let answer = || chunks(&[delta(json!({"content":"Fine."})), finish("stop")]);
+        let (home, home_reqs) = fake_server(vec![answer(), answer()]);
+        let (other, other_reqs) = fake_server(vec![answer()]);
+        let orion = orion();
+        let mut session = Session::with_backends(&orion, Mode::Local, None, Some(Box::new(routed(&home, &other))));
+        let mut ui = Recorder::default();
+        session.turn("hi", &mut ui).unwrap();
+        let local = super::super::Provider::Local;
+        session.backend_mut(local).unwrap().set_model("test:other-model");
+        assert!(session.backend(local).unwrap().describe().starts_with("other-model · local at "), "{}", session.backend(local).unwrap().describe());
+        session.turn("and now?", &mut ui).unwrap();
+        session.backend_mut(local).unwrap().set_model("home-model");
+        session.turn("back?", &mut ui).unwrap();
+        assert!(!ui.out.contains("rate limited"), "{}", ui.out);
+        assert_eq!(home_reqs.recv().unwrap().1["model"], "home-model");
+        assert_eq!(other_reqs.recv().unwrap().1["model"], "other-model");
+        assert_eq!(home_reqs.recv().unwrap().1["model"], "home-model");
     }
 
     #[test]
