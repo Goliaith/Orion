@@ -12,6 +12,7 @@ mod http;
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -83,9 +84,46 @@ struct Hub {
     agents: Mutex<Option<crate::approvals::Writer>>,
     /// The daemon's request id → the card's id.
     agent_cards: Mutex<HashMap<u64, u64>>,
+    /// Holds "1" while auto-approve is on: this conversation's tool calls
+    /// are approved without asking. A file, so the desktop's own toggles
+    /// (the Control Center, the companion) and every page agree.
+    auto_approve_file: Option<PathBuf>,
+    /// What the pages were last told about auto-approve.
+    auto_approve_shown: AtomicBool,
 }
 
 impl Hub {
+    fn auto_approve(&self) -> bool {
+        self.auto_approve_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|s| s.trim() == "1")
+    }
+
+    fn set_auto_approve(&self, on: bool) -> std::io::Result<()> {
+        let Some(file) = &self.auto_approve_file else { return Err(std::io::Error::other("no state directory")) };
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(file, if on { "1" } else { "0" })?;
+        self.show_auto_approve(on);
+        if on {
+            // Approve what is already waiting, as if it had come just now.
+            let waiting: Vec<(u64, Pending)> = {
+                let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                let ids: Vec<u64> = p.iter().filter(|(_, v)| matches!(v, Pending::Approve(_))).map(|(k, _)| *k).collect();
+                ids.into_iter().filter_map(|id| p.remove(&id).map(|v| (id, v))).collect()
+            };
+            for (id, prompt) in waiting {
+                self.resolve(prompt, "yes");
+                self.broadcast(json!({ "type": "answered", "id": id, "answer": "auto" }), true);
+            }
+        }
+        Ok(())
+    }
+
+    fn show_auto_approve(&self, on: bool) {
+        self.auto_approve_shown.store(on, Ordering::SeqCst);
+        self.broadcast(json!({ "type": "auto_approve", "on": on }), false);
+    }
+
     /// Answer a card: the conversation's own prompts, or an agent's call.
     fn resolve(&self, prompt: Pending, answer: &str) {
         let yes = matches!(answer, "yes" | "always");
@@ -228,8 +266,13 @@ fn relay(hub: &Hub, from_agent: Receiver<FromAgent>) {
             FromAgent::Output(t) => hub.broadcast(json!({ "type": "output", "text": t }), true),
             FromAgent::Approve { tool, preview, reply } => {
                 let id = hub.next_id.fetch_add(1, Ordering::SeqCst);
-                hub.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Pending::Approve(reply));
                 hub.broadcast(json!({ "type": "approve", "id": id, "tool": tool, "preview": preview }), true);
+                if hub.auto_approve() {
+                    let _ = reply.send(Answer::Yes);
+                    hub.broadcast(json!({ "type": "answered", "id": id, "answer": "auto" }), true);
+                } else {
+                    hub.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Pending::Approve(reply));
+                }
             }
             FromAgent::Confirm { question, reply } => {
                 let id = hub.next_id.fetch_add(1, Ordering::SeqCst);
@@ -264,6 +307,22 @@ fn relay(hub: &Hub, from_agent: Receiver<FromAgent>) {
 
 /// Voice: the level meter and pause detector while listening, the
 /// transcript when done, and whether Orion is speaking.
+/// Pass on auto-approve being turned on or off outside the shell.
+fn watch_auto_approve(hub: &Hub, stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_secs(1));
+        let now = hub.auto_approve();
+        if now != hub.auto_approve_shown.load(Ordering::SeqCst) {
+            if now {
+                // Approves what is waiting, too.
+                let _ = hub.set_auto_approve(true);
+            } else {
+                hub.show_auto_approve(false);
+            }
+        }
+    }
+}
+
 fn watch_voice(hub: &Hub, stop: &AtomicBool) {
     let mut was_speaking = false;
     let mut wake_was = Value::Null;
@@ -449,7 +508,10 @@ pub(super) fn run(orion: &Orion, session: Session, saver: Saver, port: Option<u1
         show_reasoning: orion.policy().chat.show_reasoning,
         agents: Mutex::new(None),
         agent_cards: Mutex::new(HashMap::new()),
+        auto_approve_file: crate::Policy::state_dir().map(|d| d.join("auto_approve_mode")),
+        auto_approve_shown: AtomicBool::new(false),
     });
+    hub.auto_approve_shown.store(hub.auto_approve(), Ordering::SeqCst);
 
     thread::scope(|scope| {
         scope.spawn(move || agent::run(orion, session, saver, agent_rx, agent_tx));
@@ -463,6 +525,7 @@ pub(super) fn run(orion: &Orion, session: Session, saver: Saver, port: Option<u1
             }
         });
         scope.spawn(|| watch_voice(&hub, &stop));
+        scope.spawn(|| watch_auto_approve(&hub, &stop));
         {
             let (hub, config) = (hub.clone(), orion.policy().daemon.clone());
             thread::spawn(move || watch_agents(&hub, &config));
@@ -647,6 +710,13 @@ fn post(hub: &Arc<Hub>, path: &str, body: &Value) -> (u16, Value) {
             hub.broadcast(json!({ "type": "answered", "id": id, "answer": answer }), true);
             (200, ok)
         }
+        "/api/auto_approve" => {
+            let Some(on) = body["on"].as_bool() else { return (400, json!({ "error": "on must be true or false" })) };
+            match hub.set_auto_approve(on) {
+                Ok(()) => (200, ok),
+                Err(e) => (500, json!({ "error": format!("can't save auto-approve: {e}") })),
+            }
+        }
         "/api/voice" => match body["action"].as_str().unwrap_or_default() {
             "start" => {
                 if hub.transcribing.load(Ordering::SeqCst) {
@@ -711,7 +781,7 @@ fn events(hub: &Hub, stream: &TcpStream) -> std::io::Result<()> {
     let speech = hub.voice(|v| v.speaker.is_ok());
     let wake_error = hub.wake_error.lock().unwrap_or_else(|e| e.into_inner()).take();
     let hello = json!({ "type": "hello", "show_reasoning": hub.show_reasoning, "mic": mic, "speech": speech,
-                        "speak_replies": speak_replies, "wake_error": wake_error });
+                        "speak_replies": speak_replies, "wake_error": wake_error, "auto_approve": hub.auto_approve() });
     http::event(stream, &hello.to_string())?;
     http::event(stream, &hub.wake_json().to_string())?;
     for snapshot in [&hub.status, &hub.machine] {
@@ -762,7 +832,10 @@ mod tests {
             show_reasoning: true,
             agents: Mutex::new(None),
             agent_cards: Mutex::new(HashMap::new()),
+            auto_approve_file: Some(std::env::temp_dir().join(format!("orion-auto-approve-{}-{port}", std::process::id()))),
+            auto_approve_shown: AtomicBool::new(false),
         };
+        let _ = std::fs::remove_file(hub.auto_approve_file.as_ref().unwrap());
         (Arc::new(hub), rx)
     }
 
@@ -827,6 +900,47 @@ mod tests {
         assert_eq!(request(&hub, &raw).0, 200);
         assert_eq!(rx.try_recv().unwrap(), Answer::Always);
         assert_eq!(request(&hub, &raw).0, 409, "a second answer (another tab) is refused");
+    }
+
+    #[test]
+    fn auto_approve_answers_tool_calls_but_not_other_questions() {
+        let (hub, _agent) = hub(7311);
+        let cookie = format!("Cookie: {COOKIE}={}\r\nX-Orion: 1\r\n", "a".repeat(32));
+        let toggle = |on: bool| {
+            let body = format!(r#"{{"on":{on}}}"#);
+            request(&hub, &format!("POST /api/auto_approve HTTP/1.1\r\nHost: localhost:7311\r\n{cookie}Content-Length: {}\r\n\r\n{body}", body.len())).0
+        };
+
+        // Turning it on approves a tool call already waiting, and only that.
+        let (waiting, waiting_rx) = mpsc::channel();
+        let (question, question_rx) = mpsc::channel();
+        hub.pending.lock().unwrap().insert(1, Pending::Approve(waiting));
+        hub.pending.lock().unwrap().insert(2, Pending::Confirm(question));
+        assert_eq!(toggle(true), 200);
+        assert!(hub.auto_approve());
+        assert_eq!(waiting_rx.try_recv().unwrap(), Answer::Yes);
+        assert!(question_rx.try_recv().is_err(), "a confirmation still asks");
+        assert!(hub.pending.lock().unwrap().contains_key(&2));
+
+        // New tool calls are approved as they come.
+        let (from_tx, from_rx) = mpsc::channel();
+        let (reply, reply_rx) = mpsc::channel();
+        from_tx.send(FromAgent::Approve { tool: "proc_run".into(), preview: String::new(), reply }).unwrap();
+        drop(from_tx);
+        relay(&hub, from_rx);
+        assert_eq!(reply_rx.try_recv().unwrap(), Answer::Yes);
+        assert!(hub.log.lock().unwrap().iter().any(|e| e.contains(r#""answer":"auto""#)));
+
+        // Off: they ask again.
+        assert_eq!(toggle(false), 200);
+        assert!(!hub.auto_approve());
+        let (from_tx, from_rx) = mpsc::channel();
+        let (reply, reply_rx) = mpsc::channel();
+        from_tx.send(FromAgent::Approve { tool: "proc_run".into(), preview: String::new(), reply }).unwrap();
+        drop(from_tx);
+        relay(&hub, from_rx);
+        assert!(reply_rx.try_recv().is_err());
+        let _ = std::fs::remove_file(hub.auto_approve_file.as_ref().unwrap());
     }
 
     #[test]

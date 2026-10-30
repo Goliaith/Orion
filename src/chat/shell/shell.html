@@ -113,6 +113,10 @@ details.thinking div { white-space: pre-wrap; font-style: italic; margin-top: 4p
 .card.resolved { border-color: var(--line); background: var(--panel); }
 .notice { color: var(--warn); font-size: 13.5px; margin: 8px 0; } .notice .countdown { color: var(--faint); }
 .error { color: var(--bad); font-size: 13.5px; margin: 8px 0; }
+.icon.auto-on { color: var(--bad); background: color-mix(in srgb, var(--bad) 16%, transparent); }
+.auto-bar { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 6px 16px; font-size: 13px; color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, var(--bg)); border-bottom: 1px solid color-mix(in srgb, var(--bad) 35%, var(--line)); }
+.auto-bar button { color: var(--text); text-decoration: underline; }
+.auto-bar.hidden { display: none; }
 .output { margin: 10px 0; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; white-space: pre-wrap; color: var(--muted); }
 .divider { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 12px; margin: 22px 0; text-transform: uppercase; letter-spacing: .8px; }
 .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
@@ -193,8 +197,10 @@ textarea::placeholder { color: var(--faint); }
       <button class="icon" id="reasoning" title="Show reasoning (Alt+R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/></svg></button>
       <button class="icon" id="speak" title="Speak replies"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg></button>
       <button class="icon" id="wake" title="Wake word (Alt+W)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8.5a6 6 0 1 1 11.2 3c-.9 1.5-2.2 2.3-2.7 3.6-.4 1.1-.3 2.4-1.3 3.4a3 3 0 0 1-4.7-.7"/><path d="M9.5 9a2.5 2.5 0 1 1 4.3 1.8c-.6.6-1.3 1-1.3 2"/></svg></button>
+      <button class="icon" id="autoApprove" title="Auto-approve tool calls (Alt+A)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v6c0 4.5 3.4 8.3 8 9 4.6-.7 8-4.5 8-9V6l-8-3z"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg></button>
       <button class="icon" id="toggleRight" title="Machine panel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
     </header>
+    <div class="auto-bar hidden" id="autoBar"><span>Auto-approve is on: Orion runs tool calls without asking.</span><button id="autoOff">Turn off</button></div>
 
     <div class="log" id="log"><div class="col" id="col"></div></div>
 
@@ -350,7 +356,7 @@ function answered(ev) {
   const c = state.cards[ev.id]; if (!c) return;
   c.classList.add("resolved");
   const acts = c.querySelector(".acts");
-  if (acts) acts.outerHTML = `<div class="done">${ev.answer === "yes" ? "✓ Approved" : ev.answer === "always" ? "✓ Approved for the rest of this session" : ev.answer === "expired" ? "No answer in time · declined" : "Declined"}</div>`;
+  if (acts) acts.outerHTML = `<div class="done">${ev.answer === "yes" ? "✓ Approved" : ev.answer === "always" ? "✓ Approved for the rest of this session" : ev.answer === "auto" ? "✓ Approved automatically (auto-approve is on)" : ev.answer === "expired" ? "No answer in time · declined" : "Declined"}</div>`;
 }
 function system(cls, text) { endBlocks(); const e = el("div", cls); e.textContent = text; add(e); }
 // A rate limit being waited out: the notice, with a countdown until the retry.
@@ -531,6 +537,7 @@ function handle(ev) {
       $("speak").classList.toggle("on", ev.speak_replies);
       $("mic").style.opacity = ev.mic ? 1 : .45; $("wake").style.opacity = ev.mic ? 1 : .45;
       if (ev.wake_error) toast("Voice: can't listen for the wake phrase: " + ev.wake_error);
+      autoApproveEv(ev.auto_approve, false);
       welcome(); break;
     case "reset": welcome(); break;
     case "transcript": transcript(ev.turns); break;
@@ -556,8 +563,21 @@ function handle(ev) {
     case "wake": wakeEv(ev); break;
     case "wake_note": toast(ev.text); break;
     case "speaking": $("speak").title = ev.on ? "Speaking · click or Esc to stop" : "Speak replies"; break;
+    case "auto_approve": autoApproveEv(ev.on, true); break;
     case "speak_replies": state.speak = ev.on; $("speak").classList.toggle("on", ev.on); break;
   }
+}
+
+function autoApproveEv(on, announce) {
+  const changed = state.autoApprove !== on;
+  state.autoApprove = on;
+  $("autoApprove").classList.toggle("auto-on", on);
+  $("autoApprove").title = on ? "Auto-approve is on · click to ask again (Alt+A)" : "Auto-approve tool calls (Alt+A)";
+  $("autoBar").classList.toggle("hidden", !on);
+  if (announce && changed) toast(on ? "Auto-approve on: tool calls run without asking" : "Auto-approve off: tool calls ask first");
+}
+async function toggleAutoApprove() {
+  try { await api("/api/auto_approve", { on: !state.autoApprove }); } catch (e) { toast(e.message); }
 }
 
 function connect() {
@@ -582,10 +602,13 @@ document.addEventListener("keydown", (e) => {
   if (e.altKey && e.code === "KeyW") { e.preventDefault(); toggleWake(); }
   if (e.altKey && e.code === "KeyM") { e.preventDefault(); const order = ["auto", "claude", "local"]; setMode(order[(order.indexOf(state.mode) + 1) % 3]); }
   if (e.altKey && e.code === "KeyR") { e.preventDefault(); $("reasoning").click(); }
+  if (e.altKey && e.code === "KeyA") { e.preventDefault(); toggleAutoApprove(); }
 });
 $("send").onclick = () => state.busy ? stop() : send();
 $("mic").onclick = talk;
 $("wake").onclick = toggleWake;
+$("autoApprove").onclick = toggleAutoApprove;
+$("autoOff").onclick = () => api("/api/auto_approve", { on: false }).catch(e => toast(e.message));
 $("new").onclick = () => { closeDrawers(); send("/new"); };
 $("mode").onclick = (e) => { const m = e.target.dataset && e.target.dataset.mode; if (m) setMode(m); };
 $("reasoning").onclick = () => { const on = document.body.classList.toggle("hide-reasoning"); $("reasoning").classList.toggle("on", !on); };
