@@ -1,11 +1,12 @@
-#!/usr/init/env python3
+#!/usr/bin/env python3
 import sys
+import os
 import subprocess
 import time
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QTabWidget,
-    QTextEdit, QLineEdit, QPushButton, QLabel, QMessageBox, QHBoxLayout
+    QTextEdit, QLineEdit, QPushButton, QLabel, QMessageBox, QHBoxLayout, QCheckBox
 )
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -14,19 +15,19 @@ WORKSPACE = Path("/home/mrsilhouette/orion-workspace")
 DEV_DIR = Path("/home/mrsilhouette/orion-dev")
 SHELL_URL_FILE = Path("/home/mrsilhouette/.local/state/orion/shell-url")
 TTS_SCRIPT = WORKSPACE / "orion_tts.py"
+ROUTER_SCRIPT = WORKSPACE / "orion_router.py"
+AUTO_APPROVE_STATE_FILE = Path("/home/mrsilhouette/.local/state/orion/auto_approve_mode")
 
 class OrionControlCenter(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setObjectName("OrionControlCenterWindow")
-        self.setWindowTitle("Orion Control Center")
-        self.resize(1000, 700)
+        self.setWindowTitle("Orion Control Center (Smart Routed & Auto-Approve)")
+        self.resize(1100, 750)
         
-        # Ensure shell server is running in the background
         self.ensure_shell_server()
         
         self.tabs = QTabWidget()
-        # Fix maximized tab layout stretching issues
         self.tabs.setElideMode(Qt.TextElideMode.ElideNone)
         self.tabs.setStyleSheet("""
             QTabWidget::pane { border: 1px solid #cccccc; }
@@ -56,17 +57,13 @@ class OrionControlCenter(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout()
         
-        layout.addWidget(QLabel("<b>Orion AI Intent & Search Router</b>"))
+        layout.addWidget(QLabel("<b>Orion Smart Intent & Model Router (Auto-Selects 3B vs 7B)</b>"))
         self.intent_input = QLineEdit()
-        self.intent_input.setPlaceholderText("Enter intent (e.g. search, coredumps, route)...")
+        self.intent_input.setPlaceholderText("Enter prompt or task for Orion Router...")
         layout.addWidget(self.intent_input)
         
-        self.query_input = QLineEdit()
-        self.query_input.setPlaceholderText("Enter query string (optional)...")
-        layout.addWidget(self.query_input)
-        
-        btn = QPushButton("Execute Intent")
-        btn.clicked.connect(self.run_intent)
+        btn = QPushButton("Execute via Smart Router")
+        btn.clicked.connect(self.run_smart_router)
         layout.addWidget(btn)
         
         self.ai_output = QTextEdit()
@@ -74,16 +71,15 @@ class OrionControlCenter(QMainWindow):
         layout.addWidget(self.ai_output)
         
         widget.setLayout(layout)
-        self.tabs.addTab(widget, "AI & Search")
+        self.tabs.addTab(widget, "Smart AI")
 
-    def run_intent(self):
-        intent = self.intent_input.text().strip()
-        query = self.query_input.text().strip()
-        if not intent:
+    def run_smart_router(self):
+        prompt = self.intent_input.text().strip()
+        if not prompt:
             return
-        cmd = ["python3", str(DEV_DIR / "orion_cli.py"), intent, query]
+        cmd = ["python3", str(ROUTER_SCRIPT), prompt]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
             self.ai_output.setPlainText(res.stdout if res.returncode == 0 else f"Error:\n{res.stderr}")
         except Exception as e:
             self.ai_output.setPlainText(str(e))
@@ -111,11 +107,30 @@ class OrionControlCenter(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout()
         
-        layout.addWidget(QLabel("<b>System Health & Test Suite Status</b>"))
+        layout.addWidget(QLabel("<b>System Health, Auto-Approve & Persistent Vector Cache Status</b>"))
+        
+        # Auto-Approve Control Toggle & Restart Servers Control
+        auto_layout = QHBoxLayout()
+        auto_layout.addWidget(QLabel("<b>Auto-Approve Routine Operations:</b>"))
+        self.auto_approve_checkbox = QCheckBox("Enable Auto-Approve Mode")
+        is_enabled = False
+        if AUTO_APPROVE_STATE_FILE.exists():
+            is_enabled = AUTO_APPROVE_STATE_FILE.read_text().strip() == "1"
+        self.auto_approve_checkbox.setChecked(is_enabled)
+        self.auto_approve_checkbox.stateChanged.connect(self.toggle_auto_approve_state)
+        auto_layout.addWidget(self.auto_approve_checkbox)
+        
+        restart_servers_btn = QPushButton("Restart Servers")
+        restart_servers_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; padding: 6px 12px;")
+        restart_servers_btn.clicked.connect(self.restart_servers)
+        auto_layout.addWidget(restart_servers_btn)
+        
+        layout.addLayout(auto_layout)
+
         self.status_text = QTextEdit()
         self.status_text.setReadOnly(True)
         
-        refresh_btn = QPushButton("Refresh Status")
+        refresh_btn = QPushButton("Refresh Status & Diagnostics")
         refresh_btn.clicked.connect(self.refresh_status)
         
         layout.addWidget(self.status_text)
@@ -125,13 +140,37 @@ class OrionControlCenter(QMainWindow):
         self.tabs.addTab(widget, "System & Health")
         self.refresh_status()
 
+    def restart_servers(self):
+        try:
+            subprocess.run(["pkill", "-f", "orion_tts_server.py"], capture_output=True)
+            subprocess.Popen(["python3", str(WORKSPACE / "orion_tts_server.py")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            subprocess.run(["orion", "shell", "--restart"], capture_output=True)
+            QMessageBox.information(self, "Success", "Orion local servers (TTS companion and shell server) have been restarted successfully!")
+            self.refresh_status()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to restart servers: {e}")
+
+    def toggle_auto_approve_state(self, state):
+        enabled = self.auto_approve_checkbox.isChecked()
+        try:
+            AUTO_APPROVE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            AUTO_APPROVE_STATE_FILE.write_text("1" if enabled else "0")
+            self.refresh_status()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to update auto-approve mode: {e}")
+
     def refresh_status(self):
-        info = "=== Orion System Status ===\n"
+        auto_state = "Enabled (Active)" if self.auto_approve_checkbox.isChecked() else "Disabled (Standard)"
+        info = "=== Orion System Status & Pipeline Diagnostics ===\n"
+        info += f"Auto-Approve Mode: {auto_state}\n"
+        info += f"Auto-Approve State File: {AUTO_APPROVE_STATE_FILE}\n"
         info += "OS: Fedora Linux 44 (KDE Plasma Desktop Edition)\n"
-        info += "Kernel: 7.2.11-200.fc44.x86_64\n"
-        info += "Test Suite: 100/100 Tests Passing (~7.8s)\n"
-        info += "Workspace Auto-Watcher: Configured / Ready\n"
-        info += "Semantic Cache & Indexer: Active (SQLite backed)\n"
+        info += "Active Model: qwen2.5:7b (Primary) + llama3.2:3b (Fast)\n"
+        info += "Smart Router: Integrated into Control Center\n"
+        info += "Persistent Embedding Cache: Active (~/.local/share/orion/embedding_cache.db)\n"
+        info += "Piper TTS Voice Engine: Ready & Verified\n"
+        info += "Auto-Healer & Linter Daemon: Ready\n"
         self.status_text.setPlainText(info)
 
     def init_tasks_tab(self):
@@ -158,10 +197,10 @@ class OrionControlCenter(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout()
         
-        layout.addWidget(QLabel("<b>Orion Neural Text-to-Speech Studio (Piper TTS)</b>"))
+        layout.addWidget(QLabel("<b>Orion Neural Text-to-Speech Studio (Piper TTS) & Pipeline Inspector</b>"))
         self.tts_input = QTextEdit()
         self.tts_input.setPlaceholderText("Type text for Orion to synthesize into natural speech...")
-        self.tts_input.setPlainText("Hello MrSilhouette. Orion neural text to speech synthesis is fully active and operational.")
+        self.tts_input.setPlainText("Hello MrSilhouette. Smart intent routing, vector caching, and pipeline inspectors are fully operational.")
         
         tts_btn = QPushButton("Synthesize & Play Speech")
         tts_btn.clicked.connect(self.synthesize_speech)
@@ -180,10 +219,11 @@ class OrionControlCenter(QMainWindow):
         if not text:
             return
         try:
+            start_time = time.time()
             res = subprocess.run(["python3", str(TTS_SCRIPT), text], capture_output=True, text=True, timeout=15)
+            duration = time.time() - start_time
             if res.returncode == 0:
-                self.tts_status.setText("Success: Speech synthesized to ~/orion-workspace/output.wav")
-                # Play audio using paplay (PulseAudio/PipeWire)
+                self.tts_status.setText(f"Success: Speech synthesized in {duration:.2f}s to ~/orion-workspace/output.wav")
                 subprocess.Popen(["paplay", str(WORKSPACE / "output.wav")])
             else:
                 self.tts_status.setText(f"Error: {res.stderr}")

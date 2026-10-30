@@ -1,0 +1,12 @@
+[Unit]
+Description=Orion Voice and Auto-Approve Companion Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/mrsilhouette/orion-workspace/orion_tts_server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
